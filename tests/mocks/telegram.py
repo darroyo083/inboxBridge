@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from inboxbridge.models import DraftReply, ParsedEmail
 
@@ -19,7 +19,8 @@ class FakeTelegram:
     """In-memory TelegramNotifier double; records everything it sends."""
 
     def __init__(self) -> None:
-        self.sent: list[SentMessage] = field(default_factory=list)
+        self.sent: list[SentMessage] = []
+        self.notices: list[str] = []
         self.typing_calls: int = 0
         self._next_id: int = 1
 
@@ -27,6 +28,7 @@ class FakeTelegram:
         return self._record(SentMessage(kind="summary", content=summary, email=email))
 
     async def send_notice(self, text: str) -> int:
+        self.notices.append(text)
         return self._record(SentMessage(kind="notice", content=text))
 
     async def send_typing(self) -> None:
