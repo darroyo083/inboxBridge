@@ -124,7 +124,7 @@ class PubSubEvent:
     message_id: str
     history_id: int
     email_address: str
-    raw: dict
+    raw: dict[str, object]
 
 
 @dataclass(frozen=True)

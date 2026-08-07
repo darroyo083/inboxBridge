@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 
@@ -108,9 +109,9 @@ class Storage:
         telegram_message_id: int | None = None,
     ) -> None:
         assert self._conn is not None
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         self._conn.execute(
             """
             INSERT INTO messages(message_id, thread_id, history_id, status,
@@ -131,9 +132,9 @@ class Storage:
     def mark_status(self, message_id: str, status: MessageStatus,
                     telegram_message_id: int | None = None) -> None:
         assert self._conn is not None
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         self._conn.execute(
             "UPDATE messages SET status = ?, telegram_message_id = ?, updated_at = ? "
             "WHERE message_id = ?",
@@ -144,9 +145,9 @@ class Storage:
     def bump_retry(self, message_id: str, next_retry_at: float) -> int:
         """Increment retry_count; returns the new count."""
         assert self._conn is not None
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         self._conn.execute(
             "UPDATE messages SET retry_count = retry_count + 1, "
             "next_retry_at = ?, updated_at = ? WHERE message_id = ?",
@@ -179,9 +180,9 @@ class Storage:
     def create_draft(self, thread_id: str, message_id: str | None,
                      reply: DraftReply) -> int:
         assert self._conn is not None
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         to_json = json.dumps([f"{a.email}" for a in reply.to])
         cur = self._conn.execute(
             """
@@ -193,13 +194,16 @@ class Storage:
              DraftStatus.PENDING.value, now, now),
         )
         self._conn.commit()
-        return int(cur.lastrowid)
+        lastrowid = cur.lastrowid
+        if lastrowid is None:
+            raise RuntimeError("SQLite did not return a row id for the draft insert")
+        return int(lastrowid)
 
     def set_draft_status(self, draft_id: int, status: DraftStatus) -> None:
         assert self._conn is not None
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         self._conn.execute(
             "UPDATE drafts SET status = ?, updated_at = ? WHERE id = ?",
             (status.value, now, draft_id),

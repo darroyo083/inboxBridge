@@ -20,12 +20,12 @@ class Settings(BaseSettings):
     send_emails: bool = Field(default=False, alias="SEND_EMAILS")
 
     # Telegram
-    telegram_bot_token: SecretStr = Field(default="", alias="TELEGRAM_BOT_TOKEN")
+    telegram_bot_token: SecretStr = Field(default=SecretStr(""), alias="TELEGRAM_BOT_TOKEN")
     telegram_allowed_chat_id: int = Field(default=0, alias="TELEGRAM_ALLOWED_CHAT_ID")
 
     # LLM (OpenAI-compatible)
     llm_base_url: str = Field(default="", alias="LLM_BASE_URL")
-    llm_api_key: SecretStr = Field(default="", alias="LLM_API_KEY")
+    llm_api_key: SecretStr = Field(default=SecretStr(""), alias="LLM_API_KEY")
     llm_model: str = "deepseek-v4-flash"
     llm_max_tokens_summary: int = 700
     llm_max_tokens_draft: int = 1000
@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     gmail_pubsub_subscription: str = ""
 
     # Attachments
-    pdf_password: SecretStr = Field(default="", alias="PDF_PASSWORD")
+    pdf_password: SecretStr = Field(default=SecretStr(""), alias="PDF_PASSWORD")
     attachment_max_bytes: int = 10 * 1024 * 1024
     attachment_max_text_chars: int = 20_000
     attachment_max_count: int = 5
