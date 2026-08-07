@@ -99,6 +99,32 @@ def _history_provider(services: Services) -> Callable[[PubSubEvent], Awaitable[H
     return provider
 
 
+class WatchRenewer:
+    """Periodically re-registers users.watch before its 7-day expiry."""
+
+    def __init__(self, watcher: WatchManager, interval_seconds: float = 3600.0) -> None:
+        self._watcher = watcher
+        self._interval = interval_seconds
+        self._task: asyncio.Task[None] | None = None
+
+    async def run(self) -> None:
+        while True:
+            try:
+                self._watcher.ensure_watch()
+            except Exception:
+                logger.exception("watch renewal check failed (will retry next cycle)")
+            await asyncio.sleep(self._interval)
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self.run(), name="watch-renewer")
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+
+
 class App:
     """Composes everything; run() is the asyncio entrypoint."""
 
@@ -107,6 +133,7 @@ class App:
         self._consumer: PubSubConsumer | None = None
         self._consumer_task: asyncio.Task[None] | None = None
         self._retry_scheduler: RetryScheduler | None = None
+        self._watch_renewer: WatchRenewer | None = None
         self._reply_worker: ReplyWorker | None = None
 
     async def run(self) -> None:
@@ -139,6 +166,11 @@ class App:
         retry_scheduler.start()
         self._retry_scheduler = retry_scheduler
 
+        # users.watch expires after 7 days; re-register when < 24h remain.
+        watch_renewer = WatchRenewer(services.watcher)
+        watch_renewer.start()
+        self._watch_renewer = watch_renewer
+
         reply_coordinator = ReplyCoordinator(
             services.settings,
             services.gmail,
@@ -167,6 +199,8 @@ class App:
             await self._reply_worker.stop()
         if self._retry_scheduler is not None:
             await self._retry_scheduler.stop()
+        if self._watch_renewer is not None:
+            await self._watch_renewer.stop()
         services = self._services
         if services is not None:
             await services.bot.stop()
