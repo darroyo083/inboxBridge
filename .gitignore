@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Environment & secrets (NEVER commit)
+.env
+.env.local
+.env.*.local
+
+# OAuth credentials & tokens
+credentials.json
+token.json
+token-*.json
+client_secret*.json
+*.oauth.json
+service_account*.json
+
+# Data & state
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+state/
+storage/
+
+# Attachments / temp extraction
+tmp/
+attachments/
+*.pdf.tmp
+
+# Local tooling caches
+.atl/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Docker volumes / compose overrides
+docker-compose.override.yml
+.env.docker
