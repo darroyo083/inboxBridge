@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check .
+      - name: Typecheck
+        run: mypy src
+      - name: Tests
+        run: pytest --cov=inboxbridge --cov-report=term-missing
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect secrets
+        run: |
+          set -e
+          if grep -rEn '(ghp_|gho_|sk-[A-Za-z0-9]{15,}|AIza[0-9A-Za-z_-]{20,}|xox[baprs]-)' \
+            --include='*.py' --include='*.toml' --include='*.yml' --include='*.yaml' \
+            --include='*.md' --include='*.example' --exclude-dir=.git .; then
+            echo "::error::Possible secret found in repository. Refusing."
+            exit 1
+          fi
+          echo "No secrets detected."
+      - name: Ensure .env is ignored
+        run: |
+          git check-ignore .env || (echo "::error::.env is not git-ignored"; exit 1)
