@@ -20,7 +20,17 @@ Key design decisions (documented for the coordinator):
   False.
 - Summary → thread mapping: ``send_summary`` writes ``meta["tg:<message_id>"] =
   thread_id`` through ``db.Storage`` so a later reply to that message can be
-  matched to the thread (survives restarts).
+  matched to the thread (survives restarts). It also writes
+  ``meta["tgm:<message_id>"] = gmail message_id`` (IDs only) so the
+  "Ver original" button can fetch the exact original email on demand —
+  Gmail stays the source of truth, bodies are never persisted.
+- "Ver original": the summary is edited to carry a ``view:<tg_message_id>``
+  button. On press, the original email is fetched from Gmail (no LLM call,
+  no SQLite body) and posted as temporary message(s) with an
+  ``Ocultar original`` button (``hide:<tg_message_id>``). The temporary
+  message ids are kept in ``meta["tgo:<tg_message_id>"]`` so hiding works
+  after restarts; hiding deletes them. Original content is untrusted:
+  links are neutralized and text is plain (no markdown/HTML rendering).
 - Streaming is NOT enabled: the ``LLMProvider`` contract has no streaming
   surface. A typing indicator is shown while the LLM runs.
 - Display text is scrubbed so URLs are never clickable (untrusted content).
@@ -29,6 +39,7 @@ Key design decisions (documented for the coordinator):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import secrets
@@ -58,10 +69,17 @@ from ..models import DraftReply, EmailSummary, ParsedEmail
 
 logger = logging.getLogger(__name__)
 
-_CALLBACK_RE = re.compile(r"^(confirm|cancel):([A-Za-z0-9_-]{1,64})$")
+_CALLBACK_RE = re.compile(r"^(confirm|cancel|view|hide):([A-Za-z0-9_-]{1,64})$")
 _URL_SCHEME_RE = re.compile(r"https?://", re.IGNORECASE)
-_TG_META_PREFIX = "tg:"
+_TG_META_PREFIX = "tg:"  # tg message_id -> thread_id
+_TG_GMAIL_PREFIX = "tgm:"  # tg message_id -> gmail message_id (IDs only)
+_TG_ORIG_PREFIX = "tgo:"  # tg message_id -> JSON list of temporary original message ids
 _CONFIRM_TIMEOUT_SECONDS = 900.0
+
+#: Telegram hard limit is 4096 chars per message; stay safely below.
+_MAX_MSG_CHARS = 3900
+#: Cap on temporary "original" messages to avoid flooding the group.
+_MAX_ORIGINAL_MESSAGES = 8
 
 
 class Sender(Protocol):
@@ -92,6 +110,8 @@ class Sender(Protocol):
     async def answer_callback_query(
         self, callback_query_id: str, text: str | None = None, show_alert: bool = False
     ) -> bool: ...
+
+    async def delete_message(self, chat_id: int | str, message_id: int) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -138,6 +158,31 @@ def _format_sender(email: ParsedEmail) -> str:
     return address.email
 
 
+def _split_original(text: str) -> list[str]:
+    """Split untrusted original text into Telegram-safe chunks.
+
+    Splits on newlines when possible (prefer whole lines), truncates the last
+    chunk with a clear marker when the cap is hit, and returns at most
+    ``_MAX_ORIGINAL_MESSAGES`` chunks.
+    """
+    if len(text) <= _MAX_MSG_CHARS:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > _MAX_MSG_CHARS and len(chunks) < _MAX_ORIGINAL_MESSAGES:
+        cut = remaining.rfind("\n", 0, _MAX_MSG_CHARS)
+        if cut < _MAX_MSG_CHARS // 2:
+            cut = _MAX_MSG_CHARS
+        chunks.append(remaining[:cut].rstrip("\n"))
+        remaining = remaining[cut:].lstrip("\n")
+    if remaining:
+        if len(chunks) >= _MAX_ORIGINAL_MESSAGES:
+            chunks.append(remaining[:_MAX_MSG_CHARS - 30] + "\n[…original truncado…]")
+        else:
+            chunks.append(remaining)
+    return chunks
+
+
 class TelegramBot(TelegramNotifier):
     def __init__(
         self,
@@ -148,6 +193,7 @@ class TelegramBot(TelegramNotifier):
         bot_user_id: int | None = None,
         bot_username: str | None = None,
         status_provider: Callable[[], Awaitable[str]] | None = None,
+        original_fetcher: Callable[[str], Awaitable[ParsedEmail]] | None = None,
     ) -> None:
         self._settings = settings
         self._storage = storage
@@ -155,6 +201,7 @@ class TelegramBot(TelegramNotifier):
         self._bot_user_id = bot_user_id
         self._bot_username = bot_username
         self._status_provider = status_provider
+        self._original_fetcher = original_fetcher
         self._allowed_chat_id = settings.telegram_allowed_chat_id
         self._queue: asyncio.Queue[ReplyRequest] = asyncio.Queue()
         self._pending_drafts: dict[str, _PendingDraft] = {}
@@ -305,7 +352,7 @@ class TelegramBot(TelegramNotifier):
                     return True
         return self._bot_username is not None and f"@{self._bot_username.lower()}" in text.lower()
 
-    # ── callback queries (draft confirm/cancel buttons) ────────────────────
+    # ── callback queries (draft confirm/cancel + view original) ────────────
 
     async def _handle_callback_query(self, query: CallbackQuery) -> None:
         message = query.message
@@ -317,6 +364,9 @@ class TelegramBot(TelegramNotifier):
         if match is None:
             return
         action, token = match.group(1), match.group(2)
+        if action in ("view", "hide"):
+            await self._handle_view_callback(query, action, token)
+            return
         pending = self._pending_drafts.get(token)
         if pending is None:
             await self._ensure_sender().answer_callback_query(
@@ -332,6 +382,100 @@ class TelegramBot(TelegramNotifier):
             chat_id=message.chat.id,
             message_id=message.message_id,
         )
+
+    # ── "Ver original" / "Ocultar original" ────────────────────────────────
+
+    async def _handle_view_callback(self, query: CallbackQuery, action: str, token: str) -> None:
+        try:
+            tg_message_id = int(token)
+        except ValueError:
+            return
+        sender = self._ensure_sender()
+        if action == "hide":
+            await self._hide_original(query, sender, tg_message_id)
+            return
+        await self._show_original(query, sender, tg_message_id)
+
+    async def _show_original(
+        self, query: CallbackQuery, sender: Sender, tg_message_id: int
+    ) -> None:
+        """Fetch the original email from Gmail on demand and post it as
+        temporary message(s). No LLM call, no SQLite body read."""
+        await sender.answer_callback_query(query.id, "Cargando…")
+        gmail_message_id = self._storage.get_meta(f"{_TG_GMAIL_PREFIX}{tg_message_id}")
+        if not gmail_message_id or self._original_fetcher is None:
+            await self._send("No pude cargar el original ahora mismo.")
+            return
+        try:
+            original = await self._original_fetcher(gmail_message_id)
+        except Exception:
+            logger.exception("fetching original email %s failed", gmail_message_id)
+            await self._send("No pude cargar el original ahora mismo.")
+            return
+        original_ids = await self._post_original(sender, tg_message_id, original)
+        if original_ids:
+            self._storage.set_meta(
+                f"{_TG_ORIG_PREFIX}{tg_message_id}", json.dumps(original_ids)
+            )
+
+    async def _post_original(
+        self, sender: Sender, tg_message_id: int, original: ParsedEmail
+    ) -> list[int]:
+        """Post the original as plain-text chunks with an 'Ocultar original'
+        button on the first one. Returns the posted message ids."""
+        header = (
+            f"Original\n\n"
+            f"Asunto: {neutralize_links(original.subject)}\n"
+            f"De: {_format_sender(original)}\n\n"
+        )
+        attachments_line = ""
+        if original.attachments:
+            names = ", ".join(
+                a.filename for a in original.attachments[:5]
+            )
+            attachments_line = f"\n\nAdjuntos: {names}"
+        body = neutralize_links(original.body_text) + attachments_line
+        hide_button = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Ocultar original", callback_data=f"hide:{tg_message_id}"
+                    )
+                ]
+            ]
+        )
+        chunks = _split_original(body)
+        posted: list[int] = []
+        for index, chunk in enumerate(chunks):
+            text = f"{header}{chunk}" if index == 0 else chunk
+            message = await sender.send_message(
+                self._allowed_chat_id,
+                text,
+                reply_markup=hide_button if index == 0 else None,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+            posted.append(message.message_id)
+        return posted
+
+    async def _hide_original(
+        self, query: CallbackQuery, sender: Sender, tg_message_id: int
+    ) -> None:
+        """Delete the temporary original message(s) and clean up the mapping."""
+        raw = self._storage.get_meta(f"{_TG_ORIG_PREFIX}{tg_message_id}")
+        message_ids: list[int] = []
+        if raw:
+            try:
+                message_ids = [int(m) for m in json.loads(raw)]
+            except (ValueError, TypeError, json.JSONDecodeError):
+                logger.warning("corrupt tgo mapping for %s", tg_message_id)
+                message_ids = []
+        for message_id in message_ids:
+            try:
+                await sender.delete_message(self._allowed_chat_id, message_id)
+            except Exception:
+                logger.exception("deleting original message %s failed", message_id)
+        self._storage.delete_meta(f"{_TG_ORIG_PREFIX}{tg_message_id}")
+        await sender.answer_callback_query(query.id, "Original oculto.")
 
     # ── TelegramNotifier implementation ────────────────────────────────────
 
@@ -350,6 +494,24 @@ class TelegramBot(TelegramNotifier):
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
         self._storage.set_meta(f"{_TG_META_PREFIX}{message.message_id}", email.thread_id)
+        self._storage.set_meta(f"{_TG_GMAIL_PREFIX}{message.message_id}", email.message_id)
+        # Attach the "Ver original" button now that the message_id is known.
+        # The message_id doubles as the callback token (stable across restarts).
+        view_button = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Ver original", callback_data=f"view:{message.message_id}"
+                    )
+                ]
+            ]
+        )
+        await sender.edit_message_text(
+            text,
+            chat_id=self._allowed_chat_id,
+            message_id=message.message_id,
+            reply_markup=view_button,
+        )
         return message.message_id
 
     async def send_notice(self, text: str) -> int:

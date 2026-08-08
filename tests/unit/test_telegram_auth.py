@@ -1,4 +1,4 @@
-﻿"""Telegram bot tests: chat authorization, triggers, commands, draft flow.
+"""Telegram bot tests: chat authorization, triggers, commands, draft flow.
 
 No network: a FakeSender stands in for PTB's Bot and updates are built as
 plain objects. The real ``db.Storage`` is used (tmp SQLite file).
@@ -7,6 +7,7 @@ plain objects. The real ``db.Storage`` is used (tmp SQLite file).
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -39,8 +40,9 @@ class FakeSender:
     def __init__(self) -> None:
         self.messages: list[Message] = []
         self.chat_actions: list[Any] = []
-        self.edited: list[tuple[int | None, str]] = []
+        self.edited: list[tuple[int | None, str, InlineKeyboardMarkup | None]] = []
         self.answered: list[str] = []
+        self.deleted: list[int] = []
         self._next_id = 1
 
     async def send_message(
@@ -76,7 +78,7 @@ class FakeSender:
         message_id: int | None = None,
         reply_markup: InlineKeyboardMarkup | None = None,
     ) -> Message:
-        self.edited.append((message_id, text))
+        self.edited.append((message_id, text, reply_markup))
         return Message(
             message_id=message_id or 0,
             date=datetime.now(UTC),
@@ -88,6 +90,10 @@ class FakeSender:
         self, callback_query_id: str, text: str | None = None, show_alert: bool = False
     ) -> bool:
         self.answered.append(text or "")
+        return True
+
+    async def delete_message(self, chat_id: int | str, message_id: int) -> bool:
+        self.deleted.append(message_id)
         return True
 
 
@@ -522,3 +528,219 @@ def test_reply_requests_is_async_generator(make_env: Any) -> None:
     assert inspect.isasyncgenfunction(bot.reply_requests)
     iterator = bot.reply_requests()
     assert hasattr(iterator, "__anext__")
+
+
+# ── "Ver original" / "Ocultar original" ────────────────────────────────────
+
+
+def _button_data(markup: InlineKeyboardMarkup, row: int, col: int) -> str:
+    return markup.inline_keyboard[row][col].callback_data or ""
+
+
+def _original_email(
+    *,
+    message_id: str = "gm-orig-1",
+    subject: str = "Arbeitsplan für nächste Woche",
+    body: str = "Hallo Daniel,\n\ndies ist der Originaltext.",
+    attachments: list[Any] | None = None,
+) -> ParsedEmail:
+    return ParsedEmail(
+        message_id=message_id,
+        thread_id="t1",
+        history_id=1,
+        subject=subject,
+        sender=EmailAddress("Daniel Arroyo", "darroyo083@gmail.com"),
+        recipients=[EmailAddress("Ana", "ana@example.com")],
+        date_iso="2026-08-07T10:00:00+00:00",
+        body_text=body,
+        attachments=attachments or [],
+    )
+
+
+def _view_summary_email(message_id: str = "gm-orig-1") -> ParsedEmail:
+    """Summary-side email: in production the summarized ParsedEmail carries
+    the SAME gmail message_id as the original (fetch_message returns it)."""
+    return ParsedEmail(
+        message_id=message_id,
+        thread_id="t1",
+        history_id=1,
+        subject="Presupuesto",
+        sender=EmailAddress("Ana", "ana@example.com"),
+        recipients=[EmailAddress("Bob", "bob@example.com")],
+        date_iso="2026-08-07T10:00:00+00:00",
+        body_text="resumen body",
+    )
+
+
+def _summary_original_fetcher(email: ParsedEmail) -> Callable[..., Any]:
+    async def fetcher(message_id: str) -> ParsedEmail:
+        assert message_id == email.message_id
+        return email
+
+    return fetcher
+
+
+async def test_send_summary_has_ver_original_button(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    message_id = await bot.send_summary(_view_summary_email(), EmailSummary(subject_es="Asunto ES"))
+    # Button attached via edit after the message_id is known.
+    assert sender.edited[-1][0] == message_id
+    markup = sender.edited[-1][2]
+    assert isinstance(markup, InlineKeyboardMarkup)
+    assert markup.inline_keyboard[0][0].text == "Ver original"
+    assert _button_data(markup, 0, 0) == f"view:{message_id}"
+    # Mapping persisted: tg -> thread, tgm -> gmail message id (IDs only).
+    assert storage.get_meta(f"tg:{message_id}") == "t1"
+    assert storage.get_meta(f"tgm:{message_id}") == "gm-orig-1"
+
+
+async def test_view_original_fetches_gmail_on_demand_no_llm_no_persist(
+    make_env: Any,
+) -> None:
+    original = _original_email()
+    bot, sender, storage = make_env(original_fetcher=_summary_original_fetcher(original))
+    summary_id = await bot.send_summary(_view_summary_email(), EmailSummary(subject_es="Asunto ES"))
+
+    await bot.process_update(_callback_update(CHAT_ID, f"view:{summary_id}"))
+
+    # Original shown as a NEW message, verbatim (no translation/summary).
+    original_msg = next(
+        m for m in sender.messages if m.message_id != summary_id
+    )
+    assert "Original" in original_msg.text
+    assert "Asunto: Arbeitsplan für nächste Woche" in original_msg.text
+    assert "dies ist der Originaltext" in original_msg.text
+    # Not persisted: no meta key holds body content.
+    assert storage.get_meta(f"tgm:{summary_id}") == original.message_id
+    assert storage.get_meta(f"tg:{summary_id}") == "t1"
+    # No LLM surface is involved at all (bot has no LLM dependency).
+
+
+async def test_view_original_uses_correct_gmail_message(make_env: Any) -> None:
+    """Pressing Ver original on summary 1 fetches gmail msg gm-orig-1."""
+    fetched: list[str] = []
+
+    async def fetcher(message_id: str) -> ParsedEmail:
+        fetched.append(message_id)
+        return _original_email(message_id=message_id)
+
+    bot, sender, storage = make_env(original_fetcher=fetcher)
+    await bot.send_summary(_view_summary_email(), EmailSummary(subject_es="A"))
+
+    await bot.process_update(_callback_update(CHAT_ID, "view:1"))
+    assert fetched == ["gm-orig-1"]
+
+
+async def test_view_original_restart_safe_mapping(make_env: Any, tmp_path: Any) -> None:
+    """The tgm mapping survives a Storage reconnect (same file)."""
+    bot, sender, storage = make_env()
+    summary_id = await bot.send_summary(_view_summary_email(), EmailSummary(subject_es="A"))
+    assert storage.get_meta(f"tgm:{summary_id}") == "gm-orig-1"
+
+    storage.close()
+    storage2 = Storage(tmp_path / "state.sqlite")
+    storage2.connect()
+    assert storage2.get_meta(f"tgm:{summary_id}") == "gm-orig-1"
+    assert storage2.get_meta(f"tg:{summary_id}") == "t1"
+    storage2.close()
+
+
+async def test_view_original_neutralizes_urls(make_env: Any) -> None:
+    original = _original_email(body="Ver esto: https://evil.example.com/x?track=1")
+    bot, sender, storage = make_env(original_fetcher=_summary_original_fetcher(original))
+    summary_id = await bot.send_summary(_view_summary_email(), EmailSummary(subject_es="A"))
+
+    await bot.process_update(_callback_update(CHAT_ID, f"view:{summary_id}"))
+
+    original_msg = next(m for m in sender.messages if m.message_id != summary_id)
+    assert "https://evil.example.com" not in original_msg.text
+    assert "hxxps://evil.example.com" in original_msg.text
+
+
+async def test_view_original_long_body_is_split_safely(make_env: Any) -> None:
+    long_body = "\n".join(f"Línea de relleno número {i} con algo de contenido" for i in range(200))
+    original = _original_email(body=long_body)
+    bot, sender, storage = make_env(original_fetcher=_summary_original_fetcher(original))
+    summary_id = await bot.send_summary(_view_summary_email(), EmailSummary(subject_es="A"))
+
+    await bot.process_update(_callback_update(CHAT_ID, f"view:{summary_id}"))
+
+    original_msgs = [m for m in sender.messages if m.message_id != summary_id]
+    assert len(original_msgs) > 1  # split into multiple messages
+    assert all(len(m.text or "") <= 4096 for m in original_msgs)
+    # Only the first chunk carries the hide button.
+    assert original_msgs[0].reply_markup is not None
+    assert all(m.reply_markup is None for m in original_msgs[1:])
+    # All temporary ids recorded for hiding.
+    raw = storage.get_meta(f"tgo:{summary_id}")
+    assert raw is not None
+    assert len(json.loads(raw)) == len(original_msgs)
+
+
+async def test_view_original_shows_attachment_line(make_env: Any) -> None:
+    from inboxbridge.models import AttachmentMeta
+
+    original = _original_email(attachments=[AttachmentMeta("factura.pdf", "application/pdf", 100)])
+    bot, sender, storage = make_env(original_fetcher=_summary_original_fetcher(original))
+    summary_id = await bot.send_summary(_view_summary_email(), EmailSummary(subject_es="A"))
+
+    await bot.process_update(_callback_update(CHAT_ID, f"view:{summary_id}"))
+
+    original_msg = next(m for m in sender.messages if m.message_id != summary_id)
+    assert "Adjuntos: factura.pdf" in original_msg.text
+
+
+async def test_hide_original_deletes_temporary_messages(make_env: Any) -> None:
+    original = _original_email()
+    bot, sender, storage = make_env(original_fetcher=_summary_original_fetcher(original))
+    summary_id = await bot.send_summary(_view_summary_email(), EmailSummary(subject_es="A"))
+
+    await bot.process_update(_callback_update(CHAT_ID, f"view:{summary_id}"))
+    original_msgs = [m for m in sender.messages if m.message_id != summary_id]
+    temp_ids = [m.message_id for m in original_msgs]
+    assert temp_ids
+
+    await bot.process_update(_callback_update(CHAT_ID, f"hide:{summary_id}"))
+    assert sender.deleted == temp_ids
+    assert storage.get_meta(f"tgo:{summary_id}") is None
+    assert "Original oculto." in sender.answered
+
+
+async def test_view_original_fetch_failure_shows_natural_message(make_env: Any) -> None:
+    async def broken_fetcher(message_id: str) -> ParsedEmail:
+        raise RuntimeError("gmail api down")
+
+    bot, sender, storage = make_env(original_fetcher=broken_fetcher)
+    summary_id = await bot.send_summary(_view_summary_email(), EmailSummary(subject_es="A"))
+
+    await bot.process_update(_callback_update(CHAT_ID, f"view:{summary_id}"))
+
+    texts = [m.text for m in sender.messages]
+    assert any("No pude cargar el original ahora mismo." in t for t in texts)
+    # No internal ids or error details leaked.
+    assert not any("gm-orig" in t for t in texts)
+    assert not any("RuntimeError" in t for t in texts)
+
+
+async def test_view_original_unknown_mapping_is_ignored(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.process_update(_callback_update(CHAT_ID, "view:999"))
+    texts = [m.text for m in sender.messages]
+    assert any("No pude cargar el original ahora mismo." in t for t in texts)
+
+
+async def test_view_callback_unauthorized_chat_ignored(make_env: Any) -> None:
+    bot, sender, storage = make_env(original_fetcher=_summary_original_fetcher(_original_email()))
+    await bot.process_update(_callback_update(555, "view:1"))
+    assert sender.messages == []
+    assert sender.answered == []
+
+
+async def test_draft_confirmation_callbacks_still_work_with_view_regex(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.send_draft_for_confirmation(_draft())
+    markup = sender.messages[0].reply_markup
+    assert isinstance(markup, InlineKeyboardMarkup)
+    token = _button_data(markup, 0, 0).split(":", 1)[1]
+    await bot.process_update(_callback_update(CHAT_ID, f"confirm:{token}"))
+    assert sender.edited[-1][1] == "Confirmado ✓"

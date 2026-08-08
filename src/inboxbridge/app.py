@@ -57,7 +57,7 @@ class Services:
         watcher = WatchManager(settings, service, storage)
         history = HistoryProcessor(settings, service, storage)
         llm = OpenAICompatLLM(settings)
-        bot = TelegramBot(settings, storage)
+        bot = TelegramBot(settings, storage, original_fetcher=gmail.fetch_message)
         bot._status_provider = _status_provider_factory(settings, storage)  # private by design
         return cls(
             settings=settings,

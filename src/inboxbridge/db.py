@@ -92,6 +92,12 @@ class Storage:
         )
         self._conn.commit()
 
+    def delete_meta(self, key: str) -> None:
+        """Remove a meta key entirely (e.g. temporary original-view state)."""
+        assert self._conn is not None
+        self._conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+        self._conn.commit()
+
     # ── messages ────────────────────────────────────────────────────────────
     def message_exists(self, message_id: str) -> bool:
         assert self._conn is not None
