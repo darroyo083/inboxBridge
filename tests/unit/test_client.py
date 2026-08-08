@@ -119,6 +119,24 @@ class TestFetchMessage:
         assert email_.attachments[0].filename == "nota.txt"
         assert email_.attachments[0].extracted_text == "contenido de la nota"
 
+    async def test_requests_raw_format(self) -> None:
+        """fetch_message must request format='raw' so the API returns raw RFC822."""
+        raw = build_raw_email(subject="Tema", body_text="Cuerpo.", body_html=None)
+        service = FakeGmailService(
+            {
+                ("users", "messages", "get"): full_response(
+                    raw, message_id="m1", thread_id="t1"
+                )
+            }
+        )
+        client = GmailClient(make_settings(), service=service)
+        await client.fetch_message("m1")
+
+        calls = [c for c in service.calls if c[0] == ("users", "messages", "get")]
+        assert len(calls) == 1
+        _path, kwargs = calls[0]
+        assert kwargs["format"] == "raw"
+
     async def test_raises_when_no_raw(self) -> None:
         service = FakeGmailService({("users", "messages", "get"): {"id": "m1"}})
         client = GmailClient(make_settings(), service=service)

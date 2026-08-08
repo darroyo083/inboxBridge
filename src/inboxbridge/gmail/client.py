@@ -67,7 +67,7 @@ class GmailClient:
     async def fetch_message(self, message_id: str) -> ParsedEmail:
         resp: dict[str, Any] = await self._run(
             self._service.users().messages().get(
-                userId=self._user_id, id=message_id, format="full"
+                userId=self._user_id, id=message_id, format="raw"
             )
         )
         raw = resp.get("raw")
