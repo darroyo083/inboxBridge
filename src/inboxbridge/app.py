@@ -24,6 +24,7 @@ from .gmail.history import HistoryDelta, HistoryProcessor
 from .gmail.pubsub import PubSubConsumer
 from .gmail.watcher import WatchManager
 from .llm.openai_compat import OpenAICompatLLM
+from .logging_setup import configure_logging
 from .models import PubSubEvent
 from .pipeline import InboundPipeline, RetryScheduler
 from .responder import ReplyCoordinator, ReplyWorker
@@ -31,13 +32,6 @@ from .status import build_status_text
 from .telegram.bot import TelegramBot
 
 logger = logging.getLogger(__name__)
-
-
-def _setup_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
 
 
 @dataclass
@@ -210,7 +204,7 @@ class App:
 
 
 def main() -> None:
-    _setup_logging(get_settings().log_level)
+    configure_logging(get_settings())
 
     async def _run() -> None:
         app = App()
