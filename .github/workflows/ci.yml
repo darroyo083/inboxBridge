@@ -31,7 +31,9 @@ jobs:
           set -e
           # tests/ is excluded: security fixtures intentionally contain
           # secret-shaped strings (e.g. test_memory.py) to verify rejection.
-          if grep -rEn '(ghp_|gho_|sk-[A-Za-z0-9]{15,}|AIza[0-9A-Za-z_-]{20,}|xox[baprs]-)' \
+          # Minimum lengths avoid matching our own defensive regexes
+          # (e.g. the _SECRET_RE pattern list in telegram/bot.py).
+          if grep -rEn '(ghp_[A-Za-z0-9]{15,}|gho_[A-Za-z0-9]{15,}|sk-[A-Za-z0-9]{15,}|AIza[0-9A-Za-z_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})' \
             --include='*.py' --include='*.toml' --include='*.yml' --include='*.yaml' \
             --include='*.md' --include='*.example' --exclude-dir=.git --exclude-dir=tests \
             --exclude='ci.yml' --exclude='.env.example' .; then
