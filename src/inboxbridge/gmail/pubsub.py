@@ -23,6 +23,7 @@ from typing import Any
 
 from google.cloud import pubsub_v1  # type: ignore[import-untyped]
 from google.cloud.pubsub_v1.subscriber.message import Message  # type: ignore[import-untyped]
+from google.oauth2.service_account import Credentials
 
 from ..config import Settings
 from ..models import PubSubEvent
@@ -54,12 +55,28 @@ def parse_pubsub_data(data: bytes, *, message_id: str = "") -> PubSubEvent:
 
 
 class PubSubConsumer:
-    """StreamingPull consumer; ``consume`` runs until cancelled."""
+    """StreamingPull consumer; ``consume`` runs until cancelled.
+
+    Credentials: when ``GOOGLE_APPLICATION_CREDENTIALS`` points to a service
+    account key file, the ``SubscriberClient`` is built with those
+    credentials; otherwise it falls back to Application Default Credentials
+    (``pubsub_v1.SubscriberClient()``). Tests can inject a fake client.
+    """
 
     def __init__(self, settings: Settings, *, client: Any | None = None) -> None:
         self._settings = settings
-        self._client = client if client is not None else pubsub_v1.SubscriberClient()
+        self._client = client if client is not None else self._build_client(settings)
         self._owns_client = client is None
+
+    @staticmethod
+    def _build_client(settings: Settings) -> Any:
+        key_file = settings.google_application_credentials
+        if not key_file:
+            return pubsub_v1.SubscriberClient()
+        credentials = Credentials.from_service_account_file(  # type: ignore[no-untyped-call]
+            key_file
+        )
+        return pubsub_v1.SubscriberClient(credentials=credentials)
 
     def subscription_path(self) -> str:
         project, sub = (

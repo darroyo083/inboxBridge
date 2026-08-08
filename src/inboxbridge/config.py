@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     # Gmail / Google
     google_client_secret_file: str = "credentials/client_secret.json"
     google_token_file: str = "credentials/token.json"
+    # Service account key used to consume the Pub/Sub subscription (StreamingPull).
+    # Empty → falls back to Application Default Credentials.
+    google_application_credentials: str = Field(
+        default="", alias="GOOGLE_APPLICATION_CREDENTIALS"
+    )
     gmail_user_id: str = "me"
     google_cloud_project: str = ""
     gmail_pubsub_topic: str = ""
