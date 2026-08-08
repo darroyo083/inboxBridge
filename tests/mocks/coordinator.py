@@ -74,7 +74,7 @@ class FakeReplyBot:
     async def send_typing(self) -> None:
         return None
 
-    async def send_draft_for_confirmation(self, draft: DraftReply) -> int:
+    async def send_draft_for_confirmation(self, draft: DraftReply, *, user_id: int = 0) -> int:
         self.drafts_shown.append(draft)
         message_id = self._next_message_id
         self._next_message_id += 1

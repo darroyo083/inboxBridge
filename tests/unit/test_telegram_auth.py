@@ -153,12 +153,17 @@ def _update(message: Message) -> Update:
 
 
 def _callback_update(
-    chat_id: int, data: str, *, callback_id: str = "cq-1", message_id: int = 50
+    chat_id: int,
+    data: str,
+    *,
+    callback_id: str = "cq-1",
+    message_id: int = 50,
+    from_user_id: int = 7,
 ) -> Update:
-    message = _message(message_id, chat_id, "Borrador", 7)
+    message = _message(message_id, chat_id, "Borrador", from_user_id)
     query = CallbackQuery(
         id=callback_id,
-        from_user=_user(7),
+        from_user=_user(from_user_id),
         chat_instance="instance",
         data=data,
         message=message,
@@ -657,7 +662,7 @@ async def test_send_draft_for_confirmation_posts_buttons(make_env: Any) -> None:
     assert _button_data(markup, 0, 0).startswith("confirm:")
     assert _button_data(markup, 0, 1).startswith("cancel:")
     buttons = markup.inline_keyboard[0]
-    assert buttons[0].text == "Confirmar"
+    assert buttons[0].text == "Enviar"
     assert buttons[1].text == "Cancelar"
 
 
@@ -720,18 +725,21 @@ def _summary_original_fetcher(email: ParsedEmail) -> Callable[..., Any]:
     return fetcher
 
 
-async def test_send_summary_has_ver_original_button(make_env: Any) -> None:
+async def test_send_summary_has_action_buttons(make_env: Any) -> None:
     bot, sender, storage = make_env()
     message_id = await bot.send_summary(_view_summary_email(), EmailSummary(subject_es="Asunto ES"))
-    # Button attached via edit after the message_id is known.
+    # Buttons attached via edit after the message_id is known.
     assert sender.edited[-1][0] == message_id
     markup = sender.edited[-1][2]
     assert isinstance(markup, InlineKeyboardMarkup)
-    assert markup.inline_keyboard[0][0].text == "Ver original"
+    row = markup.inline_keyboard[0]
+    assert [b.text for b in row] == ["Ver original", "Responder"]
     assert _button_data(markup, 0, 0) == f"view:{message_id}"
-    # Mapping persisted: tg -> thread, tgm -> gmail message id (IDs only).
+    assert _button_data(markup, 0, 1) == f"reply:{message_id}"
+    # Mapping persisted: tg -> thread, tgm -> gmail message id, tgs -> sender.
     assert storage.get_meta(f"tg:{message_id}") == "t1"
     assert storage.get_meta(f"tgm:{message_id}") == "gm-orig-1"
+    assert storage.get_meta(f"tgs:{message_id}") == "Ana (ana@example.com)"
 
 
 async def test_view_original_fetches_gmail_on_demand_no_llm_no_persist(
@@ -884,3 +892,107 @@ async def test_draft_confirmation_callbacks_still_work_with_view_regex(make_env:
     token = _button_data(markup, 0, 0).split(":", 1)[1]
     await bot.process_update(_callback_update(CHAT_ID, f"confirm:{token}"))
     assert sender.edited[-1][1] == "Confirmado ✓"
+
+
+# ── "Responder" button ─────────────────────────────────────────────────────
+
+
+async def test_responder_button_asks_for_intent_and_uses_thread(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    summary_id = await bot.send_summary(_view_summary_email(), EmailSummary(subject_es="A"))
+
+    await bot.process_update(_callback_update(CHAT_ID, f"reply:{summary_id}"))
+
+    texts = [m.text for m in sender.messages]
+    assert any("¿Qué quieres decirle a Ana (ana@example.com)?" in t for t in texts)
+
+
+async def test_responder_followup_message_creates_reply_request(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    summary_id = await bot.send_summary(_view_summary_email(), EmailSummary(subject_es="A"))
+
+    await bot.process_update(_callback_update(CHAT_ID, f"reply:{summary_id}"))
+    # The member's next plain message (not a reply/mention) is the intent.
+    message = _message(60, CHAT_ID, "Dile que sí puedo cubrir el viernes.", 7)
+    await bot.process_update(_update(message))
+
+    requests = await _drain(bot)
+    assert len(requests) == 1
+    assert requests[0].thread_id == "t1"
+    assert requests[0].user_instructions == "Dile que sí puedo cubrir el viernes."
+    assert requests[0].user_id == 7
+
+
+async def test_responder_followup_isolated_between_users(make_env: Any) -> None:
+    """User 7's pending reply is not consumed by user 8's message."""
+    bot, sender, storage = make_env()
+    summary_id = await bot.send_summary(_view_summary_email(), EmailSummary(subject_es="A"))
+
+    await bot.process_update(_callback_update(CHAT_ID, f"reply:{summary_id}"))
+    # User 8 messages first: pending reply belongs to user 7, so nothing queued.
+    message8 = _message(60, CHAT_ID, "Mensaje de otro miembro.", 8)
+    await bot.process_update(_update(message8))
+    assert await _drain(bot) == []
+    # User 7 then sends their intent.
+    message7 = _message(61, CHAT_ID, "Dile que voy el viernes.", 7)
+    await bot.process_update(_update(message7))
+    requests = await _drain(bot)
+    assert len(requests) == 1
+    assert requests[0].user_id == 7
+    assert requests[0].user_instructions == "Dile que voy el viernes."
+
+
+async def test_responder_callback_unauthorized_chat_ignored(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.process_update(_callback_update(555, "reply:1"))
+    assert sender.messages == []
+    assert await _drain(bot) == []
+
+
+async def test_responder_draft_owned_by_requesting_user(make_env: Any) -> None:
+    """Another member pressing Enviar on someone else's draft is rejected."""
+    bot, sender, storage = make_env()
+    await bot.send_draft_for_confirmation(_draft(), user_id=7)
+    markup = sender.messages[0].reply_markup
+    assert isinstance(markup, InlineKeyboardMarkup)
+    token = _button_data(markup, 0, 0).split(":", 1)[1]
+
+    # User 8 tries to confirm user 7's draft.
+    update8 = _callback_update(CHAT_ID, f"confirm:{token}", from_user_id=8)
+    await bot.process_update(update8)
+    assert "otro miembro" in sender.answered[-1]
+    assert sender.edited == []  # draft not confirmed
+
+    # User 7 confirms their own draft.
+    update7 = _callback_update(CHAT_ID, f"confirm:{token}")
+    await bot.process_update(update7)
+    assert sender.edited[-1][1] == "Confirmado ✓"
+
+
+async def test_responder_flow_end_to_end_with_kill_switch(make_env: Any) -> None:
+    """Full loop contract: button -> intent -> ReplyRequest with thread +
+    instructions + owner; the draft confirmation shows Enviar/Cancelar
+    (actual sending is guarded by SEND_EMAILS=false in GmailClient)."""
+    bot, sender, storage = make_env()
+    summary_id = await bot.send_summary(_view_summary_email(), EmailSummary(subject_es="A"))
+    await bot.process_update(_callback_update(CHAT_ID, f"reply:{summary_id}"))
+    message = _message(60, CHAT_ID, "Dile que confirmo el viernes.", 7)
+    await bot.process_update(_update(message))
+
+    requests = await _drain(bot)
+    assert len(requests) == 1
+    assert requests[0].thread_id == "t1"
+    assert requests[0].user_instructions == "Dile que confirmo el viernes."
+    assert requests[0].user_id == 7
+
+    # Draft confirmation message shows recipients and Enviar/Cancelar buttons
+    # (responder.py calls send_draft_for_confirmation with the owner user_id).
+    await bot.send_draft_for_confirmation(_draft(), user_id=7)
+    draft_msg = sender.messages[-1]
+    assert "Para: Ana <ana@example.com>" in (draft_msg.text or "")
+    markup = draft_msg.reply_markup
+    assert isinstance(markup, InlineKeyboardMarkup)
+    assert [b.text for b in markup.inline_keyboard[0]] == ["Enviar", "Cancelar"]
+    token = _button_data(markup, 0, 0).split(":", 1)[1]
+    await bot.process_update(_callback_update(CHAT_ID, f"cancel:{token}", from_user_id=7))
+    assert "Cancelado." in sender.answered

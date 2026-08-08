@@ -62,18 +62,18 @@ class ReplyCoordinator:
                 memory=request.memory,
             )
             draft: DraftReply = await self._llm.draft_reply(draft_request, thread)
-            await self._present_draft(draft)
+            await self._present_draft(draft, user_id=request.user_id)
         except Exception:
             logger.exception("reply flow failed for thread %s", request.thread_id)
             await self._bot.send_notice("No pude preparar la respuesta. Inténtalo de nuevo.")
 
-    async def _present_draft(self, draft: DraftReply) -> None:
+    async def _present_draft(self, draft: DraftReply, *, user_id: int = 0) -> None:
         """Show recipients + body and wait for explicit confirmation.
 
         The draft row is persisted ONLY after confirmation, so a rejected or
         expired draft never leaves a trace in the DB.
         """
-        message_id = await self._bot.send_draft_for_confirmation(draft)
+        message_id = await self._bot.send_draft_for_confirmation(draft, user_id=user_id)
         confirmed = await self._bot.wait_for_confirmation(message_id)
         if not confirmed:
             logger.info("draft for thread %s not confirmed; discarding", draft.thread_id)

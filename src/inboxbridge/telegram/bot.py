@@ -79,10 +79,11 @@ from ..models import DraftReply, EmailSummary, ParsedEmail
 
 logger = logging.getLogger(__name__)
 
-_CALLBACK_RE = re.compile(r"^(confirm|cancel|view|hide):([A-Za-z0-9_-]{1,64})$")
+_CALLBACK_RE = re.compile(r"^(confirm|cancel|view|hide|reply):([A-Za-z0-9_-]{1,64})$")
 _URL_SCHEME_RE = re.compile(r"https?://", re.IGNORECASE)
 _TG_META_PREFIX = "tg:"  # tg message_id -> thread_id
 _TG_GMAIL_PREFIX = "tgm:"  # tg message_id -> gmail message_id (IDs only)
+_TG_SENDER_PREFIX = "tgs:"  # tg message_id -> sender display name
 _TG_ORIG_PREFIX = "tgo:"  # tg message_id -> JSON list of temporary original message ids
 _CONFIRM_TIMEOUT_SECONDS = 900.0
 
@@ -156,6 +157,9 @@ class ReplyRequest:
     #: Explicit facts the requesting member asked the bot to remember
     #: (bounded, untrusted context for the LLM).
     memory: tuple[str, ...] = ()
+    #: Telegram user id of the member who initiated the request. Zero when
+    #: unknown (older flows); used for draft ownership/isolation.
+    user_id: int = 0
 
 
 @dataclass
@@ -163,6 +167,9 @@ class _PendingDraft:
     token: str
     draft: DraftReply
     message_id: int
+    #: Telegram user id that requested the draft; only this member may
+    #: confirm/cancel it (group isolation).
+    user_id: int = 0
     decided: bool | None = None
     future: asyncio.Future[bool] | None = None
 
@@ -266,6 +273,9 @@ class TelegramBot(TelegramNotifier):
         self._allowed_chat_id = settings.telegram_allowed_chat_id
         self._queue: asyncio.Queue[ReplyRequest] = asyncio.Queue()
         self._pending_drafts: dict[str, _PendingDraft] = {}
+        #: user_id -> (tg summary message_id, thread_id): a member pressed
+        #: "Responder" and their next plain message is their reply intent.
+        self._pending_replies: dict[int, tuple[int, str]] = {}
         self._application: Application[Any, Any, Any, Any, Any, Any] | None = None
         self._started = False
 
@@ -447,6 +457,25 @@ class TelegramBot(TelegramNotifier):
     # ── plain messages ─────────────────────────────────────────────────────
 
     async def _handle_plain_message(self, message: Message) -> None:
+        user = message.from_user
+        if user is None:
+            return
+        # "Responder" flow: the member pressed the button; this text is their
+        # reply intent, regardless of reply/mention (still chat-authorized).
+        pending = self._pending_replies.pop(user.id, None)
+        if pending is not None:
+            _tg_message_id, thread_id = pending
+            memory = tuple(m["value"] for m in self._storage.list_memories(user.id))
+            self._queue.put_nowait(
+                ReplyRequest(
+                    thread_id=thread_id,
+                    user_instructions=message.text or "",
+                    source_message_id=message.message_id,
+                    memory=memory,
+                    user_id=user.id,
+                )
+            )
+            return
         if not (self._is_reply_to_own(message) or self._is_mentioned(message)):
             return
         thread_id = ""
@@ -455,18 +484,14 @@ class TelegramBot(TelegramNotifier):
             if any(p.message_id == reply.message_id for p in self._pending_drafts.values()):
                 return  # draft confirmation message: use the inline buttons
             thread_id = self._storage.get_meta(f"{_TG_META_PREFIX}{reply.message_id}") or ""
-        user = message.from_user
-        memory = (
-            tuple(m["value"] for m in self._storage.list_memories(user.id))
-            if user is not None
-            else ()
-        )
+        memory = tuple(m["value"] for m in self._storage.list_memories(user.id))
         self._queue.put_nowait(
             ReplyRequest(
                 thread_id=thread_id,
                 user_instructions=message.text or "",
                 source_message_id=message.message_id,
                 memory=memory,
+                user_id=user.id,
             )
         )
 
@@ -505,6 +530,9 @@ class TelegramBot(TelegramNotifier):
         if match is None:
             return
         action, token = match.group(1), match.group(2)
+        if action == "reply":
+            await self._handle_reply_callback(query, token)
+            return
         if action in ("view", "hide"):
             await self._handle_view_callback(query, action, token)
             return
@@ -512,6 +540,13 @@ class TelegramBot(TelegramNotifier):
         if pending is None:
             await self._ensure_sender().answer_callback_query(
                 query.id, "Este borrador ya no está disponible."
+            )
+            return
+        # Group isolation: only the member who requested the draft may
+        # confirm/cancel it.
+        if pending.user_id and query.from_user.id != pending.user_id:
+            await self._ensure_sender().answer_callback_query(
+                query.id, "Ese borrador lo está gestionando otro miembro."
             )
             return
         confirmed = action == "confirm"
@@ -523,6 +558,28 @@ class TelegramBot(TelegramNotifier):
             chat_id=message.chat.id,
             message_id=message.message_id,
         )
+
+    # ── "Responder" button ─────────────────────────────────────────────────
+
+    async def _handle_reply_callback(self, query: CallbackQuery, token: str) -> None:
+        """User pressed "Responder": remember the target thread and ask for
+        their intent; their next plain message becomes the reply instruction."""
+        try:
+            tg_message_id = int(token)
+        except ValueError:
+            return
+        sender = self._ensure_sender()
+        await sender.answer_callback_query(query.id)
+        thread_id = self._storage.get_meta(f"{_TG_META_PREFIX}{tg_message_id}")
+        if not thread_id:
+            await self._send("No puedo asociar eso a ningún hilo.")
+            return
+        sender_name = self._storage.get_meta(f"{_TG_SENDER_PREFIX}{tg_message_id}") or ""
+        self._pending_replies[query.from_user.id] = (tg_message_id, thread_id)
+        if sender_name:
+            await self._send(f"¿Qué quieres decirle a {sender_name}?")
+        else:
+            await self._send("¿Qué quieres decirle?")
 
     # ── "Ver original" / "Ocultar original" ────────────────────────────────
 
@@ -636,14 +693,18 @@ class TelegramBot(TelegramNotifier):
         )
         self._storage.set_meta(f"{_TG_META_PREFIX}{message.message_id}", email.thread_id)
         self._storage.set_meta(f"{_TG_GMAIL_PREFIX}{message.message_id}", email.message_id)
-        # Attach the "Ver original" button now that the message_id is known.
-        # The message_id doubles as the callback token (stable across restarts).
-        view_button = InlineKeyboardMarkup(
+        self._storage.set_meta(f"{_TG_SENDER_PREFIX}{message.message_id}", _format_sender(email))
+        # Attach the action buttons now that the message_id is known. The
+        # message_id doubles as the callback token (stable across restarts).
+        buttons = InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton(
                         "Ver original", callback_data=f"view:{message.message_id}"
-                    )
+                    ),
+                    InlineKeyboardButton(
+                        "Responder", callback_data=f"reply:{message.message_id}"
+                    ),
                 ]
             ]
         )
@@ -651,7 +712,7 @@ class TelegramBot(TelegramNotifier):
             text,
             chat_id=self._allowed_chat_id,
             message_id=message.message_id,
-            reply_markup=view_button,
+            reply_markup=buttons,
         )
         return message.message_id
 
@@ -661,7 +722,9 @@ class TelegramBot(TelegramNotifier):
     async def send_typing(self) -> None:
         await self._ensure_sender().send_chat_action(self._allowed_chat_id, ChatAction.TYPING)
 
-    async def send_draft_for_confirmation(self, draft: DraftReply) -> int:
+    async def send_draft_for_confirmation(
+        self, draft: DraftReply, *, user_id: int = 0
+    ) -> int:
         token = secrets.token_urlsafe(8)
         to_line = (
             ", ".join(str(address) for address in draft.to) if draft.to else "(sin destinatario)"
@@ -675,7 +738,7 @@ class TelegramBot(TelegramNotifier):
         keyboard = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("Confirmar", callback_data=f"confirm:{token}"),
+                    InlineKeyboardButton("Enviar", callback_data=f"confirm:{token}"),
                     InlineKeyboardButton("Cancelar", callback_data=f"cancel:{token}"),
                 ]
             ]
@@ -687,7 +750,10 @@ class TelegramBot(TelegramNotifier):
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
         self._pending_drafts[token] = _PendingDraft(
-            token=token, draft=draft, message_id=message.message_id
+            token=token,
+            draft=draft,
+            message_id=message.message_id,
+            user_id=user_id,
         )
         return message.message_id
 
