@@ -36,7 +36,7 @@ from openai.types.chat import ChatCompletionMessageParam
 from ..config import Settings, get_settings
 from ..models import DraftReply, DraftRequest, EmailSummary, ParsedEmail, ThreadContext
 from . import prompts
-from .base import LLMError, LLMInvalidResponse, LLMRateLimited, LLMUnavailable, call_with_retry
+from .base import LLMEmptyResponse, LLMError, LLMRateLimited, LLMUnavailable, call_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,7 @@ class OpenAICompatLLM:
         except APIError as exc:
             raise LLMError(f"LLM API error: {exc}") from exc
         if not response.choices or not response.choices[0].message.content:
-            raise LLMInvalidResponse("LLM returned an empty response")
+            raise LLMEmptyResponse("LLM returned an empty response")
         return response.choices[0].message.content.strip()
 
     async def close(self) -> None:

@@ -37,8 +37,17 @@ class LLMInvalidResponse(LLMError):
     """Provider answered but the output is unusable (empty, refusal)."""
 
 
+class LLMEmptyResponse(LLMInvalidResponse):
+    """Provider answered with EMPTY content; transient — retried like outages.
+
+    Distinct from :class:`LLMInvalidResponse` so genuinely malformed output
+    (refusals, garbage) stays permanent while empty responses — often a
+    transient provider glitch — get immediate retries.
+    """
+
+
 def _default_retryable(exc: BaseException) -> bool:
-    return isinstance(exc, LLMRateLimited | LLMUnavailable)
+    return isinstance(exc, LLMRateLimited | LLMUnavailable | LLMEmptyResponse)
 
 
 def _backoff_delay(attempt: int, base_backoff: float, max_backoff: float) -> float:
@@ -57,9 +66,9 @@ async def call_with_retry(
 ) -> T:
     """Await ``fn()``, retrying transient failures with backoff and jitter.
 
-    ``LLMRateLimited`` and ``LLMUnavailable`` are retried by default; other
-    exceptions propagate immediately. The last exception is re-raised when
-    ``max_attempts`` is exhausted.
+    ``LLMRateLimited``, ``LLMUnavailable`` and ``LLMEmptyResponse`` are retried
+    by default; other exceptions propagate immediately. The last exception is
+    re-raised when ``max_attempts`` is exhausted.
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")

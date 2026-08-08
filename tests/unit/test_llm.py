@@ -188,6 +188,46 @@ async def test_call_with_retry_does_not_retry_permanent_errors() -> None:
     assert calls == 1
 
 
+async def test_call_with_retry_does_not_retry_invalid_response() -> None:
+    """Genuinely invalid output (refusal/garbage) stays permanent: the
+    plain LLMInvalidResponse is NOT in the retryable set."""
+    calls = 0
+
+    async def fn() -> str:
+        nonlocal calls
+        calls += 1
+        raise base.LLMInvalidResponse("refusal")
+
+    with pytest.raises(base.LLMInvalidResponse):
+        await base.call_with_retry(fn, max_attempts=3)
+    assert calls == 1
+
+
+async def test_call_with_retry_retries_empty_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
+    calls = 0
+
+    async def fn() -> str:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise base.LLMEmptyResponse("empty")
+        return "ok"
+
+    result = await base.call_with_retry(fn, max_attempts=5, base_backoff=1.0)
+    assert result == "ok"
+    assert calls == 3
+    assert len(sleeps) == 2
+    assert all(0 <= seconds <= 2.0 for seconds in sleeps)
+
+
 async def test_call_with_retry_invalid_attempts() -> None:
     async def fn() -> str:
         return "never"
@@ -308,6 +348,58 @@ async def test_summarize_email_empty_content_raises_invalid_response(
     _fake_create(provider, monkeypatch, content=None)
     with pytest.raises(base.LLMInvalidResponse):
         await provider.summarize_email(_email())
+
+
+async def test_summarize_email_empty_content_is_retried_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty responses are TRANSIENT: retried within the same call_with_retry
+    budget; a valid second response succeeds."""
+    async def fake_sleep(seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
+    settings = _settings(monkeypatch, LLM_MAX_RETRIES=3)
+    provider = OpenAICompatLLM(settings)
+    calls = 0
+
+    async def empty_then_ok(**kwargs: object) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        content = "Resumen tras reintento." if calls > 1 else None
+        message = SimpleNamespace(content=content)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    monkeypatch.setattr(provider._client.chat.completions, "create", empty_then_ok)
+    result = await provider.summarize_email(_email())
+    assert result.summary_es == "Resumen tras reintento."
+    assert calls == 2
+
+
+async def test_summarize_email_repeated_empty_raises_empty_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All attempts empty → LLMEmptyResponse (an LLMInvalidResponse subclass)
+    propagates so the pipeline FAILED + delayed retry path is preserved."""
+    async def fake_sleep(seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
+    settings = _settings(monkeypatch, LLM_MAX_RETRIES=3)
+    provider = OpenAICompatLLM(settings)
+    calls = 0
+
+    async def always_empty(**kwargs: object) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        message = SimpleNamespace(content=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    monkeypatch.setattr(provider._client.chat.completions, "create", always_empty)
+    with pytest.raises(base.LLMEmptyResponse) as exc_info:
+        await provider.summarize_email(_email())
+    assert isinstance(exc_info.value, base.LLMInvalidResponse)
+    assert calls == 3
 
 
 async def test_draft_reply_builds_draft_from_trusted_thread_data(
