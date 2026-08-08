@@ -120,8 +120,10 @@ def test_unknown_thread_notifies_user(tmp_path: object) -> None:
 class MockLLM:
     """Deterministic LLMProvider double for the responder tests."""
 
-    async def summarize_email(self, email: object) -> str:
-        return "resumen"
+    async def summarize_email(self, email: object) -> object:
+        from inboxbridge.models import EmailSummary
+
+        return EmailSummary(summary_es="resumen")
 
     async def draft_reply(self, request: object, thread: object) -> object:
         from inboxbridge.models import DraftReply, ThreadContext

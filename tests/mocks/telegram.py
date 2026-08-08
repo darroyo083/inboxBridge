@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from inboxbridge.models import DraftReply, ParsedEmail
+from inboxbridge.models import DraftReply, EmailSummary, ParsedEmail
 
 
 @dataclass
@@ -13,6 +13,7 @@ class SentMessage:
     content: str
     draft: DraftReply | None = None
     email: ParsedEmail | None = None
+    summary: EmailSummary | None = None
 
 
 class FakeTelegram:
@@ -24,8 +25,10 @@ class FakeTelegram:
         self.typing_calls: int = 0
         self._next_id: int = 1
 
-    async def send_summary(self, email: ParsedEmail, summary: str) -> int:
-        return self._record(SentMessage(kind="summary", content=summary, email=email))
+    async def send_summary(self, email: ParsedEmail, summary: EmailSummary) -> int:
+        return self._record(
+            SentMessage(kind="summary", content=summary.summary_es, email=email, summary=summary)
+        )
 
     async def send_notice(self, text: str) -> int:
         self.notices.append(text)

@@ -14,6 +14,7 @@ from typing import Protocol
 from .models import (
     DraftReply,
     DraftRequest,
+    EmailSummary,
     ParsedEmail,
     ThreadContext,
 )
@@ -39,8 +40,9 @@ class LLMProvider(Protocol):
     """LLM abstraction. Must never raise on transient errors — pipeline
     retries; failures surface via dedicated exception types."""
 
-    async def summarize_email(self, email: ParsedEmail) -> str:
-        """Produce a natural Spanish summary of an incoming email."""
+    async def summarize_email(self, email: ParsedEmail) -> EmailSummary:
+        """Produce a natural Spanish summary (and Spanish subject) of an
+        incoming email. One LLM call: subject translation + summary together."""
         ...
 
     async def draft_reply(
@@ -53,8 +55,9 @@ class LLMProvider(Protocol):
 class TelegramNotifier(Protocol):
     """Telegram side. Only the configured group chat is ever touched."""
 
-    async def send_summary(self, email: ParsedEmail, summary: str) -> int:
-        """Post summary; returns telegram message_id."""
+    async def send_summary(self, email: ParsedEmail, summary: EmailSummary) -> int:
+        """Post summary (with Spanish subject, falling back to the original);
+        returns telegram message_id."""
         ...
 
     async def send_notice(self, text: str) -> int:

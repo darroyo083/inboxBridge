@@ -54,7 +54,7 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes, Messag
 from ..config import Settings
 from ..contracts import TelegramNotifier
 from ..db import Storage
-from ..models import DraftReply, ParsedEmail
+from ..models import DraftReply, EmailSummary, ParsedEmail
 
 logger = logging.getLogger(__name__)
 
@@ -321,10 +321,13 @@ class TelegramBot(TelegramNotifier):
 
     # ── TelegramNotifier implementation ────────────────────────────────────
 
-    async def send_summary(self, email: ParsedEmail, summary: str) -> int:
+    async def send_summary(self, email: ParsedEmail, summary: EmailSummary) -> int:
         sender = self._ensure_sender()
         sender_name = email.sender.name or email.sender.email
-        text = f"{email.subject}\nDe: {sender_name}\n\n{neutralize_links(summary)}"
+        # Spanish subject from the LLM; original subject as fallback. The
+        # original email.subject stays the source of truth for threading.
+        display_subject = summary.subject_es or email.subject
+        text = f"{display_subject}\nDe: {sender_name}\n\n{neutralize_links(summary.summary_es)}"
         message = await sender.send_message(
             self._allowed_chat_id,
             text,

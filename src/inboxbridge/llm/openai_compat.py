@@ -2,11 +2,18 @@
 
 Any endpoint speaking the OpenAI /chat/completions protocol works via
 ``base_url``. There is NO automatic fallback between providers.
+
+The summary response is expected as JSON (``{"subject_es": ..., "summary_es": ...}``);
+parsing is tolerant: when JSON is missing or malformed, the summary falls back
+to the raw text and the Spanish subject is empty (the caller then shows the
+original subject) — the inbound pipeline never fails because of it.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 
 import httpx
 from openai import (
@@ -27,11 +34,14 @@ from openai import (
 from openai.types.chat import ChatCompletionMessageParam
 
 from ..config import Settings, get_settings
-from ..models import DraftReply, DraftRequest, ParsedEmail, ThreadContext
+from ..models import DraftReply, DraftRequest, EmailSummary, ParsedEmail, ThreadContext
 from . import prompts
 from .base import LLMError, LLMInvalidResponse, LLMRateLimited, LLMUnavailable, call_with_retry
 
 logger = logging.getLogger(__name__)
+
+#: Tolerant JSON extraction for LLM output (fenced code blocks included).
+_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 #: httpx timeouts for LLM calls (long reads: summaries/drafts can be slow).
 _CONNECT_TIMEOUT = 10.0
@@ -69,14 +79,15 @@ class OpenAICompatLLM:
             max_retries=0,
         )
 
-    async def summarize_email(self, email: ParsedEmail) -> str:
-        return await call_with_retry(
+    async def summarize_email(self, email: ParsedEmail) -> EmailSummary:
+        content = await call_with_retry(
             lambda: self._complete(
                 prompts.summary_messages(email), self._settings.llm_max_tokens_summary
             ),
             max_attempts=self._settings.llm_max_retries,
             base_backoff=self._settings.retry_backoff_base,
         )
+        return _parse_summary(content)
 
     async def draft_reply(self, request: DraftRequest, thread: ThreadContext) -> DraftReply:
         body = await call_with_retry(
@@ -122,3 +133,29 @@ class OpenAICompatLLM:
 
     async def close(self) -> None:
         await self._client.close()
+
+
+def _parse_summary(content: str) -> EmailSummary:
+    """Parse the LLM JSON output into an EmailSummary, tolerantly.
+
+    - valid JSON with both fields → used as-is;
+    - valid JSON missing ``subject_es`` → empty subject (caller falls back);
+    - not JSON at all → whole text becomes the summary, empty subject.
+    Never raises: the pipeline must not fail because of a malformed subject.
+    """
+    match = _JSON_BLOCK_RE.search(content)
+    if match is not None:
+        try:
+            payload = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            summary_es = payload.get("summary_es")
+            if isinstance(summary_es, str) and summary_es.strip():
+                subject_es = payload.get("subject_es")
+                return EmailSummary(
+                    subject_es=subject_es if isinstance(subject_es, str) else "",
+                    summary_es=summary_es.strip(),
+                )
+    logger.warning("LLM summary response was not valid JSON; using raw text")
+    return EmailSummary(subject_es="", summary_es=content)

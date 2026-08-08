@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 from inboxbridge.llm.base import LLMUnavailable
-from inboxbridge.models import DraftReply, DraftRequest, EmailAddress, ParsedEmail, ThreadContext
+from inboxbridge.models import (
+    DraftReply,
+    DraftRequest,
+    EmailAddress,
+    EmailSummary,
+    ParsedEmail,
+    ThreadContext,
+)
 
 
 class FakeLLM:
@@ -17,6 +24,7 @@ class FakeLLM:
         self,
         *,
         summary: str = "Resumen de prueba.",
+        subject_es: str = "",
         draft_body: str = (
             "Sehr geehrte Frau Muster,\n\nvielen Dank für Ihre Nachricht. "
             "Ich melde mich Anfang nächster Woche.\n\nMit freundlichen Grüßen\nInboxBridge"
@@ -25,18 +33,19 @@ class FakeLLM:
         transient_failures: int = 0,
     ) -> None:
         self.summary = summary
+        self.subject_es = subject_es
         self.draft_body = draft_body
         self.draft_to = draft_to
         self.transient_failures = transient_failures
         self.summarize_calls: list[ParsedEmail] = []
         self.draft_calls: list[tuple[DraftRequest, ThreadContext]] = []
 
-    async def summarize_email(self, email: ParsedEmail) -> str:
+    async def summarize_email(self, email: ParsedEmail) -> EmailSummary:
         self.summarize_calls.append(email)
         if self.transient_failures > 0:
             self.transient_failures -= 1
             raise LLMUnavailable("simulated transient outage")
-        return self.summary
+        return EmailSummary(subject_es=self.subject_es, summary_es=self.summary)
 
     async def draft_reply(self, request: DraftRequest, thread: ThreadContext) -> DraftReply:
         self.draft_calls.append((request, thread))
@@ -58,7 +67,7 @@ class FailingLLM:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error or LLMUnavailable("simulated outage")
 
-    async def summarize_email(self, email: ParsedEmail) -> str:
+    async def summarize_email(self, email: ParsedEmail) -> EmailSummary:
         raise self.error
 
     async def draft_reply(self, request: DraftRequest, thread: ThreadContext) -> DraftReply:

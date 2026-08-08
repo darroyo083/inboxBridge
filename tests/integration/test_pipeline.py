@@ -71,6 +71,61 @@ async def test_happy_path(tmp_path: object) -> None:
     assert storage.get_status("m1") == MessageStatus.SENT_TELEGRAM
 
 
+async def test_spanish_subject_flows_to_telegram_and_original_stays_untouched(
+    tmp_path: object,
+) -> None:
+    """The LLM produces subject_es + summary_es in ONE call; the original
+    email.subject (source of truth for threading/drafts) is never overwritten."""
+    settings = make_settings()
+    storage = make_storage(tmp_path)
+    storage.set_meta("last_history_id", "10")
+    email = make_email(subject="Arbeitsplan nächste Woche")
+    gmail = FakeGmail(messages={"m1": email})
+    llm = FakeLLM(
+        summary="Reunión el viernes: confirmar asistencia.",
+        subject_es="Plan de trabajo de la próxima semana",
+    )
+    telegram = FakeTelegram()
+
+    pipeline = InboundPipeline(
+        settings, gmail, llm, telegram, storage,
+        history_provider=_delta_provider(["m1"]),
+    )
+    result = await pipeline.process_event(make_event(history_id=20))
+    assert result.status == MessageStatus.SENT_TELEGRAM
+
+    # Spanish subject displayed on Telegram; original subject NOT shown.
+    assert telegram.sent[0].summary is not None
+    assert telegram.sent[0].summary.subject_es == "Plan de trabajo de la próxima semana"
+    # Original subject untouched (source of truth for Gmail threading).
+    assert email.subject == "Arbeitsplan nächste Woche"
+    # One LLM call total (summary + subject in the same request, no extra call).
+    assert len(llm.summarize_calls) == 1
+
+
+async def test_missing_spanish_subject_falls_back_and_pipeline_succeeds(
+    tmp_path: object,
+) -> None:
+    """Malformed/missing subject_es must not fail the pipeline: Telegram shows
+    the original subject and the message is still marked SENT_TELEGRAM."""
+    settings = make_settings()
+    storage = make_storage(tmp_path)
+    storage.set_meta("last_history_id", "10")
+    gmail = FakeGmail(messages={"m1": make_email(subject="Arbeitsplan nächste Woche")})
+    llm = FakeLLM(summary="Reunión el viernes.", subject_es="")  # no translated subject
+    telegram = FakeTelegram()
+
+    pipeline = InboundPipeline(
+        settings, gmail, llm, telegram, storage,
+        history_provider=_delta_provider(["m1"]),
+    )
+    result = await pipeline.process_event(make_event(history_id=20))
+    assert result.status == MessageStatus.SENT_TELEGRAM
+    assert telegram.sent[0].summary is not None
+    assert telegram.sent[0].summary.subject_es == ""
+    assert telegram.sent[0].summary.summary_es == "Reunión el viernes."
+
+
 async def test_duplicate_event_is_idempotent(tmp_path: object) -> None:
     settings = make_settings()
     storage = make_storage(tmp_path)
@@ -205,7 +260,7 @@ async def _empty_delta(event: PubSubEvent) -> HistoryDelta:
 
 
 class FailingLLM(FakeLLM):
-    async def summarize_email(self, email: object) -> str:
+    async def summarize_email(self, email: object) -> object:
         from inboxbridge.llm.base import LLMUnavailable
 
         raise LLMUnavailable("simulated outage")

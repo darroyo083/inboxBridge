@@ -128,6 +128,19 @@ class PubSubEvent:
 
 
 @dataclass(frozen=True)
+class EmailSummary:
+    """LLM result for an incoming email: Spanish subject + Spanish summary.
+
+    ``subject_es`` may be empty when the LLM did not produce one — the caller
+    falls back to the original ``ParsedEmail.subject`` (source of truth for
+    threading/drafts; never overwritten).
+    """
+
+    subject_es: str = ""
+    summary_es: str = ""
+
+
+@dataclass(frozen=True)
 class PipelineResult:
     message_id: str
     status: MessageStatus

@@ -50,8 +50,12 @@ _SUMMARY_RULES = (
     f"- NUNCA uses frases como: {', '.join(f'\"{p}\"' for p in FORBIDDEN_SUMMARY_PHRASES)}.\n"
     "- No suenes a IA: evita \"En resumen\", \"Espero que esto te ayude\", \"No dudes en...\" "
     "y fórmulas de asistente genérico.\n"
-    "- Sin markdown, sin emojis, texto plano.\n"
-    "- Responde únicamente con el resumen, sin preámbulos ni despedidas."
+    "- Sin markdown, sin emojis, texto plano.\n\n"
+    "ASUNTO: traduce/adapta también el asunto del correo al español en el campo "
+    "\"subject_es\": español natural y breve, fiel al original, sin inventar información. "
+    "Si el asunto ya está en español, consérvalo tal cual.\n\n"
+    "RESPONDE SOLO EN JSON con esta forma exacta (sin markdown, sin texto fuera del JSON):\n"
+    '{"subject_es": "<asunto en español>", "summary_es": "<resumen en español>"}'
 )
 
 _DRAFT_RULES = (

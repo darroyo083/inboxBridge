@@ -27,7 +27,7 @@ from telegram.constants import ChatAction, ChatType, ParseMode
 
 from inboxbridge.config import Settings
 from inboxbridge.db import Storage
-from inboxbridge.models import DraftReply, EmailAddress, ParsedEmail
+from inboxbridge.models import DraftReply, EmailAddress, EmailSummary, ParsedEmail
 from inboxbridge.telegram.bot import TelegramBot
 
 CHAT_ID = -100123456789
@@ -404,14 +404,31 @@ async def test_wait_for_confirmation_timeout(make_env: Any) -> None:
 # ── notifier methods ──────────────────────────────────────────────────────
 
 
-async def test_send_summary_stores_thread_mapping(make_env: Any) -> None:
+async def test_send_summary_stores_thread_mapping_and_shows_spanish_subject(
+    make_env: Any,
+) -> None:
     bot, sender, storage = make_env()
-    message_id = await bot.send_summary(_email(), "Resumen con enlace https://evil.example.com/x")
+    summary = EmailSummary(
+        subject_es="Plan de trabajo de la próxima semana",
+        summary_es="Resumen con enlace https://evil.example.com/x",
+    )
+    message_id = await bot.send_summary(_email(), summary)
     assert message_id == 1
     assert storage.get_meta(f"tg:{message_id}") == "t1"
     text = sender.messages[0].text
-    assert "Presupuesto" in text
+    assert "Plan de trabajo de la próxima semana" in text
+    assert "Presupuesto" not in text  # original German subject is not shown
     assert "Resumen con enlace hxxps://evil.example.com/x" in text
+
+
+async def test_send_summary_falls_back_to_original_subject_when_missing(
+    make_env: Any,
+) -> None:
+    bot, sender, storage = make_env()
+    summary = EmailSummary(subject_es="", summary_es="Resumen de prueba.")
+    message_id = await bot.send_summary(_email(), summary)
+    assert storage.get_meta(f"tg:{message_id}") == "t1"  # thread mapping intact
+    assert "Presupuesto" in sender.messages[0].text  # original subject fallback
 
 
 async def test_send_notice_neutralizes_links(make_env: Any) -> None:

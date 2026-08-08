@@ -75,6 +75,15 @@ def test_summary_messages_structure() -> None:
     assert _email("cuerpo").subject in cast(str, messages[1]["content"])
 
 
+def test_summary_system_prompt_asks_for_spanish_subject() -> None:
+    system = prompts.summary_system_prompt()
+    assert "subject_es" in system
+    assert "summary_es" in system
+    assert "JSON" in system
+    assert "traduce/adapta también el asunto" in system
+    assert "Si el asunto ya está en español, consérvalo" in system
+
+
 def test_summary_attachment_text_inside_delimiters() -> None:
     from inboxbridge.models import AttachmentMeta
 

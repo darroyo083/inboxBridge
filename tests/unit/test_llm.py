@@ -14,7 +14,14 @@ import pytest
 
 from inboxbridge.config import Settings
 from inboxbridge.llm import OpenAICompatLLM, base, prompts
-from inboxbridge.models import DraftRequest, EmailAddress, ParsedEmail, ThreadContext, ThreadMessage
+from inboxbridge.models import (
+    DraftRequest,
+    EmailAddress,
+    EmailSummary,
+    ParsedEmail,
+    ThreadContext,
+    ThreadMessage,
+)
 
 
 def _settings(monkeypatch: pytest.MonkeyPatch, **overrides: object) -> Settings:
@@ -242,19 +249,56 @@ async def test_rate_limit_error_is_retried_then_raises(
 # ── provider behavior ─────────────────────────────────────────────────────
 
 
-async def test_summarize_email_sends_prompt_and_strips_content(
+async def test_summarize_email_sends_prompt_and_parses_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = _provider(monkeypatch)
-    captured = _fake_create(provider, monkeypatch, content="  Resumen breve.  ")
+    content = (
+        '{"subject_es": "Plan de trabajo de la próxima semana", '
+        '"summary_es": "Resumen breve."}'
+    )
+    captured = _fake_create(provider, monkeypatch, content=content)
     result = await provider.summarize_email(_email())
-    assert result == "Resumen breve."
+    assert result == EmailSummary(
+        subject_es="Plan de trabajo de la próxima semana", summary_es="Resumen breve."
+    )
     request = cast(dict[str, Any], captured[0])
     assert request["model"] == "test-model"
     assert request["max_tokens"] == 700
     assert request["temperature"] == 0.4
     assert request["messages"][0]["role"] == "system"
     assert prompts.UNTRUSTED_DATA_START in request["messages"][1]["content"]
+
+
+async def test_summarize_email_plain_text_falls_back_to_raw_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-JSON LLM output must not break the pipeline: raw text becomes the
+    summary and the Spanish subject stays empty (original subject shown)."""
+    provider = _provider(monkeypatch)
+    _fake_create(provider, monkeypatch, content="  Resumen breve en texto plano.  ")
+    result = await provider.summarize_email(_email())
+    assert result == EmailSummary(subject_es="", summary_es="Resumen breve en texto plano.")
+
+
+async def test_summarize_email_json_without_subject_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(monkeypatch)
+    _fake_create(provider, monkeypatch, content='{"summary_es": "Solo resumen."}')
+    result = await provider.summarize_email(_email())
+    assert result == EmailSummary(subject_es="", summary_es="Solo resumen.")
+
+
+async def test_summarize_email_fenced_json_block_is_parsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(monkeypatch)
+    content = '```json\n{"subject_es": "Reunión", "summary_es": "El viernes."}\n```'
+    _fake_create(provider, monkeypatch, content=content)
+    result = await provider.summarize_email(_email())
+    assert result.subject_es == "Reunión"
+    assert result.summary_es == "El viernes."
 
 
 async def test_summarize_email_empty_content_raises_invalid_response(
