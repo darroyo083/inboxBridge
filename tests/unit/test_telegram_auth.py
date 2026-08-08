@@ -418,6 +418,7 @@ async def test_send_summary_stores_thread_mapping_and_shows_spanish_subject(
     text = sender.messages[0].text
     assert "Plan de trabajo de la próxima semana" in text
     assert "Presupuesto" not in text  # original German subject is not shown
+    assert "De: Ana (ana@example.com)" in text
     assert "Resumen con enlace hxxps://evil.example.com/x" in text
 
 
@@ -429,6 +430,58 @@ async def test_send_summary_falls_back_to_original_subject_when_missing(
     message_id = await bot.send_summary(_email(), summary)
     assert storage.get_meta(f"tg:{message_id}") == "t1"  # thread mapping intact
     assert "Presupuesto" in sender.messages[0].text  # original subject fallback
+    assert "De: Ana (ana@example.com)" in sender.messages[0].text
+
+
+@pytest.mark.parametrize("name", ["", "   "])
+async def test_send_summary_shows_email_only_when_sender_has_no_useful_name(
+    make_env: Any, name: str
+) -> None:
+    bot, sender, storage = make_env()
+    email = _email()
+    email = ParsedEmail(
+        message_id=email.message_id,
+        thread_id=email.thread_id,
+        history_id=email.history_id,
+        subject=email.subject,
+        sender=EmailAddress(name, email.sender.email),
+        recipients=email.recipients,
+        date_iso=email.date_iso,
+        body_text=email.body_text,
+        attachments=email.attachments,
+    )
+    summary = EmailSummary(subject_es="Asunto traducido", summary_es="Resumen de prueba.")
+    message_id = await bot.send_summary(email, summary)
+    assert storage.get_meta(f"tg:{message_id}") == "t1"  # thread mapping intact
+    text = sender.messages[0].text
+    assert "Asunto traducido" in text
+    assert "De: ana@example.com" in text
+    assert "ana@example.com (ana@example.com)" not in text
+
+
+async def test_send_summary_does_not_duplicate_email_as_sender_name(
+    make_env: Any,
+) -> None:
+    bot, sender, storage = make_env()
+    email = _email()
+    email = ParsedEmail(
+        message_id=email.message_id,
+        thread_id=email.thread_id,
+        history_id=email.history_id,
+        subject=email.subject,
+        sender=EmailAddress("ana@example.com", email.sender.email),
+        recipients=email.recipients,
+        date_iso=email.date_iso,
+        body_text=email.body_text,
+        attachments=email.attachments,
+    )
+    summary = EmailSummary(subject_es="Asunto traducido", summary_es="Resumen de prueba.")
+    message_id = await bot.send_summary(email, summary)
+    assert storage.get_meta(f"tg:{message_id}") == "t1"  # thread mapping intact
+    text = sender.messages[0].text
+    assert "Asunto traducido" in text
+    assert "De: ana@example.com" in text
+    assert "ana@example.com (ana@example.com)" not in text
 
 
 async def test_send_notice_neutralizes_links(make_env: Any) -> None:

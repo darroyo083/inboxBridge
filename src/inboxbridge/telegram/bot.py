@@ -124,6 +124,20 @@ def neutralize_links(text: str) -> str:
     return _URL_SCHEME_RE.sub(lambda match: f"hxxp{match.group(0)[4:]}", text)
 
 
+def _format_sender(email: ParsedEmail) -> str:
+    """Human-readable sender display: "Name (email)", or just "email".
+
+    The address is shown alone when the name is empty/whitespace or when it
+    duplicates the address (avoids noise like "ana@example.com
+    (ana@example.com)").
+    """
+    address = email.sender
+    name = address.name.strip() if address.name else ""
+    if name and name.casefold() != address.email.casefold():
+        return f"{name} ({address.email})"
+    return address.email
+
+
 class TelegramBot(TelegramNotifier):
     def __init__(
         self,
@@ -323,11 +337,13 @@ class TelegramBot(TelegramNotifier):
 
     async def send_summary(self, email: ParsedEmail, summary: EmailSummary) -> int:
         sender = self._ensure_sender()
-        sender_name = email.sender.name or email.sender.email
         # Spanish subject from the LLM; original subject as fallback. The
         # original email.subject stays the source of truth for threading.
         display_subject = summary.subject_es or email.subject
-        text = f"{display_subject}\nDe: {sender_name}\n\n{neutralize_links(summary.summary_es)}"
+        text = (
+            f"{display_subject}\nDe: {_format_sender(email)}\n\n"
+            f"{neutralize_links(summary.summary_es)}"
+        )
         message = await sender.send_message(
             self._allowed_chat_id,
             text,
