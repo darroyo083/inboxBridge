@@ -356,6 +356,146 @@ async def test_cancel_command_resolves_pending_draft(make_env: Any) -> None:
     assert "cancelados" in sender.messages[-1].text
 
 
+# ── explicit memory commands (/remember /memory /forget) ──────────────────
+
+
+async def test_remember_stores_fact_and_replies(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    message = _message(30, CHAT_ID, "/remember Roman es tu jefe", 7)
+    await bot.process_update(_update(message))
+    assert sender.messages[-1].text == "Me guardo que Roman es tu jefe."
+    facts = storage.list_memories(7)
+    assert [f["value"] for f in facts] == ["Roman es tu jefe"]
+    assert [f["key"] for f in facts] == ["roman es tu jefe"]
+
+
+async def test_remember_long_fact_derives_key_from_first_four_words(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    fact = "La reunión de presupuesto es el martes a las 10"
+    await bot.process_update(_update(_message(30, CHAT_ID, f"/remember {fact}", 7)))
+    (saved,) = storage.list_memories(7)
+    assert saved["key"] == "la reunión de presupuesto"
+    assert saved["value"] == fact
+    assert sender.messages[-1].text == f"Me guardo que {fact}."
+
+
+async def test_remember_same_fact_is_upserted(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.process_update(_update(_message(30, CHAT_ID, "/remember Roman es tu jefe", 7)))
+    await bot.process_update(_update(_message(31, CHAT_ID, "/remember Roman es tu jefe", 7)))
+    assert len(storage.list_memories(7)) == 1
+
+
+async def test_remember_rejects_secret_like_facts(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    for text in ("/remember sk-abcdefgh1234", "/remember password=123"):
+        await bot.process_update(_update(_message(30, CHAT_ID, text, 7)))
+    assert "no lo guardo" in sender.messages[-1].text
+    assert storage.list_memories(7) == []
+
+
+async def test_remember_without_argument_shows_usage(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.process_update(_update(_message(30, CHAT_ID, "/remember", 7)))
+    assert "/remember" in sender.messages[-1].text
+    assert storage.list_memories(7) == []
+
+
+async def test_memory_command_lists_facts_ordered_by_key(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.process_update(_update(_message(30, CHAT_ID, "/remember Roman es tu jefe", 7)))
+    await bot.process_update(_update(_message(31, CHAT_ID, "/remember Trabajas en FEMO", 7)))
+    await bot.process_update(_update(_message(32, CHAT_ID, "/memory", 7)))
+    assert sender.messages[-1].text == "Recuerdo:\n* Roman es tu jefe\n* Trabajas en FEMO"
+
+
+async def test_memory_command_empty_state(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.process_update(_update(_message(30, CHAT_ID, "/memory", 7)))
+    assert "No tengo nada guardado" in sender.messages[-1].text
+
+
+async def test_memory_command_filters_by_query(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.process_update(_update(_message(30, CHAT_ID, "/remember Roman es tu jefe", 7)))
+    await bot.process_update(_update(_message(31, CHAT_ID, "/memory roman", 7)))
+    assert sender.messages[-1].text == "Recuerdo:\n* Roman es tu jefe"
+    await bot.process_update(_update(_message(32, CHAT_ID, "/memory inexistente", 7)))
+    assert sender.messages[-1].text == "No tengo nada guardado sobre eso."
+
+
+async def test_forget_removes_matching_fact_and_replies(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.process_update(_update(_message(30, CHAT_ID, "/remember Roman es tu jefe", 7)))
+    await bot.process_update(_update(_message(31, CHAT_ID, "/forget roman", 7)))
+    assert sender.messages[-1].text == "He olvidado lo de Roman."
+    assert storage.list_memories(7) == []
+
+
+async def test_forget_removes_multiple_matching_facts(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.process_update(_update(_message(30, CHAT_ID, "/remember Roman es mi jefe", 7)))
+    await bot.process_update(_update(_message(31, CHAT_ID, "/remember Roman es mi colega", 7)))
+    await bot.process_update(_update(_message(32, CHAT_ID, "/forget roman es mi", 7)))
+    assert sender.messages[-1].text == "He olvidado 2 cosas de Roman es mi."
+    assert storage.list_memories(7) == []
+
+
+async def test_forget_not_found_replies_naturally(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.process_update(_update(_message(30, CHAT_ID, "/forget roman", 7)))
+    assert sender.messages[-1].text == "No tengo nada guardado de eso."
+
+
+async def test_memory_isolated_between_telegram_users(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.process_update(_update(_message(30, CHAT_ID, "/remember Roman es tu jefe", 7)))
+    await bot.process_update(_update(_message(31, CHAT_ID, "/memory", 8)))
+    assert "No tengo nada guardado" in sender.messages[-1].text
+    await bot.process_update(_update(_message(32, CHAT_ID, "/forget roman", 8)))
+    assert sender.messages[-1].text == "No tengo nada guardado de eso."
+    assert len(storage.list_memories(7)) == 1
+
+
+async def test_memory_commands_ignored_outside_allowed_chat(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.process_update(_update(_message(30, -999, "/remember Roman es tu jefe", 7)))
+    assert sender.messages == []
+    assert storage.list_memories(7) == []
+
+
+async def test_memory_persists_after_restart(make_env: Any, tmp_path: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.process_update(_update(_message(30, CHAT_ID, "/remember Roman es tu jefe", 7)))
+    storage.close()
+    storage2 = Storage(tmp_path / "state.sqlite")
+    storage2.connect()
+    assert [f["value"] for f in storage2.list_memories(7)] == ["Roman es tu jefe"]
+    storage2.close()
+
+
+async def test_email_content_is_never_auto_stored(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.send_summary(
+        _email(), EmailSummary(subject_es="Asunto", summary_es="Resumen secreto")
+    )
+    assert storage.list_memories(7) == []
+    assert storage.list_memories(BOT_ID) == []
+    assert storage.get_meta("tg:1") == "t1"  # only ID mappings, never email content
+
+
+async def test_reply_request_carries_only_requesting_users_memory(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.process_update(_update(_message(30, CHAT_ID, "/remember Roman es tu jefe", 7)))
+    await bot.process_update(_update(_message(31, CHAT_ID, "/remember Trabajas en FEMO", 7)))
+    await bot.process_update(_update(_message(32, CHAT_ID, "/remember Datos del banco", 8)))
+    bot_message = _message(40, CHAT_ID, "Presupuesto", BOT_ID, is_bot=True)
+    message = _message(41, CHAT_ID, "responde que sí", 7, reply_to=bot_message)
+    await bot.process_update(_update(message))
+    (request,) = await _drain(bot)
+    assert request.memory == ("Roman es tu jefe", "Trabajas en FEMO")
+
+
 def _button_data(markup: InlineKeyboardMarkup, row: int, col: int) -> str:
     """Callback data of a button (PTB types the attribute as object)."""
     return cast(str, markup.inline_keyboard[row][col].callback_data or "")

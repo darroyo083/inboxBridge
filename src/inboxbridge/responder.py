@@ -59,6 +59,7 @@ class ReplyCoordinator:
                 thread_id=request.thread_id,
                 user_instructions=request.user_instructions,
                 language="de",
+                memory=request.memory,
             )
             draft: DraftReply = await self._llm.draft_reply(draft_request, thread)
             await self._present_draft(draft)

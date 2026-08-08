@@ -34,6 +34,16 @@ Key design decisions (documented for the coordinator):
 - Streaming is NOT enabled: the ``LLMProvider`` contract has no streaming
   surface. A typing indicator is shown while the LLM runs.
 - Display text is scrubbed so URLs are never clickable (untrusted content).
+- Explicit memory V1 (``/remember``, ``/memory``, ``/forget``): per-member
+  facts stored in SQLite via ``db.Storage``, keyed by the Telegram user id
+  (never the chat id) and isolated between members. Facts are ONLY stored
+  when a member explicitly asks; nothing is ever learned from emails or
+  conversation. A fact is normalized into a matching key (first 4 words,
+  lowercased, punctuation stripped — or the whole text when short) plus the
+  original text as the displayed value. Secret-like content (api keys,
+  tokens, passwords) is rejected and never persisted. The requesting
+  member's facts ride along on ``ReplyRequest`` so the responder can feed
+  them to the draft prompt as bounded, untrusted context.
 """
 
 from __future__ import annotations
@@ -81,6 +91,26 @@ _MAX_MSG_CHARS = 3900
 #: Cap on temporary "original" messages to avoid flooding the group.
 _MAX_ORIGINAL_MESSAGES = 8
 
+#: Explicit memory V1: a fact's matching key is its first N normalized words.
+_MEMORY_KEY_WORDS = 4
+
+#: Reject credential-like content before persisting a memory. Words cover
+#: Spanish and English ("clave" alone is intentionally NOT matched to avoid
+#: false positives on non-secret usage); prefixes cover common API tokens.
+_SECRET_RE = re.compile(
+    r"("
+    r"\b(api[ _-]?key|apikey|password|passwd|secret|contraseña|token|bearer"
+    r"|client[ _-]?secret|credenciales)\b"
+    r"|sk-[A-Za-z0-9]{4,}"
+    r"|ghp_[A-Za-z0-9]{4,}"
+    r"|xox[baprs]-[A-Za-z0-9-]{4,}"
+    r"|AKIA[0-9A-Z]{16}"
+    r"|AIza[0-9A-Za-z_-]{20,}"
+    r"|BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY"
+    r")",
+    re.IGNORECASE,
+)
+
 
 class Sender(Protocol):
     """Minimal Telegram API surface used by the bot (satisfied by telegram.Bot)."""
@@ -123,6 +153,9 @@ class ReplyRequest:
     thread_id: str
     user_instructions: str
     source_message_id: int
+    #: Explicit facts the requesting member asked the bot to remember
+    #: (bounded, untrusted context for the LLM).
+    memory: tuple[str, ...] = ()
 
 
 @dataclass
@@ -142,6 +175,34 @@ class _PendingDraft:
 def neutralize_links(text: str) -> str:
     """Make URLs non-clickable in Telegram display (https:// → hxxps://)."""
     return _URL_SCHEME_RE.sub(lambda match: f"hxxp{match.group(0)[4:]}", text)
+
+
+def _normalize_memory_text(text: str) -> str:
+    """Lowercase, drop punctuation, collapse whitespace (matching keys)."""
+    stripped = re.sub(r"[^\w\s]", "", text.lower())
+    return " ".join(stripped.split())
+
+
+def _split_memory_fact(text: str) -> tuple[str, str]:
+    """Split a fact into (key, value) for storage.
+
+    Key = the first ``_MEMORY_KEY_WORDS`` normalized words, or the whole
+    normalized text when the fact is short (≤ 4 words). The key is what
+    ``/memory`` and ``/forget`` match against. Value = the original text,
+    kept for display (``/memory`` shows what the member actually wrote).
+
+    Raises ValueError when the text has no meaningful content.
+    """
+    normalized = _normalize_memory_text(text)
+    words = normalized.split()
+    if not words:
+        raise ValueError("memory fact is empty")
+    key = (
+        normalized
+        if len(words) <= _MEMORY_KEY_WORDS
+        else " ".join(words[:_MEMORY_KEY_WORDS])
+    )
+    return key, text.strip()
 
 
 def _format_sender(email: ParsedEmail) -> str:
@@ -288,11 +349,22 @@ class TelegramBot(TelegramNotifier):
     # ── commands ───────────────────────────────────────────────────────────
 
     async def _handle_command(self, message: Message, text: str) -> None:
-        command = text.split(maxsplit=1)[0].lower().split("@", maxsplit=1)[0]
+        user = message.from_user
+        if user is None:
+            return
+        parts = text.split(maxsplit=1)
+        command = parts[0].lower().split("@", maxsplit=1)[0]
+        arg = parts[1].strip() if len(parts) > 1 else ""
         if command == "/status":
             await self._run_status(message)
         elif command == "/cancel":
             await self._run_cancel(message)
+        elif command == "/remember":
+            await self._run_remember(message, user.id, arg)
+        elif command == "/memory":
+            await self._run_memory(message, user.id, arg)
+        elif command == "/forget":
+            await self._run_forget(message, user.id, arg)
 
     async def _run_status(self, message: Message) -> None:
         if self._status_provider is None:
@@ -310,6 +382,68 @@ class TelegramBot(TelegramNotifier):
         text = "Nada que cancelar." if cancelled == 0 else f"Borradores cancelados: {cancelled}."
         await self._send(text, reply_to=message.message_id)
 
+    async def _run_remember(self, message: Message, user_id: int, arg: str) -> None:
+        if not arg:
+            await self._send(
+                "Dame algo que recordar: /remember <dato>", reply_to=message.message_id
+            )
+            return
+        if _SECRET_RE.search(arg):
+            await self._send(
+                "Eso tiene pinta de ser un secreto; no lo guardo.",
+                reply_to=message.message_id,
+            )
+            return
+        try:
+            key, value = _split_memory_fact(arg)
+        except ValueError:
+            await self._send(
+                "Dame algo que recordar: /remember <dato>", reply_to=message.message_id
+            )
+            return
+        self._storage.set_memory(user_id, key, value)
+        await self._send(
+            f"Me guardo que {value.rstrip(' .!?')}.", reply_to=message.message_id
+        )
+
+    async def _run_memory(self, message: Message, user_id: int, arg: str) -> None:
+        query = _normalize_memory_text(arg) or None
+        memories = self._storage.list_memories(user_id, query)
+        if not memories:
+            if query is None:
+                await self._send(
+                    "No tengo nada guardado todavía. Cuéntame algo con /remember.",
+                    reply_to=message.message_id,
+                )
+            else:
+                await self._send(
+                    "No tengo nada guardado sobre eso.", reply_to=message.message_id
+                )
+            return
+        text = "Recuerdo:\n" + "\n".join(f"* {m['value']}" for m in memories)
+        if len(text) > _MAX_MSG_CHARS:
+            text = text[: _MAX_MSG_CHARS - 30] + "\n[…y más…]"
+        await self._send(text, reply_to=message.message_id)
+
+    async def _run_forget(self, message: Message, user_id: int, arg: str) -> None:
+        query = _normalize_memory_text(arg)
+        if not query:
+            await self._send("Uso: /forget <dato>", reply_to=message.message_id)
+            return
+        deleted = self._storage.delete_memories(user_id, query)
+        if deleted == 0:
+            await self._send(
+                "No tengo nada guardado de eso.", reply_to=message.message_id
+            )
+            return
+        title = query[:1].upper() + query[1:]
+        if deleted == 1:
+            await self._send(f"He olvidado lo de {title}.", reply_to=message.message_id)
+        else:
+            await self._send(
+                f"He olvidado {deleted} cosas de {title}.", reply_to=message.message_id
+            )
+
     # ── plain messages ─────────────────────────────────────────────────────
 
     async def _handle_plain_message(self, message: Message) -> None:
@@ -321,11 +455,18 @@ class TelegramBot(TelegramNotifier):
             if any(p.message_id == reply.message_id for p in self._pending_drafts.values()):
                 return  # draft confirmation message: use the inline buttons
             thread_id = self._storage.get_meta(f"{_TG_META_PREFIX}{reply.message_id}") or ""
+        user = message.from_user
+        memory = (
+            tuple(m["value"] for m in self._storage.list_memories(user.id))
+            if user is not None
+            else ()
+        )
         self._queue.put_nowait(
             ReplyRequest(
                 thread_id=thread_id,
                 user_instructions=message.text or "",
                 source_message_id=message.message_id,
+                memory=memory,
             )
         )
 

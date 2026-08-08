@@ -97,6 +97,9 @@ class DraftRequest:
     thread_id: str
     user_instructions: str
     language: str = "de"
+    #: Explicit facts the requesting member asked the bot to remember
+    #: (untrusted context for the LLM; capped inside the draft prompt).
+    memory: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

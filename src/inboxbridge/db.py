@@ -1,8 +1,9 @@
 """SQLite persistence — minimal state only.
 
 Stores dedup/status identifiers, never email bodies or attachment text.
-Schema is portable: `inboxbridge.db` in a small volume is all that must
-survive a VPS migration.
+Also stores explicit user memories (facts the team saves via /remember);
+nothing is ever learned from emails automatically. Schema is portable:
+`inboxbridge.db` in a small volume is all that must survive a VPS migration.
 
 Ownership note: this is a shared contract (used by both Gmail and Telegram
 workers). The schema lives here; nobody else writes SQL against SQLite.
@@ -73,6 +74,17 @@ class Storage:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_user_id INTEGER NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(telegram_user_id, key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(telegram_user_id);
             """
         )
         self._conn.commit()
@@ -220,3 +232,61 @@ class Storage:
         assert self._conn is not None
         row = self._conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
         return dict(row) if row else None
+
+    # ── memories (explicit user facts, per Telegram user) ──────────────────
+    def set_memory(self, telegram_user_id: int, key: str, value: str) -> None:
+        """Create or update a memory. ``key`` is the normalized fact key."""
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        self._conn.execute(
+            """
+            INSERT INTO memories(telegram_user_id, key, value, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(telegram_user_id, key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (telegram_user_id, key, value, now, now),
+        )
+        self._conn.commit()
+
+    def list_memories(
+        self, telegram_user_id: int, query: str | None = None
+    ) -> list[dict[str, Any]]:
+        """All memories for a user ordered by key; optional substring filter."""
+        assert self._conn is not None
+        if query:
+            pattern = f"%{self._escape_like(query)}%"
+            rows = self._conn.execute(
+                "SELECT key, value, updated_at FROM memories "
+                "WHERE telegram_user_id = ? AND key LIKE ? ESCAPE '\\' "
+                "ORDER BY key",
+                (telegram_user_id, pattern),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT key, value, updated_at FROM memories "
+                "WHERE telegram_user_id = ? ORDER BY key",
+                (telegram_user_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_memories(self, telegram_user_id: int, query: str) -> int:
+        """Delete memories whose key contains ``query``; returns count deleted."""
+        assert self._conn is not None
+        if not query:
+            return 0
+        pattern = f"%{self._escape_like(query)}%"
+        cur = self._conn.execute(
+            "DELETE FROM memories WHERE telegram_user_id = ? AND key LIKE ? ESCAPE '\\'",
+            (telegram_user_id, pattern),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    @staticmethod
+    def _escape_like(text: str) -> str:
+        """Escape LIKE wildcards so user queries match literally."""
+        return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
