@@ -66,6 +66,11 @@ class Storage:
                 to_json TEXT NOT NULL,
                 subject TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
+                telegram_user_id INTEGER NOT NULL DEFAULT 0,
+                sent_message_id TEXT NOT NULL DEFAULT '',
+                send_started_at REAL,
+                verification_attempts INTEGER NOT NULL DEFAULT 0,
+                attachments_json TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -88,6 +93,25 @@ class Storage:
             """
         )
         self._conn.commit()
+        self._ensure_column("drafts", "telegram_user_id", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("drafts", "sent_message_id", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("drafts", "send_started_at", "REAL")
+        self._ensure_column("drafts", "verification_attempts", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("drafts", "attachments_json", "TEXT NOT NULL DEFAULT '[]'")
+
+    def _ensure_column(self, table: str, column: str, ddl: str) -> None:
+        """Idempotent ALTER TABLE ADD COLUMN for pre-existing databases.
+
+        Deterministic migration: a missing column is added exactly once;
+        existing data keeps its defaults.
+        """
+        assert self._conn is not None
+        cols = {
+            str(row["name"]) for row in self._conn.execute(f"PRAGMA table_info({table})")
+        }
+        if column not in cols:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            self._conn.commit()
 
     # ── meta ────────────────────────────────────────────────────────────────
     def get_meta(self, key: str, default: str | None = None) -> str | None:
@@ -195,21 +219,45 @@ class Storage:
         return [dict(r) for r in rows]
 
     # ── drafts ──────────────────────────────────────────────────────────────
-    def create_draft(self, thread_id: str, message_id: str | None,
-                     reply: DraftReply) -> int:
+    def create_draft(
+        self,
+        thread_id: str,
+        message_id: str | None,
+        reply: DraftReply,
+        *,
+        telegram_user_id: int = 0,
+    ) -> int:
+        """Persist a draft row (status PENDING) at presentation time.
+
+        The draft body is the user's own generated reply (needed for safe
+        retry/recovery); attachment binaries are never stored — only their
+        metadata.
+        """
         assert self._conn is not None
         from datetime import datetime
 
         now = datetime.now(UTC).isoformat()
-        to_json = json.dumps([f"{a.email}" for a in reply.to])
+        to_json = json.dumps([str(a) for a in reply.to])
+        attachments_json = json.dumps(
+            [
+                {
+                    "filename": a.filename,
+                    "mime_type": a.mime_type,
+                    "size_bytes": a.size_bytes,
+                }
+                for a in reply.attachments
+            ]
+        )
         cur = self._conn.execute(
             """
             INSERT INTO drafts(thread_id, message_id, body, to_json, subject,
-                               status, created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                               status, telegram_user_id, attachments_json,
+                               created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (thread_id, message_id, reply.body, to_json, reply.subject,
-             DraftStatus.PENDING.value, now, now),
+             DraftStatus.PENDING.value, telegram_user_id, attachments_json,
+             now, now),
         )
         self._conn.commit()
         lastrowid = cur.lastrowid
@@ -228,10 +276,63 @@ class Storage:
         )
         self._conn.commit()
 
+    def set_draft_send_started(self, draft_id: int, started_at_ms: int) -> None:
+        """Record when the send attempt began (epoch ms, Gmail internalDate scale)."""
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        self._conn.execute(
+            "UPDATE drafts SET send_started_at = ?, updated_at = ? WHERE id = ?",
+            (started_at_ms, now, draft_id),
+        )
+        self._conn.commit()
+
+    def set_draft_sent_message(self, draft_id: int, sent_message_id: str) -> None:
+        """Record the Gmail message id returned by the send call (when known)."""
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        self._conn.execute(
+            "UPDATE drafts SET sent_message_id = ?, updated_at = ? WHERE id = ?",
+            (sent_message_id, now, draft_id),
+        )
+        self._conn.commit()
+
+    def bump_verification_attempts(self, draft_id: int) -> int:
+        """Increment the reconciliation attempt counter; returns the new count."""
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        self._conn.execute(
+            "UPDATE drafts SET verification_attempts = verification_attempts + 1, "
+            "updated_at = ? WHERE id = ?",
+            (now, draft_id),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT verification_attempts FROM drafts WHERE id = ?", (draft_id,)
+        ).fetchone()
+        return int(row["verification_attempts"]) if row else 0
+
     def get_draft(self, draft_id: int) -> dict[str, Any] | None:
         assert self._conn is not None
         row = self._conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
         return dict(row) if row else None
+
+    def drafts_in_statuses(self, statuses: list[DraftStatus]) -> list[dict[str, Any]]:
+        """All draft rows currently in the given states (for recovery sweeps)."""
+        assert self._conn is not None
+        if not statuses:
+            return []
+        placeholders = ", ".join("?" for _ in statuses)
+        rows = self._conn.execute(
+            f"SELECT * FROM drafts WHERE status IN ({placeholders}) ORDER BY id",
+            [s.value for s in statuses],
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # ── memories (explicit user facts, per Telegram user) ──────────────────
     def set_memory(self, telegram_user_id: int, key: str, value: str) -> None:

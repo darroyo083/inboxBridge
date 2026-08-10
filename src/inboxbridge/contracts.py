@@ -16,6 +16,7 @@ from .models import (
     DraftRequest,
     EmailSummary,
     ParsedEmail,
+    SendVerification,
     ThreadContext,
 )
 
@@ -32,7 +33,26 @@ class GmailClient(Protocol):
         ...
 
     async def send_reply(self, draft: DraftReply) -> str:
-        """Send a reply in the existing thread. Returns the new message_id."""
+        """Send a reply in the existing thread. Returns the new message_id.
+
+        May raise ``AmbiguousSendError`` when the server-side outcome is
+        unknown — the caller must reconcile before retrying.
+        """
+        ...
+
+    async def verify_delivery(
+        self,
+        draft: DraftReply,
+        *,
+        expected_message_id: str = "",
+        since_ms: int = 0,
+    ) -> SendVerification:
+        """Reconcile a send attempt against Gmail (source of truth).
+
+        ``expected_message_id`` is the id returned by send when known;
+        ``since_ms`` bounds the thread search when it is not. Returns
+        evidence, never raises.
+        """
         ...
 
 

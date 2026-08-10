@@ -17,15 +17,26 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import re
 from email.message import EmailMessage
+from email.utils import getaddresses
 from typing import Any
 
+import httplib2  # type: ignore[import-untyped]
 from googleapiclient.discovery import build  # type: ignore[import-untyped]
 from googleapiclient.errors import HttpError  # type: ignore[import-untyped]
 
 from ..config import Settings
-from ..models import DraftReply, ParsedEmail, ThreadContext, ThreadMessage
+from ..models import (
+    DraftReply,
+    EmailAddress,
+    OutgoingAttachment,
+    ParsedEmail,
+    SendVerification,
+    ThreadContext,
+    ThreadMessage,
+)
 from .attachments import extract_attachments
 from .auth import get_credentials
 from .parse import parse_rfc822
@@ -34,16 +45,42 @@ logger = logging.getLogger(__name__)
 
 # Reply context is bounded: only the most recent N thread messages are parsed.
 MAX_THREAD_CONTEXT_MESSAGES = 10
+#: Bounded search window for reconciling a send without a message id.
+MAX_RECONCILE_CANDIDATES = 20
+#: Clock-skew margin for internalDate comparisons (send started vs. Gmail dates).
+_SKEW_MS = 60_000
 
 _RE_PREFIX = re.compile(r"^Re(\[\d+\])?:", re.IGNORECASE)
+
+#: Transport-level failures after/before transmission. The send outcome is
+#: UNKNOWN in these cases (the request may have reached Gmail): never retry
+#: blindly — reconcile first.
+_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,
+    TimeoutError,
+    httplib2.HttpLib2Error,
+)
 
 
 class GmailAPIError(RuntimeError):
     """Gmail API call failed (transport or API error)."""
 
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class SendingDisabledError(GmailAPIError):
     """Kill switch: SEND_EMAILS=false makes sending technically impossible."""
+
+
+class AmbiguousSendError(GmailAPIError):
+    """The send request's outcome is unknown (transport error / uncertain 5xx).
+
+    Gmail may or may not have accepted the message. The caller MUST reconcile
+    against Gmail before offering any retry — a blind resend risks a
+    duplicate email.
+    """
 
 
 class GmailClient:
@@ -58,6 +95,7 @@ class GmailClient:
     ) -> None:
         self._settings = settings
         self._user_id = settings.gmail_user_id
+        self._my_email: str | None = None
         self._service = (
             service
             if service is not None
@@ -146,15 +184,123 @@ class GmailClient:
         if references:
             mime["References"] = references
         mime.set_content(draft.body)
+        for attachment in draft.attachments:
+            _attach_outgoing(mime, attachment)
 
         raw = base64.urlsafe_b64encode(mime.as_bytes()).decode("ascii")
         resp: dict[str, Any] = await self._run(
             self._service.users().messages().send(
                 userId=self._user_id,
                 body={"raw": raw, "threadId": draft.thread_id},
-            )
+            ),
+            ambiguous=True,
         )
         return str(resp.get("id") or "")
+
+    async def verify_delivery(
+        self,
+        draft: DraftReply,
+        *,
+        expected_message_id: str = "",
+        since_ms: int = 0,
+    ) -> SendVerification:
+        """Reconcile a send attempt against Gmail (source of truth).
+
+        - With a known message id: fetch it and check thread/recipients/
+          subject/attachments.
+        - Without one (response lost): search the thread for our own sent
+          message with internalDate >= ``since_ms``.
+
+        Never raises: any Gmail query failure yields ``checked_ok=False``
+        (inconclusive — a retry is NOT offered on that evidence).
+        """
+        try:
+            if expected_message_id:
+                try:
+                    resp: dict[str, Any] = await self._run(
+                        self._service.users().messages().get(
+                            userId=self._user_id,
+                            id=expected_message_id,
+                            format="full",
+                        )
+                    )
+                except GmailAPIError as exc:
+                    if exc.status_code == 404:
+                        resp = {}  # id unknown → fall back to thread search
+                    else:
+                        raise
+                if resp:
+                    return _verify_message_payload(draft, resp)
+            return await self._search_thread_for_sent(draft, since_ms)
+        except Exception:
+            logger.exception(
+                "delivery verification failed for thread %s", draft.thread_id
+            )
+            return SendVerification(
+                found=False,
+                message_id="",
+                thread_match=False,
+                recipients_match=False,
+                attachments_match=False,
+                subject_match=False,
+                checked_ok=False,
+            )
+
+    async def _search_thread_for_sent(
+        self, draft: DraftReply, since_ms: int
+    ) -> SendVerification:
+        """Find OUR sent message in the thread (matches account From header)."""
+        thread_resp: dict[str, Any] = await self._run(
+            self._service.users().threads().get(
+                userId=self._user_id, id=draft.thread_id, format="full"
+            )
+        )
+        messages = thread_resp.get("messages") or []
+        ordered = sorted(messages, key=lambda m: _to_int(m.get("internalDate")) or 0)
+        floor = since_ms - _SKEW_MS
+        candidates = [
+            m
+            for m in ordered[-MAX_RECONCILE_CANDIDATES:]
+            if not since_ms or (_to_int(m.get("internalDate")) or 0) >= floor
+        ]
+        my_email = await self._my_email_address()
+        for candidate in reversed(candidates):
+            mid = str(candidate.get("id") or "")
+            if not mid:
+                continue
+            full: dict[str, Any] = await self._run(
+                self._service.users().messages().get(
+                    userId=self._user_id, id=mid, format="full"
+                )
+            )
+            payload = full.get("payload") or {}
+            headers = {
+                str(h.get("name") or "").lower(): str(h.get("value") or "")
+                for h in payload.get("headers") or []
+            }
+            if my_email and headers.get("from", "").casefold() != my_email.casefold():
+                continue  # incoming message in the same thread — not ours
+            verification = _verify_message_payload(draft, full)
+            if verification.found and verification.thread_match:
+                return verification
+        return SendVerification(
+            found=False,
+            message_id="",
+            thread_match=False,
+            recipients_match=False,
+            attachments_match=False,
+            subject_match=False,
+            checked_ok=True,
+        )
+
+    async def _my_email_address(self) -> str:
+        """Cache the account's own address (one profile call per process)."""
+        if self._my_email is None:
+            profile: dict[str, Any] = await self._run(
+                self._service.users().getProfile(userId=self._user_id)
+            )
+            self._my_email = str(profile.get("emailAddress") or "")
+        return self._my_email
 
     async def _threading_headers(self, thread_id: str, draft: DraftReply) -> tuple[str, str]:
         """Best-effort In-Reply-To/References from the thread's latest message.
@@ -190,11 +336,36 @@ class GmailClient:
             logger.exception("could not resolve threading headers for thread %s", thread_id)
         return in_reply_to, references
 
-    async def _run(self, request: Any) -> Any:
+    async def _run(self, request: Any, *, ambiguous: bool = False) -> Any:
+        """Execute a Gmail request off the event loop.
+
+        ``ambiguous=True`` (send operations): transport failures and 5xx
+        responses are mapped to :class:`AmbiguousSendError` because the
+        server-side outcome is unknown.
+        """
         try:
             return await asyncio.to_thread(request.execute)
         except HttpError as exc:
-            raise GmailAPIError(f"Gmail API error {exc.status_code}") from exc
+            status = getattr(exc, "resp", None)
+            code = int(getattr(status, "status", 0) or 0) if status is not None else 0
+            if ambiguous and code >= 500:
+                raise AmbiguousSendError(
+                    f"Gmail send returned {code}: server-side outcome unknown",
+                    status_code=code,
+                ) from exc
+            raise GmailAPIError(
+                f"Gmail API error {code}" if code else f"Gmail API error: {exc}",
+                status_code=code or None,
+            ) from exc
+        except _TRANSPORT_ERRORS as exc:
+            if ambiguous:
+                raise AmbiguousSendError(
+                    f"Gmail send transport error ({type(exc).__name__}): "
+                    "outcome unknown — reconcile before retrying"
+                ) from exc
+            raise GmailAPIError(
+                f"Gmail transport error ({type(exc).__name__})"
+            ) from exc
 
 
 def ensure_re_prefix(subject: str) -> str:
@@ -232,3 +403,94 @@ def _first_subject(messages: list[dict[str, Any]]) -> str:
             if str(h.get("name") or "").lower() == "subject" and h.get("value"):
                 return str(h.get("value"))
     return ""
+
+
+# ── delivery verification helpers ────────────────────────────────────────────
+
+
+def _verify_message_payload(draft: DraftReply, message: dict[str, Any]) -> SendVerification:
+    """Score one Gmail message against the draft's expected identity."""
+    message_id = str(message.get("id") or "")
+    thread_id = str(message.get("threadId") or "")
+    payload = message.get("payload") or {}
+    headers = {
+        str(h.get("name") or "").lower(): str(h.get("value") or "")
+        for h in payload.get("headers") or []
+    }
+    return SendVerification(
+        found=bool(message_id),
+        message_id=message_id,
+        thread_match=bool(thread_id) and thread_id == draft.thread_id,
+        recipients_match=_recipients_covered(draft.to, headers.get("to", "")),
+        attachments_match=_attachments_covered(
+            draft.attachments, _attachment_filenames(payload)
+        ),
+        subject_match=_subjects_equivalent(headers.get("subject", ""), draft.subject),
+    )
+
+
+def _recipients_covered(expected: list[EmailAddress], to_header: str) -> bool:
+    """Every expected recipient must appear in the sent To header."""
+    expected_emails = {a.email.casefold() for a in expected}
+    expected_emails.discard("")
+    if not expected_emails:
+        return True
+    actual = {addr.casefold() for _, addr in getaddresses([to_header]) if addr}
+    return expected_emails <= actual
+
+
+def _attachment_filenames(payload: dict[str, Any]) -> set[str]:
+    """Display filenames of the parts of a sent message (casefolded)."""
+    names: set[str] = set()
+    for part in payload.get("parts") or []:
+        filename = str(part.get("filename") or "").strip()
+        if filename:
+            names.add(filename.casefold())
+    return names
+
+
+def _attachments_covered(
+    expected: tuple[OutgoingAttachment, ...], actual: set[str]
+) -> bool:
+    if not expected:
+        return True
+    expected_names = {a.filename.casefold() for a in expected if a.filename}
+    if not expected_names:
+        return True
+    return expected_names <= actual
+
+
+def _subjects_equivalent(sent_subject: str, draft_subject: str) -> bool:
+    """Compare thread subjects ignoring leading Re:/Fwd: prefixes (case-insensitive)."""
+    draft_norm = _strip_subject_prefix(draft_subject).casefold()
+    if not draft_norm:
+        return True
+    sent_norm = _strip_subject_prefix(sent_subject).casefold()
+    return (
+        sent_norm == draft_norm
+        or draft_norm in sent_norm
+        or sent_norm in draft_norm
+    )
+
+
+def _strip_subject_prefix(subject: str) -> str:
+    return re.sub(r"^(re|fwd|fw|aw|antw)(\[\d+\])?:", "", subject, flags=re.IGNORECASE).strip()
+
+
+# ── outgoing MIME construction ───────────────────────────────────────────────
+
+
+def _attach_outgoing(mime: EmailMessage, attachment: OutgoingAttachment) -> None:
+    """Attach one Telegram-supplied temp file to the outgoing message."""
+    if not attachment.path or not os.path.isfile(attachment.path):
+        raise GmailAPIError(f"attachment file is gone for {attachment.filename}")
+    maintype, sep, subtype = attachment.mime_type.partition("/")
+    if not sep or not maintype or not subtype:
+        maintype, subtype = "application", "octet-stream"
+    with open(attachment.path, "rb") as fh:
+        mime.add_attachment(
+            fh.read(),
+            maintype=maintype,
+            subtype=subtype,
+            filename=attachment.filename,
+        )

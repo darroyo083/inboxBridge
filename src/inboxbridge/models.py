@@ -22,9 +22,27 @@ class MessageStatus(StrEnum):
 
 
 class DraftStatus(StrEnum):
+    """Lifecycle of an outgoing reply draft (send/verification states).
+
+    Sending states follow the goal's verified-delivery contract:
+
+    - ``SENDING``: the send request is in flight.
+    - ``SENT_UNVERIFIED``: Gmail may or may not have accepted the message
+      (ambiguous result) or verification is still pending — never report
+      success in this state.
+    - ``SENT_VERIFIED``: Gmail evidence confirms the message exists in the
+      expected thread with the expected recipients/attachments.
+    - ``SEND_FAILED``: a definitive failure; safe to report and offer a
+      controlled retry.
+    """
+
     PENDING = "pending"
     CONFIRMED = "confirmed"
-    SENT = "sent"
+    SENDING = "sending"
+    SENT_UNVERIFIED = "sent_unverified"
+    SENT_VERIFIED = "sent_verified"
+    SEND_FAILED = "send_failed"
+    CANCELLED = "cancelled"
     REJECTED = "rejected"
 
 
@@ -91,6 +109,52 @@ class ThreadContext:
 
 
 @dataclass(frozen=True)
+class OutgoingAttachment:
+    """A Telegram-supplied file to include in an outgoing Gmail reply.
+
+    Metadata only travels into the DB/confirmation view; the binary lives in a
+    temporary directory for the bounded send workflow and is deleted once the
+    draft reaches a terminal state (verified, cancelled, failed, expired).
+    """
+
+    filename: str
+    mime_type: str
+    size_bytes: int
+    #: Absolute path of the temp file (display-only in the DB; never persisted).
+    path: str = ""
+
+
+@dataclass(frozen=True)
+class SendVerification:
+    """Deterministic Gmail-side evidence for one outgoing reply.
+
+    ``checked_ok`` distinguishes "Gmail was queried and the message is NOT
+    there" (safe to retry) from "Gmail could not be queried" (inconclusive —
+    a retry would risk duplicates).
+    """
+
+    found: bool
+    message_id: str
+    thread_match: bool
+    recipients_match: bool
+    attachments_match: bool
+    subject_match: bool
+    checked_ok: bool = True
+
+    @property
+    def verified(self) -> bool:
+        """Strong success: the expected message exists and matches."""
+        return (
+            self.found
+            and self.checked_ok
+            and self.thread_match
+            and self.recipients_match
+            and self.attachments_match
+            and self.subject_match
+        )
+
+
+@dataclass(frozen=True)
 class DraftRequest:
     """User asks (from Telegram) for a reply to a thread."""
 
@@ -104,7 +168,12 @@ class DraftRequest:
 
 @dataclass(frozen=True)
 class DraftReply:
-    """LLM-produced draft for a Gmail reply."""
+    """LLM-produced draft for a Gmail reply.
+
+    ``attachments`` are Telegram-supplied files attached AFTER generation
+    (the LLM never decides what to attach); they travel in memory and in a
+    temp directory, never in SQLite.
+    """
 
     thread_id: str
     subject: str
@@ -113,6 +182,7 @@ class DraftReply:
     body: str
     in_reply_to: str = ""
     references: str = ""
+    attachments: tuple[OutgoingAttachment, ...] = ()
 
 
 @dataclass(frozen=True)

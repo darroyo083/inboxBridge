@@ -51,6 +51,23 @@ class Settings(BaseSettings):
     attachment_max_text_chars: int = 20_000
     attachment_max_count: int = 5
 
+    # Outgoing attachments (Telegram → Gmail reply)
+    outgoing_attachment_max_count: int = 5
+    outgoing_attachment_max_bytes: int = 10 * 1024 * 1024
+
+    # Temporary working directory (attachment binaries; cleaned on terminal states)
+    tmp_dir: str = "data/tmp"
+
+    # Verified delivery / reconciliation
+    send_verification_attempts: int = 3
+    send_verification_backoff_seconds: float = 2.0
+    #: Absolute cap on reconciliation attempts for one draft (across retries/restarts).
+    send_verification_max_attempts: int = 12
+    #: Periodic sweep interval for drafts stuck in sent_unverified (seconds).
+    reconcile_sweep_interval_seconds: float = 300.0
+    #: Temp attachment files older than this (seconds) are swept unconditionally.
+    tmp_max_age_seconds: int = 24 * 3600
+
     # Retries
     retry_backoff_base: float = 2.0
     retry_max_attempts: int = 5

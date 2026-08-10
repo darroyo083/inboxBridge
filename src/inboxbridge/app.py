@@ -27,7 +27,7 @@ from .llm.openai_compat import OpenAICompatLLM
 from .logging_setup import configure_logging
 from .models import PubSubEvent
 from .pipeline import InboundPipeline, RetryScheduler
-from .responder import ReplyCoordinator, ReplyWorker
+from .responder import ReconciliationSweep, ReplyCoordinator, ReplyWorker
 from .status import build_status_text
 from .telegram.bot import TelegramBot
 
@@ -129,6 +129,7 @@ class App:
         self._retry_scheduler: RetryScheduler | None = None
         self._watch_renewer: WatchRenewer | None = None
         self._reply_worker: ReplyWorker | None = None
+        self._reconcile_sweep: ReconciliationSweep | None = None
 
     async def run(self) -> None:
         services = Services.build()
@@ -176,7 +177,15 @@ class App:
         reply_worker.start()
         self._reply_worker = reply_worker
 
+        reconcile_sweep = ReconciliationSweep(reply_coordinator)
+        reconcile_sweep.start()
+        self._reconcile_sweep = reconcile_sweep
+
         await services.bot.start()
+
+        # Reconcile drafts left in-flight by a previous process. Never resends:
+        # verifies against Gmail and resolves sent_unverified/sending states.
+        await reply_coordinator.reconcile_on_startup()
 
         logger.info("InboxBridge started (SEND_EMAILS=%s)", services.settings.send_emails)
         try:
@@ -191,6 +200,8 @@ class App:
             self._consumer.close()
         if self._reply_worker is not None:
             await self._reply_worker.stop()
+        if self._reconcile_sweep is not None:
+            await self._reconcile_sweep.stop()
         if self._retry_scheduler is not None:
             await self._retry_scheduler.stop()
         if self._watch_renewer is not None:

@@ -51,15 +51,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import re
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol, cast
 
 from telegram import (
     Bot,
     CallbackQuery,
+    File,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
@@ -75,11 +78,11 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes, Messag
 from ..config import Settings
 from ..contracts import TelegramNotifier
 from ..db import Storage
-from ..models import DraftReply, EmailSummary, ParsedEmail
+from ..models import DraftReply, EmailSummary, OutgoingAttachment, ParsedEmail
 
 logger = logging.getLogger(__name__)
 
-_CALLBACK_RE = re.compile(r"^(confirm|cancel|view|hide|reply):([A-Za-z0-9_-]{1,64})$")
+_CALLBACK_RE = re.compile(r"^(confirm|cancel|view|hide|reply|resend):([A-Za-z0-9_-]{1,64})$")
 _URL_SCHEME_RE = re.compile(r"https?://", re.IGNORECASE)
 _TG_META_PREFIX = "tg:"  # tg message_id -> thread_id
 _TG_GMAIL_PREFIX = "tgm:"  # tg message_id -> gmail message_id (IDs only)
@@ -144,6 +147,8 @@ class Sender(Protocol):
 
     async def delete_message(self, chat_id: int | str, message_id: int) -> bool: ...
 
+    async def get_file(self, file_id: str) -> File: ...
+
 
 @dataclass(frozen=True)
 class ReplyRequest:
@@ -160,6 +165,9 @@ class ReplyRequest:
     #: Telegram user id of the member who initiated the request. Zero when
     #: unknown (older flows); used for draft ownership/isolation.
     user_id: int = 0
+    #: Telegram-supplied files (documents/photos) downloaded to a temporary
+    #: directory; the responder attaches them to the outgoing reply.
+    attachments: tuple[OutgoingAttachment, ...] = ()
 
 
 @dataclass
@@ -226,6 +234,41 @@ def _format_sender(email: ParsedEmail) -> str:
     return address.email
 
 
+def sanitize_filename(filename: str) -> str:
+    """Reduce an untrusted Telegram filename to safe display metadata.
+
+    Keeps the basename only (no traversal), drops control characters and
+    caps the length; never used as a filesystem path on its own.
+    """
+    name = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r"[\x00-\x1f\x7f]+", "", name).strip()
+    if name in ("", ".", ".."):
+        return "attachment"
+    if len(name) > 180:
+        stem, dot, suffix = name.rpartition(".")
+        name = stem[: 180 - len(suffix) - 1] + dot + suffix
+    return name
+
+
+def _guess_mime(filename: str) -> str:
+    return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+
+def _format_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes // 1024} KB"
+    return f"{size_bytes // (1024 * 1024)} MB"
+
+
+def _remove_file(path: str) -> None:
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        logger.warning("could not remove temp file %s", path)
+
+
 def _split_original(text: str) -> list[str]:
     """Split untrusted original text into Telegram-safe chunks.
 
@@ -270,6 +313,7 @@ class TelegramBot(TelegramNotifier):
         self._bot_username = bot_username
         self._status_provider = status_provider
         self._original_fetcher = original_fetcher
+        self._resend_callback: Callable[[int], Awaitable[None]] | None = None
         self._allowed_chat_id = settings.telegram_allowed_chat_id
         self._queue: asyncio.Queue[ReplyRequest] = asyncio.Queue()
         self._pending_drafts: dict[str, _PendingDraft] = {}
@@ -278,6 +322,10 @@ class TelegramBot(TelegramNotifier):
         self._pending_replies: dict[int, tuple[int, str]] = {}
         self._application: Application[Any, Any, Any, Any, Any, Any] | None = None
         self._started = False
+
+    def register_resend_callback(self, callback: Callable[[int], Awaitable[None]]) -> None:
+        """Wire the "Reintentar envío" button to the reply coordinator."""
+        self._resend_callback = callback
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
@@ -349,9 +397,9 @@ class TelegramBot(TelegramNotifier):
         if message.from_user.is_bot:
             return
         text = message.text
-        if text is None:
+        if text is None and message.document is None and not message.photo:
             return
-        if text.startswith("/"):
+        if text is not None and text.startswith("/"):
             await self._handle_command(message, text)
             return
         await self._handle_plain_message(message)
@@ -460,24 +508,30 @@ class TelegramBot(TelegramNotifier):
         user = message.from_user
         if user is None:
             return
-        # "Responder" flow: the member pressed the button; this text is their
-        # reply intent, regardless of reply/mention (still chat-authorized).
+        # "Responder" flow: the member pressed the button; this message (with
+        # any document/photo) is their reply intent.
         pending = self._pending_replies.pop(user.id, None)
         if pending is not None:
+            attachments = await self._collect_outgoing_attachments(message)
             _tg_message_id, thread_id = pending
+            text = message.text or message.caption or ""
             memory = tuple(m["value"] for m in self._storage.list_memories(user.id))
             self._queue.put_nowait(
                 ReplyRequest(
                     thread_id=thread_id,
-                    user_instructions=message.text or "",
+                    user_instructions=text,
                     source_message_id=message.message_id,
                     memory=memory,
                     user_id=user.id,
+                    attachments=attachments,
                 )
             )
             return
         if not (self._is_reply_to_own(message) or self._is_mentioned(message)):
             return
+        # Reply intent confirmed: only now download any attachments (files are
+        # never fetched for messages without a workflow purpose).
+        attachments = await self._collect_outgoing_attachments(message)
         thread_id = ""
         reply = message.reply_to_message
         if reply is not None and self._is_own_message(reply):
@@ -488,12 +542,79 @@ class TelegramBot(TelegramNotifier):
         self._queue.put_nowait(
             ReplyRequest(
                 thread_id=thread_id,
-                user_instructions=message.text or "",
+                user_instructions=message.text or message.caption or "",
                 source_message_id=message.message_id,
                 memory=memory,
                 user_id=user.id,
+                attachments=attachments,
             )
         )
+
+    async def _collect_outgoing_attachments(
+        self, message: Message
+    ) -> tuple[OutgoingAttachment, ...]:
+        """Download Telegram documents/photos to the temp dir (bounded, safe).
+
+        Limits: ``outgoing_attachment_max_count`` files and
+        ``outgoing_attachment_max_bytes`` each. Violations reject the whole
+        batch with a notice; filenames are sanitized to display metadata only.
+        """
+        entries: list[tuple[str, str, int, str]] = []
+        if message.document is not None:
+            doc = message.document
+            size = doc.file_size or 0
+            name = sanitize_filename(doc.file_name or f"documento_{doc.file_unique_id}")
+            mime = doc.mime_type or _guess_mime(name)
+            entries.append((doc.file_id, name, size, mime))
+        if message.photo:
+            largest = max(message.photo, key=lambda p: p.file_size or 0)
+            size = largest.file_size or 0
+            name = sanitize_filename(
+                f"foto_{message.message_id}_{len(entries) + 1}.jpg"
+            )
+            entries.append((largest.file_id, name, size, "image/jpeg"))
+        if not entries:
+            return ()
+        max_count = self._settings.outgoing_attachment_max_count
+        max_bytes = self._settings.outgoing_attachment_max_bytes
+        if len(entries) > max_count:
+            await self.send_notice(
+                f"Demasiados adjuntos (máximo {max_count}); no los añado. Vuelve a intentarlo."
+            )
+            return ()
+        oversized = [name for name, _, size, _ in entries if size > max_bytes]
+        if oversized:
+            await self.send_notice(
+                "Adjunto demasiado grande (máximo 10 MB); no los añado: "
+                + ", ".join(oversized)
+            )
+            return ()
+        results: list[OutgoingAttachment] = []
+        for file_id, name, size, mime in entries:
+            try:
+                file = await self._ensure_sender().get_file(file_id)
+                target = self._outgoing_tmp_path(name)
+                # PTB File.download is the blocking variant; run it off the loop.
+                await asyncio.to_thread(file.download, target)  # type: ignore[attr-defined]
+            except Exception:
+                logger.exception("downloading telegram attachment %s failed", name)
+                for r in results:
+                    _remove_file(r.path)
+                await self.send_notice("No pude descargar un adjunto; vuelve a intentarlo.")
+                return ()
+            results.append(
+                OutgoingAttachment(
+                    filename=name, mime_type=mime, size_bytes=size, path=str(target)
+                )
+            )
+        return tuple(results)
+
+    def _outgoing_tmp_path(self, filename: str) -> Path:
+        """Unique temp path for one outgoing attachment (safe, no traversal)."""
+        base = Path(self._settings.tmp_dir) / "incoming"
+        base.mkdir(parents=True, exist_ok=True)
+        token = secrets.token_hex(6)
+        return base / f"{token}_{filename}"
 
     def _is_own_message(self, message: Message) -> bool:
         return (
@@ -535,6 +656,9 @@ class TelegramBot(TelegramNotifier):
             return
         if action in ("view", "hide"):
             await self._handle_view_callback(query, action, token)
+            return
+        if action == "resend":
+            await self._handle_resend_callback(query, token)
             return
         pending = self._pending_drafts.get(token)
         if pending is None:
@@ -580,6 +704,36 @@ class TelegramBot(TelegramNotifier):
             await self._send(f"¿Qué quieres decirle a {sender_name}?")
         else:
             await self._send("¿Qué quieres decirle?")
+
+    # ── "Reintentar envío" button ──────────────────────────────────────────
+
+    async def _handle_resend_callback(self, query: CallbackQuery, token: str) -> None:
+        """User pressed retry on a failed/uncertain draft.
+
+        Chat authorization is enforced above; draft ownership is checked
+        server-side via the persisted row. The coordinator re-verifies Gmail
+        FIRST and only resends on definitive evidence the mail never left.
+        """
+        try:
+            draft_id = int(token)
+        except ValueError:
+            return
+        sender = self._ensure_sender()
+        row = self._storage.get_draft(draft_id)
+        if row is None:
+            await sender.answer_callback_query(query.id, "Ese borrador ya no existe.")
+            return
+        owner = int(row.get("telegram_user_id") or 0)
+        if owner and query.from_user.id != owner:
+            await sender.answer_callback_query(
+                query.id, "Ese borrador lo está gestionando otro miembro."
+            )
+            return
+        if self._resend_callback is None:
+            await sender.answer_callback_query(query.id, "Reintento no disponible.")
+            return
+        await sender.answer_callback_query(query.id, "Reintentando…")
+        await self._resend_callback(draft_id)
 
     # ── "Ver original" / "Ocultar original" ────────────────────────────────
 
@@ -723,16 +877,23 @@ class TelegramBot(TelegramNotifier):
         await self._ensure_sender().send_chat_action(self._allowed_chat_id, ChatAction.TYPING)
 
     async def send_draft_for_confirmation(
-        self, draft: DraftReply, *, user_id: int = 0
+        self, draft: DraftReply, *, user_id: int = 0, draft_id: int = 0
     ) -> int:
         token = secrets.token_urlsafe(8)
         to_line = (
             ", ".join(str(address) for address in draft.to) if draft.to else "(sin destinatario)"
         )
+        attachments_line = ""
+        if draft.attachments:
+            names = "\n".join(
+                f"- {a.filename} ({_format_size(a.size_bytes)})" for a in draft.attachments
+            )
+            attachments_line = f"\nAdjuntos:\n{names}"
         text = (
             f"Borrador de respuesta\n"
             f"Para: {to_line}\n"
-            f"Asunto: {draft.subject}\n\n"
+            f"Asunto: {draft.subject}\n"
+            f"{attachments_line}\n\n"
             f"{neutralize_links(draft.body)}"
         )
         keyboard = InlineKeyboardMarkup(
@@ -754,6 +915,32 @@ class TelegramBot(TelegramNotifier):
             draft=draft,
             message_id=message.message_id,
             user_id=user_id,
+        )
+        return message.message_id
+
+    async def offer_resend(self, draft_id: int, user_id: int = 0) -> int:
+        """Post the controlled-retry button for a failed/uncertain send.
+
+        The button token is the persisted draft id (survives restarts); the
+        coordinator re-verifies Gmail before resending — never a blind retry.
+        """
+        text = (
+            "¿Reintento el envío? Primero compruebo Gmail para no enviar duplicados."
+        )
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Reintentar envío", callback_data=f"resend:{draft_id}"
+                    )
+                ]
+            ]
+        )
+        message = await self._ensure_sender().send_message(
+            self._allowed_chat_id,
+            text,
+            reply_markup=keyboard,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
         return message.message_id
 
