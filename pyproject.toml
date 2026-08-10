@@ -48,6 +48,9 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
+markers = [
+    "real_llm: bounded real LLM provider calls (env-gated, RUN_REAL_LLM=1)",
+]
 
 [tool.ruff]
 target-version = "py312"
