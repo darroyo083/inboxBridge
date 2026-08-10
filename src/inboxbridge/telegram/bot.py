@@ -432,11 +432,15 @@ class TelegramBot(TelegramNotifier):
         await self._send(text, reply_to=message.message_id)
 
     async def _run_cancel(self, message: Message) -> None:
+        user = message.from_user
+        user_id = user.id if user is not None else 0
         cancelled = 0
         for pending in list(self._pending_drafts.values()):
+            if pending.user_id and pending.user_id != user_id:
+                continue  # only the owner may cancel their own draft
             pending.resolve(False)
             cancelled += 1
-        self._pending_drafts.clear()
+            self._pending_drafts.pop(pending.token, None)
         text = "Nada que cancelar." if cancelled == 0 else f"Borradores cancelados: {cancelled}."
         await self._send(text, reply_to=message.message_id)
 
@@ -585,12 +589,13 @@ class TelegramBot(TelegramNotifier):
         oversized = [name for name, _, size, _ in entries if size > max_bytes]
         if oversized:
             await self.send_notice(
-                "Adjunto demasiado grande (máximo 10 MB); no los añado: "
+                f"Adjunto demasiado grande (máximo {max_bytes // (1024 * 1024)} MB); "
+                "no los añado: "
                 + ", ".join(oversized)
             )
             return ()
         results: list[OutgoingAttachment] = []
-        for file_id, name, size, mime in entries:
+        for file_id, name, _reported_size, mime in entries:
             try:
                 file = await self._ensure_sender().get_file(file_id)
                 target = self._outgoing_tmp_path(name)
@@ -602,9 +607,22 @@ class TelegramBot(TelegramNotifier):
                     _remove_file(r.path)
                 await self.send_notice("No pude descargar un adjunto; vuelve a intentarlo.")
                 return ()
+            # Re-validate against the REAL downloaded size (Telegram's reported
+            # size is client-supplied metadata and must not be trusted).
+            actual_size = target.stat().st_size
+            if actual_size > max_bytes:
+                logger.warning("attachment %s exceeds %d bytes after download", name, max_bytes)
+                _remove_file(str(target))
+                await self.send_notice(
+                    f"Adjunto demasiado grande (máximo {max_bytes // (1024 * 1024)} MB); "
+                    "no lo añado."
+                )
+                for r in results:
+                    _remove_file(r.path)
+                return ()
             results.append(
                 OutgoingAttachment(
-                    filename=name, mime_type=mime, size_bytes=size, path=str(target)
+                    filename=name, mime_type=mime, size_bytes=actual_size, path=str(target)
                 )
             )
         return tuple(results)
@@ -667,8 +685,8 @@ class TelegramBot(TelegramNotifier):
             )
             return
         # Group isolation: only the member who requested the draft may
-        # confirm/cancel it.
-        if pending.user_id and query.from_user.id != pending.user_id:
+        # confirm/cancel it (owner 0 = no owner recorded → fail closed).
+        if not pending.user_id or query.from_user.id != pending.user_id:
             await self._ensure_sender().answer_callback_query(
                 query.id, "Ese borrador lo está gestionando otro miembro."
             )
@@ -724,7 +742,7 @@ class TelegramBot(TelegramNotifier):
             await sender.answer_callback_query(query.id, "Ese borrador ya no existe.")
             return
         owner = int(row.get("telegram_user_id") or 0)
-        if owner and query.from_user.id != owner:
+        if not owner or query.from_user.id != owner:
             await sender.answer_callback_query(
                 query.id, "Ese borrador lo está gestionando otro miembro."
             )
@@ -752,8 +770,15 @@ class TelegramBot(TelegramNotifier):
         self, query: CallbackQuery, sender: Sender, tg_message_id: int
     ) -> None:
         """Fetch the original email from Gmail on demand and post it as
-        temporary message(s). No LLM call, no SQLite body read."""
+        temporary message(s). No LLM call, no SQLite body read.
+
+        Re-pressing hides the previously posted set first, so repeated presses
+        never flood the group or orphan messages.
+        """
         await sender.answer_callback_query(query.id, "Cargando…")
+        raw_prev = self._storage.get_meta(f"{_TG_ORIG_PREFIX}{tg_message_id}")
+        if raw_prev:
+            await self._delete_original_messages(sender, raw_prev)
         gmail_message_id = self._storage.get_meta(f"{_TG_GMAIL_PREFIX}{tg_message_id}")
         if not gmail_message_id or self._original_fetcher is None:
             await self._send("No pude cargar el original ahora mismo.")
@@ -814,20 +839,23 @@ class TelegramBot(TelegramNotifier):
     ) -> None:
         """Delete the temporary original message(s) and clean up the mapping."""
         raw = self._storage.get_meta(f"{_TG_ORIG_PREFIX}{tg_message_id}")
+        await self._delete_original_messages(sender, raw)
+        self._storage.delete_meta(f"{_TG_ORIG_PREFIX}{tg_message_id}")
+        await sender.answer_callback_query(query.id, "Original oculto.")
+
+    async def _delete_original_messages(self, sender: Sender, raw: str | None) -> None:
         message_ids: list[int] = []
         if raw:
             try:
                 message_ids = [int(m) for m in json.loads(raw)]
             except (ValueError, TypeError, json.JSONDecodeError):
-                logger.warning("corrupt tgo mapping for %s", tg_message_id)
+                logger.warning("corrupt tgo mapping")
                 message_ids = []
         for message_id in message_ids:
             try:
                 await sender.delete_message(self._allowed_chat_id, message_id)
             except Exception:
                 logger.exception("deleting original message %s failed", message_id)
-        self._storage.delete_meta(f"{_TG_ORIG_PREFIX}{tg_message_id}")
-        await sender.answer_callback_query(query.id, "Original oculto.")
 
     # ── TelegramNotifier implementation ────────────────────────────────────
 

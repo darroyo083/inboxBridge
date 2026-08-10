@@ -334,6 +334,26 @@ class Storage:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def claim_draft_for_send(self, draft_id: int, allowed: list[DraftStatus]) -> bool:
+        """Atomically claim a draft for a send attempt (status → sending).
+
+        Returns False when the draft is not in an allowed state — callers
+        treat that as "another flow already owns this draft" (prevents
+        double-send races between resend taps and sweeps).
+        """
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        placeholders = ", ".join("?" for _ in allowed)
+        cur = self._conn.execute(
+            f"UPDATE drafts SET status = ?, updated_at = ? "
+            f"WHERE id = ? AND status IN ({placeholders})",
+            (DraftStatus.SENDING.value, now, draft_id, *[s.value for s in allowed]),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
     # ── memories (explicit user facts, per Telegram user) ──────────────────
     def set_memory(self, telegram_user_id: int, key: str, value: str) -> None:
         """Create or update a memory. ``key`` is the normalized fact key."""

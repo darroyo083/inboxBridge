@@ -20,6 +20,21 @@ UNTRUSTED_DATA_END = "<<<UNTRUSTED_EMAIL_CONTENT_END>>>"
 #: Defensive cap per body / attachment text (upstream caps already apply).
 MAX_BODY_CHARS = 30_000
 
+
+def _seal(text: str) -> str:
+    """Neutralize delimiter strings inside untrusted content.
+
+    An attacker-controlled body could otherwise spell the END delimiter and
+    reopen it, placing their text outside the data block from the model's
+    textual point of view. Replacing the exact delimiter strings (and their
+    angle brackets) inside the DATA section keeps the boundary unambiguous.
+    """
+    return (
+        text.replace(UNTRUSTED_DATA_START, "«UNTRUSTED_EMAIL_CONTENT_START»")
+        .replace(UNTRUSTED_DATA_END, "«UNTRUSTED_EMAIL_CONTENT_END»")
+        .replace("<<<", "‹‹‹")
+    )
+
 #: Explicit memory V1: bounded untrusted context in the DRAFT prompt only.
 _MEMORY_MAX_FACTS = 5
 _MEMORY_FACT_MAX_CHARS = 300
@@ -133,7 +148,7 @@ def _memory_block(facts: tuple[str, ...]) -> str:
     if not facts:
         return ""
     lines = [
-        f"- {_truncate(fact, _MEMORY_FACT_MAX_CHARS)}"
+        f"- {_truncate(_seal(fact), _MEMORY_FACT_MAX_CHARS)}"
         for fact in facts[:_MEMORY_MAX_FACTS]
     ]
     text = "\n".join(lines)
@@ -159,7 +174,7 @@ def summary_user_prompt(email: ParsedEmail) -> str:
     attachments = ""
     if email.attachment_texts:
         parts = [
-            f'Adjunto "{filename}":\n{_truncate(text)}'
+            f'Adjunto "{filename}":\n{_truncate(_seal(text))}'
             for filename, text in email.attachment_texts
         ]
         attachments = "\n\n" + "\n\n".join(parts)
@@ -172,7 +187,7 @@ def summary_user_prompt(email: ParsedEmail) -> str:
         f"De: {email.sender}\n"
         f"Fecha: {email.date_iso}\n"
         f"Asunto: {email.subject}\n\n"
-        f"Cuerpo:\n{_truncate(email.body_text)}"
+        f"Cuerpo:\n{_truncate(_seal(email.body_text))}"
         f"{attachments}\n"
         f"{UNTRUSTED_DATA_END}\n\n"
         "Escribe el resumen en español."
@@ -198,7 +213,7 @@ def draft_system_prompt() -> str:
 
 def draft_user_prompt(request: DraftRequest, thread: ThreadContext) -> str:
     parts = [
-        f"[{i}] De: {message.from_}\n{message.date_iso}\n{_truncate(message.body_text)}"
+        f"[{i}] De: {message.from_}\n{message.date_iso}\n{_truncate(_seal(message.body_text))}"
         for i, message in enumerate(thread.messages, start=1)
     ]
     thread_text = "\n\n".join(parts) if parts else "(el hilo no tiene mensajes disponibles)"

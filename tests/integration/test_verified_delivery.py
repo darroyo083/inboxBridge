@@ -217,6 +217,51 @@ class TestVerifiedDelivery:
         assert len(gmail.sent) == 1
         assert storage.get_draft(1)["status"] == DraftStatus.SENT_VERIFIED.value
 
+    def test_double_tap_resend_sends_exactly_once(self, tmp_path: Path) -> None:
+        gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
+        gmail.send_error = "definitive"
+        coordinator, bot, storage = make_coordinator(tmp_path, gmail)
+        run_request(
+            coordinator,
+            ReplyRequest(thread_id="t1", user_instructions="Danke", source_message_id=13),
+        )
+        assert storage.get_draft(1)["status"] == DraftStatus.SEND_FAILED.value
+
+        gmail.send_error = ""
+        # Two retry taps arrive "concurrently": the second must be refused by
+        # the atomic claim (no duplicate email).
+        async def double_tap() -> None:
+            await asyncio.gather(
+                coordinator.resend_draft(1),
+                coordinator.resend_draft(1),
+            )
+
+        asyncio.run(double_tap())
+        assert len(gmail.sent) == 1
+        assert storage.get_draft(1)["status"] == DraftStatus.SENT_VERIFIED.value
+        # The second tap was refused (either while the first was in flight, or
+        # because the draft is no longer retryable).
+        assert any(
+            "proceso de reenvío" in n or "no está en estado de reintento" in n
+            for n in bot.notices
+        )
+
+    def test_claim_fails_when_draft_not_in_allowed_state(self, tmp_path: Path) -> None:
+        gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
+        coordinator, bot, storage = make_coordinator(tmp_path, gmail)
+        draft = DraftReply(
+            thread_id="t1",
+            subject="Re: Projektbericht",
+            to=[EmailAddress("Anna Muster", "anna@example.com")],
+            cc=[],
+            body="Danke!",
+        )
+        draft_id = storage.create_draft("t1", None, draft)
+        # Verified drafts are not claimable for another send.
+        storage.set_draft_status(draft_id, DraftStatus.SENT_VERIFIED)
+        assert not storage.claim_draft_for_send(draft_id, [DraftStatus.SEND_FAILED])
+        assert storage.get_draft(draft_id)["status"] == DraftStatus.SENT_VERIFIED.value
+
 
 class TestRestartRecovery:
     def test_startup_reconciles_sent_unverified_to_verified_without_resend(
@@ -380,7 +425,7 @@ class TestAttachmentLifecycle:
         assert storage.get_draft(1)["status"] == DraftStatus.SEND_FAILED.value
         # The claimed file is still on disk, so the retry can rebuild the draft.
         draft_dir = Path(str(tmp_path / "tmp" / "draft-1"))
-        assert (draft_dir / "scan.pdf").is_file()
+        assert (draft_dir / "01_scan.pdf").is_file()
 
         gmail.send_error = ""
         asyncio.run(coordinator.resend_draft(1))

@@ -45,8 +45,9 @@ logger = logging.getLogger(__name__)
 
 # Reply context is bounded: only the most recent N thread messages are parsed.
 MAX_THREAD_CONTEXT_MESSAGES = 10
-#: Bounded search window for reconciling a send without a message id.
-MAX_RECONCILE_CANDIDATES = 20
+#: Bounded search tail for reconciling a send without a message id. Wide
+#: enough for high-velocity threads (the time floor does the real filtering).
+MAX_RECONCILE_CANDIDATES = 500
 #: Clock-skew margin for internalDate comparisons (send started vs. Gmail dates).
 _SKEW_MS = 60_000
 
@@ -249,7 +250,14 @@ class GmailClient:
     async def _search_thread_for_sent(
         self, draft: DraftReply, since_ms: int
     ) -> SendVerification:
-        """Find OUR sent message in the thread (matches account From header)."""
+        """Find OUR sent message in the thread (matches account From header).
+
+        Candidate selection is deliberately conservative:
+        - with a ``since_ms`` floor: only messages dated after the send began
+          (clock-skew margin), bounded to a large safety tail;
+        - without one (legacy rows): only the thread's NEWEST message, so an
+          old outbound message can never be mistaken for this send.
+        """
         thread_resp: dict[str, Any] = await self._run(
             self._service.users().threads().get(
                 userId=self._user_id, id=draft.thread_id, format="full"
@@ -257,12 +265,15 @@ class GmailClient:
         )
         messages = thread_resp.get("messages") or []
         ordered = sorted(messages, key=lambda m: _to_int(m.get("internalDate")) or 0)
-        floor = since_ms - _SKEW_MS
-        candidates = [
-            m
-            for m in ordered[-MAX_RECONCILE_CANDIDATES:]
-            if not since_ms or (_to_int(m.get("internalDate")) or 0) >= floor
-        ]
+        if since_ms:
+            floor = since_ms - _SKEW_MS
+            candidates = [
+                m
+                for m in ordered[-MAX_RECONCILE_CANDIDATES:]
+                if (_to_int(m.get("internalDate")) or 0) >= floor
+            ]
+        else:
+            candidates = ordered[-1:]  # newest only when the send time is unknown
         my_email = await self._my_email_address()
         for candidate in reversed(candidates):
             mid = str(candidate.get("id") or "")
@@ -337,14 +348,24 @@ class GmailClient:
         return in_reply_to, references
 
     async def _run(self, request: Any, *, ambiguous: bool = False) -> Any:
-        """Execute a Gmail request off the event loop.
+        """Execute a Gmail request off the event loop, with a hard timeout.
 
-        ``ambiguous=True`` (send operations): transport failures and 5xx
-        responses are mapped to :class:`AmbiguousSendError` because the
-        server-side outcome is unknown.
+        ``ambiguous=True`` (send operations): transport failures, timeouts and
+        5xx responses are mapped to :class:`AmbiguousSendError` because the
+        server-side outcome is unknown. The timeout guarantees a hung
+        transport can never stall the reply worker forever.
         """
         try:
-            return await asyncio.to_thread(request.execute)
+            return await asyncio.wait_for(
+                asyncio.to_thread(request.execute),
+                timeout=self._settings.gmail_request_timeout_seconds,
+            )
+        except TimeoutError as exc:
+            if ambiguous:
+                raise AmbiguousSendError(
+                    "Gmail send timed out: outcome unknown — reconcile before retrying"
+                ) from exc
+            raise GmailAPIError("Gmail request timed out") from exc
         except HttpError as exc:
             status = getattr(exc, "resp", None)
             code = int(getattr(status, "status", 0) or 0) if status is not None else 0

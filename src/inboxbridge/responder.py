@@ -73,7 +73,19 @@ class ReplyCoordinator:
         self._storage = storage
         self._tmp_dir = Path(settings.tmp_dir)
         self._tmp_dir.mkdir(parents=True, exist_ok=True)
+        #: Per-draft async locks: a draft's send/verify/resend lifecycle is
+        #: serialized within the process (double-tap and sweep races).
+        self._draft_locks: dict[int, asyncio.Lock] = {}
+        #: Draft ids currently being reconciled (sweep skips them).
+        self._active_reconciles: set[int] = set()
         bot.register_resend_callback(self.resend_draft)
+
+    def _lock_for(self, draft_id: int) -> asyncio.Lock:
+        lock = self._draft_locks.get(draft_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._draft_locks[draft_id] = lock
+        return lock
 
     async def run_forever(self) -> None:
         """Process reply requests from the bot queue indefinitely."""
@@ -134,10 +146,28 @@ class ReplyCoordinator:
         await self._send_confirmed(draft_id, draft)
 
     async def _send_confirmed(self, draft_id: int, draft: DraftReply) -> None:
-        """Drive one send attempt: sending → (verified | unverified | failed)."""
+        """Drive one send attempt: sending → (verified | unverified | failed).
+
+        The draft is atomically claimed (status → sending) so concurrent
+        confirm/resend paths can never double-send.
+        """
+        async with self._lock_for(draft_id):
+            allowed = [
+                DraftStatus.CONFIRMED,
+                DraftStatus.SEND_FAILED,
+                DraftStatus.SENT_UNVERIFIED,
+            ]
+            if not self._storage.claim_draft_for_send(draft_id, allowed):
+                logger.warning(
+                    "draft %d not claimable for send (concurrent flow); skipping", draft_id
+                )
+                return
+            await self._send_claimed(draft_id, draft)
+
+    async def _send_claimed(self, draft_id: int, draft: DraftReply) -> None:
+        """Send attempt for a draft already atomically claimed as SENDING."""
         started_ms = int(time.time() * 1000)
         self._storage.set_draft_send_started(draft_id, started_ms)
-        self._storage.set_draft_status(draft_id, DraftStatus.SENDING)
         try:
             new_message_id = await self._gmail.send_reply(draft)
         except SendingDisabledError:
@@ -186,6 +216,22 @@ class ReplyCoordinator:
         - inconclusive (Gmail unreachable) → sent_unverified, report later;
         - definitive not-found → sent_unverified + controlled retry button.
         """
+        self._active_reconciles.add(draft_id)
+        try:
+            await self._reconcile_loop(
+                draft_id, draft, expected_message_id=expected_message_id, started_ms=started_ms
+            )
+        finally:
+            self._active_reconciles.discard(draft_id)
+
+    async def _reconcile_loop(
+        self,
+        draft_id: int,
+        draft: DraftReply,
+        *,
+        expected_message_id: str,
+        started_ms: int,
+    ) -> None:
         attempts = 0
         max_attempts = max(1, self._settings.send_verification_attempts)
         while attempts < max_attempts:
@@ -229,19 +275,32 @@ class ReplyCoordinator:
         """Retry a failed/uncertain draft. NEVER blind: Gmail is checked first.
 
         Called from the Telegram "Reintentar envío" button (chat + ownership
-        already validated by the bot).
+        already validated by the bot). The draft is atomically claimed
+        (status → sending) before any work, so a double-tap or a concurrent
+        sweep can never produce two emails.
         """
+        async with self._lock_for(draft_id):
+            await self._resend_draft_locked(draft_id)
+
+    async def _resend_draft_locked(self, draft_id: int) -> None:
         row = self._storage.get_draft(draft_id)
         if row is None:
             await self._bot.send_notice("Ese borrador ya no existe.")
             return
-        status = DraftStatus(row["status"])
-        if status not in (DraftStatus.SEND_FAILED, DraftStatus.SENT_UNVERIFIED):
+        previous_status = DraftStatus(row["status"])
+        if previous_status not in (DraftStatus.SEND_FAILED, DraftStatus.SENT_UNVERIFIED):
             await self._bot.send_notice("Ese borrador no está en estado de reintento.")
+            return
+        # Atomic claim: the first caller wins; any concurrent retry/sweep skips.
+        if not self._storage.claim_draft_for_send(
+            draft_id, [DraftStatus.SEND_FAILED, DraftStatus.SENT_UNVERIFIED]
+        ):
+            await self._bot.send_notice("Ese borrador ya está en proceso de reenvío.")
             return
         draft = self._draft_from_row(row)
         attachments = self._load_attachments(row)
         if any(a is None for a in attachments):
+            self._storage.set_draft_status(draft_id, previous_status)
             await self._bot.send_notice(
                 "Los adjuntos de ese borrador ya no están disponibles; "
                 "prepara la respuesta otra vez."
@@ -255,31 +314,36 @@ class ReplyCoordinator:
             since_ms=int(row["send_started_at"] or 0),
         )
         if verification.verified:
+            self._storage.set_draft_sent_message(draft_id, verification.message_id)
             self._storage.set_draft_status(draft_id, DraftStatus.SENT_VERIFIED)
             await self._bot.send_notice("Ya estaba enviado (verificado ✓). No he reenviado nada.")
             self._cleanup_attachments(draft)
             return
         if not verification.checked_ok:
+            self._storage.set_draft_status(draft_id, DraftStatus.SENT_UNVERIFIED)
             await self._bot.send_notice(
                 "No puedo confirmar el estado en Gmail ahora; no reenvío para evitar duplicados."
             )
             return
         if verification.found:
+            self._storage.set_draft_status(draft_id, previous_status)
             await self._bot.send_notice(
                 "Gmail tiene un mensaje en ese hilo que no coincide con el borrador; "
                 "no reenvío."
             )
             return
-        # Gmail evidence: the message was NOT sent → safe to send now.
-        await self._send_confirmed(draft_id, draft)
+        # Gmail evidence: the message was NOT sent → safe to send now (already
+        # claimed as SENDING; keep the lock across the whole attempt).
+        await self._send_claimed(draft_id, draft)
 
     # ── restart / periodic recovery ─────────────────────────────────────────
 
     async def reconcile_on_startup(self) -> None:
         """Sweep drafts left in-flight by a previous process.
 
-        Only reconciles; never resends. Orphan temp files are cleaned after
-        terminal states are resolved.
+        Only reconciles; never resends. Temp cleanup is left to the periodic
+        sweep (which runs AFTER this pass), so a freshly-offered retry button
+        never races its own attachment files.
         """
         rows = self._storage.drafts_in_statuses(list(_UNRECONCILED))
         for row in rows:
@@ -288,14 +352,17 @@ class ReplyCoordinator:
             if status == DraftStatus.SENDING:
                 # The send may have reached Gmail; the row may lack a message id.
                 self._storage.set_draft_status(draft_id, DraftStatus.SENT_UNVERIFIED)
+                row = {**row, "status": DraftStatus.SENT_UNVERIFIED.value}
             draft = self._draft_from_row(row)
             logger.info("startup reconciliation for draft %d (was %s)", draft_id, status.value)
             await self._reconcile_row(row, draft, startup=True)
-        self.cleanup_orphan_tmp()
 
     async def sweep_unverified(self) -> None:
         """Periodic: re-verify drafts stuck in sent_unverified (bounded)."""
         for row in self._storage.drafts_in_statuses([DraftStatus.SENT_UNVERIFIED]):
+            draft_id = int(row["id"])
+            if draft_id in self._active_reconciles:
+                continue  # a send/verify flow already owns this draft
             attempts = int(row["verification_attempts"])
             if attempts >= self._settings.send_verification_max_attempts:
                 continue
@@ -307,27 +374,44 @@ class ReplyCoordinator:
         self, row: dict[str, Any], draft: DraftReply, *, startup: bool
     ) -> None:
         draft_id = int(row["id"])
-        result = await self._gmail.verify_delivery(
-            draft,
-            expected_message_id=row["sent_message_id"] or "",
-            since_ms=int(row["send_started_at"] or 0),
-        )
-        self._storage.bump_verification_attempts(draft_id)
-        if result.verified:
-            self._storage.set_draft_sent_message(draft_id, result.message_id)
-            self._storage.set_draft_status(draft_id, DraftStatus.SENT_VERIFIED)
-            prefix = "Tras el reinicio" if startup else "Verificación"
-            await self._bot.send_notice(f"{prefix}: envío confirmado ✓ (no he reenviado nada).")
-            self._cleanup_attachments(draft)
-        elif not result.checked_ok:
-            logger.warning("reconciliation inconclusive for draft %d (Gmail unreachable)", draft_id)
-        elif not result.found:
-            self._storage.set_draft_status(draft_id, DraftStatus.SEND_FAILED)
-            await self._bot.send_notice(
-                "Tras revisar Gmail, el envío pendiente no llegó a salir. "
-                "Puedes reintentarlo."
-            )
-            await self._bot.offer_resend(draft_id, user_id=int(row["telegram_user_id"] or 0))
+        self._active_reconciles.add(draft_id)
+        try:
+            async with self._lock_for(draft_id):
+                # A user-driven resend may have claimed the draft while we were
+                # verifying; never clobber an in-flight flow's state.
+                current = self._storage.get_draft(draft_id)
+                if current is None or current["status"] != row["status"]:
+                    return
+                result = await self._gmail.verify_delivery(
+                    draft,
+                    expected_message_id=row["sent_message_id"] or "",
+                    since_ms=int(row["send_started_at"] or 0),
+                )
+                self._storage.bump_verification_attempts(draft_id)
+                if result.verified:
+                    self._storage.set_draft_sent_message(draft_id, result.message_id)
+                    self._storage.set_draft_status(draft_id, DraftStatus.SENT_VERIFIED)
+                    prefix = "Tras el reinicio" if startup else "Verificación"
+                    await self._bot.send_notice(
+                        f"{prefix}: envío confirmado ✓ (no he reenviado nada)."
+                    )
+                    self._cleanup_attachments(draft)
+                elif not result.checked_ok:
+                    logger.warning(
+                        "reconciliation inconclusive for draft %d (Gmail unreachable)",
+                        draft_id,
+                    )
+                elif not result.found:
+                    self._storage.set_draft_status(draft_id, DraftStatus.SEND_FAILED)
+                    await self._bot.send_notice(
+                        "Tras revisar Gmail, el envío pendiente no llegó a salir. "
+                        "Puedes reintentarlo."
+                    )
+                    await self._bot.offer_resend(
+                        draft_id, user_id=int(row["telegram_user_id"] or 0)
+                    )
+        finally:
+            self._active_reconciles.discard(draft_id)
 
     # ── temp attachment lifecycle ───────────────────────────────────────────
 
@@ -337,24 +421,24 @@ class ReplyCoordinator:
     def _claim_attachments(self, draft_id: int, draft: DraftReply) -> DraftReply:
         """Move freshly downloaded files into ``tmp/draft-<id>/``.
 
-        Returns a draft whose attachment paths point at the claimed files, so
-        later resend/recovery lookups (`_load_attachments`) find them.
+        Claimed names are deterministic from the attachment order
+        (``NN_<safe-name>``) so recovery/resend lookups reproduce them and
+        same-name attachments never collide. Returns a draft whose attachment
+        paths point at the claimed files.
         """
         if not draft.attachments:
             return draft
         target_dir = self._draft_tmp_dir(draft_id)
         target_dir.mkdir(parents=True, exist_ok=True)
         claimed: list[OutgoingAttachment] = []
-        for attachment in draft.attachments:
+        for index, attachment in enumerate(draft.attachments):
             if not attachment.path:
                 claimed.append(attachment)
                 continue
             source = Path(attachment.path)
-            target = target_dir / _safe_basename(attachment.filename)
+            target = target_dir / _claimed_name(index, attachment.filename)
             try:
                 if source != target and source.is_file():
-                    if target.exists():
-                        target.unlink()
                     source.replace(target)
                 claimed.append(
                     OutgoingAttachment(
@@ -382,11 +466,18 @@ class ReplyCoordinator:
                     break
 
     def cleanup_orphan_tmp(self) -> None:
-        """Remove temp files/dirs whose draft reached a terminal state, or that
-        are stale (downloads that never became drafts)."""
+        """Remove temp files/dirs that can no longer be used.
+
+        - terminal drafts: files survive a grace period (a freshly-posted
+          retry button must not be dead on arrival);
+        - PENDING/CONFIRMED drafts are swept once stale (crashed workflows,
+          kill-switch leftovers);
+        - unknown drafts and never-claimed downloads are swept by age.
+        """
         if not self._tmp_dir.is_dir():
             return
         max_age = timedelta(seconds=self._settings.tmp_max_age_seconds)
+        offer_ttl = timedelta(seconds=self._settings.resend_offer_ttl_seconds)
         now = datetime.now(UTC)
         for child in self._tmp_dir.iterdir():
             # Fresh downloads that never became drafts (e.g. crashed mid-request).
@@ -407,19 +498,22 @@ class ReplyCoordinator:
                 continue
             row = self._storage.get_draft(draft_id)
             if row is None:
-                pass  # unknown draft → stale, remove if old
-            elif row["status"] in (
+                self._sweep_stale(child, now, max_age)  # unknown draft → stale
+                continue
+            status = row["status"]
+            if status in (
                 DraftStatus.SENT_VERIFIED.value,
                 DraftStatus.SEND_FAILED.value,
                 DraftStatus.CANCELLED.value,
                 DraftStatus.REJECTED.value,
             ):
-                with contextlib.suppress(OSError):
-                    shutil.rmtree(child, ignore_errors=True)
+                # Terminal: keep files only while a resend offer could still be
+                # acted on; the dir's own age is the grace clock.
+                self._sweep_stale(child, now, offer_ttl)
                 continue
-            else:
-                continue  # active draft: leave the files
-            self._sweep_stale(child, now, max_age)
+            # PENDING/CONFIRMED can only legitimately stay that way briefly;
+            # stale ones are crash/kill-switch leftovers → sweep by age.
+            self._sweep_stale(child, now, offer_ttl)
 
     @staticmethod
     def _sweep_stale(path: Path, now: datetime, max_age: timedelta) -> None:
@@ -474,9 +568,9 @@ class ReplyCoordinator:
         draft_id = int(row["id"])
         base = self._draft_tmp_dir(draft_id)
         result: list[OutgoingAttachment | None] = []
-        for item in items:
+        for index, item in enumerate(items):
             filename = str(item.get("filename") or "")
-            path = base / _safe_basename(filename)
+            path = base / _claimed_name(index, filename)
             result.append(
                 OutgoingAttachment(
                     filename=filename,
@@ -559,3 +653,8 @@ def _safe_basename(filename: str) -> str:
     name = PurePath(filename.replace("\\", "/")).name
     cleaned = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
     return cleaned.strip(".") or "attachment"
+
+
+def _claimed_name(index: int, filename: str) -> str:
+    """Deterministic per-draft claimed file name (order-prefixed, collision-free)."""
+    return f"{index + 1:02d}_{_safe_basename(filename)}"

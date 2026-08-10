@@ -67,6 +67,12 @@ class Settings(BaseSettings):
     reconcile_sweep_interval_seconds: float = 300.0
     #: Temp attachment files older than this (seconds) are swept unconditionally.
     tmp_max_age_seconds: int = 24 * 3600
+    #: How long a resend offer (and its temp attachments) stays valid after the
+    #: draft reaches a terminal state; after this, the files are swept.
+    resend_offer_ttl_seconds: int = 3600
+    #: Per-request Gmail API timeout (seconds). A hung transport can never
+    #: block the reply worker forever; a timed-out SEND is ambiguous by design.
+    gmail_request_timeout_seconds: float = 30.0
 
     # Retries
     retry_backoff_base: float = 2.0

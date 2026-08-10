@@ -541,7 +541,7 @@ def _button_data(markup: InlineKeyboardMarkup, row: int, col: int) -> str:
 
 async def test_confirm_button_resolves_draft(make_env: Any) -> None:
     bot, sender, storage = make_env()
-    draft_message_id = await bot.send_draft_for_confirmation(_draft())
+    draft_message_id = await bot.send_draft_for_confirmation(_draft(), user_id=7)
     markup = sender.messages[-1].reply_markup
     assert isinstance(markup, InlineKeyboardMarkup)
     token = _button_data(markup, 0, 0).split(":", 1)[1]
@@ -555,7 +555,7 @@ async def test_confirm_button_resolves_draft(make_env: Any) -> None:
 
 async def test_cancel_button_resolves_draft_false(make_env: Any) -> None:
     bot, sender, storage = make_env()
-    draft_message_id = await bot.send_draft_for_confirmation(_draft())
+    draft_message_id = await bot.send_draft_for_confirmation(_draft(), user_id=7)
     markup = sender.messages[-1].reply_markup
     assert isinstance(markup, InlineKeyboardMarkup)
     token = _button_data(markup, 0, 1).split(":", 1)[1]
@@ -563,6 +563,20 @@ async def test_cancel_button_resolves_draft_false(make_env: Any) -> None:
     await asyncio.sleep(0)
     await bot.process_update(_callback_update(CHAT_ID, f"cancel:{token}"))
     assert await task is False
+
+
+async def test_ownerless_draft_confirm_is_fail_closed(make_env: Any) -> None:
+    """A draft with no recorded owner can never be confirmed (fail closed)."""
+    bot, sender, storage = make_env()
+    draft_message_id = await bot.send_draft_for_confirmation(_draft())  # user_id=0
+    markup = sender.messages[-1].reply_markup
+    token = _button_data(markup, 0, 0).split(":", 1)[1]
+    task = asyncio.create_task(bot.wait_for_confirmation(draft_message_id))
+    await asyncio.sleep(0)
+    await bot.process_update(_callback_update(CHAT_ID, f"confirm:{token}"))
+    assert "otro miembro" in sender.answered[-1]
+    assert not task.done()  # not confirmed
+    task.cancel()
 
 
 async def test_stale_callback_is_answered_and_ignored(make_env: Any) -> None:
@@ -916,7 +930,7 @@ async def test_view_callback_unauthorized_chat_ignored(make_env: Any) -> None:
 
 async def test_draft_confirmation_callbacks_still_work_with_view_regex(make_env: Any) -> None:
     bot, sender, storage = make_env()
-    await bot.send_draft_for_confirmation(_draft())
+    await bot.send_draft_for_confirmation(_draft(), user_id=7)
     markup = sender.messages[0].reply_markup
     assert isinstance(markup, InlineKeyboardMarkup)
     token = _button_data(markup, 0, 0).split(":", 1)[1]
