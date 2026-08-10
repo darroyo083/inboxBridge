@@ -322,7 +322,7 @@ class TestRestartRecovery:
 
 
 class TestAttachmentLifecycle:
-    def test_attachments_cleaned_after_verified_send(self, tmp_path: Path) -> None:
+    def test_attachments_claimed_then_cleaned_after_verified_send(self, tmp_path: Path) -> None:
         gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
         coordinator, bot, storage = make_coordinator(tmp_path, gmail)
         attachment = write_attachment(tmp_path)
@@ -339,7 +339,10 @@ class TestAttachmentLifecycle:
         assert len(gmail.sent) == 1
         assert gmail.sent[0].attachments[0].filename == "factura.pdf"
         assert storage.get_draft(1)["status"] == DraftStatus.SENT_VERIFIED.value
-        assert not Path(attachment.path).exists()  # temp file removed after verified delivery
+        # Claimed into the draft's temp dir, then deleted after verification.
+        draft_dir = Path(str(tmp_path / "tmp" / "draft-1"))
+        assert not draft_dir.exists()
+        assert not Path(attachment.path).exists()
 
     def test_cancellation_cleans_attachments_and_never_sends(self, tmp_path: Path) -> None:
         gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
@@ -358,7 +361,33 @@ class TestAttachmentLifecycle:
         )
         assert gmail.sent == []
         assert storage.get_draft(1)["status"] == DraftStatus.CANCELLED.value
-        assert not Path(attachment.path).exists()
+        assert not Path(str(tmp_path / "tmp" / "draft-1")).exists()
+
+    def test_resend_after_failure_keeps_attachments(self, tmp_path: Path) -> None:
+        gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
+        gmail.send_error = "definitive"
+        coordinator, bot, storage = make_coordinator(tmp_path, gmail)
+        attachment = write_attachment(tmp_path, name="scan.pdf")
+        run_request(
+            coordinator,
+            ReplyRequest(
+                thread_id="t1",
+                user_instructions="Danke",
+                source_message_id=12,
+                attachments=(attachment,),
+            ),
+        )
+        assert storage.get_draft(1)["status"] == DraftStatus.SEND_FAILED.value
+        # The claimed file is still on disk, so the retry can rebuild the draft.
+        draft_dir = Path(str(tmp_path / "tmp" / "draft-1"))
+        assert (draft_dir / "scan.pdf").is_file()
+
+        gmail.send_error = ""
+        asyncio.run(coordinator.resend_draft(1))
+        assert storage.get_draft(1)["status"] == DraftStatus.SENT_VERIFIED.value
+        assert len(gmail.sent) == 1
+        assert gmail.sent[0].attachments[0].filename == "scan.pdf"
+        assert not draft_dir.exists()  # cleaned after verified delivery
 
     def test_confirmation_shows_attachments(self, tmp_path: Path) -> None:
         gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
@@ -391,6 +420,19 @@ class TestAttachmentLifecycle:
         os.utime(orphan_dir, (old, old))
         coordinator.cleanup_orphan_tmp()
         assert not orphan_dir.exists()
+
+    def test_stale_incoming_download_swept(self, tmp_path: Path) -> None:
+        gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
+        coordinator, bot, storage = make_coordinator(tmp_path, gmail)
+        import os
+
+        stale = Path(str(tmp_path / "tmp" / "incoming" / "abc123_scan.pdf"))
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b"junk")
+        old = time.time() - 48 * 3600
+        os.utime(stale, (old, old))
+        coordinator.cleanup_orphan_tmp()
+        assert not stale.exists()
 
 
 class MockLLM:

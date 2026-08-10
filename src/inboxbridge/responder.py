@@ -114,6 +114,9 @@ class ReplyCoordinator:
         draft_id = self._storage.create_draft(
             draft.thread_id, None, draft, telegram_user_id=user_id
         )
+        # Claim freshly-downloaded files into tmp/draft-<id>/ so the whole
+        # attachment lifecycle is per-draft (sweepable, resendable).
+        draft = self._claim_attachments(draft_id, draft)
         message_id = await self._bot.send_draft_for_confirmation(
             draft, draft_id=draft_id, user_id=user_id
         )
@@ -162,7 +165,7 @@ class ReplyCoordinator:
                 "El envío falló y no se completó. El borrador queda guardado; "
                 "puedes reintentarlo."
             )
-            await self._bot.offer_resend(draft_id, user_id=0)
+            await self._bot.offer_resend(draft_id, user_id=self._draft_owner(draft_id))
             return
         self._storage.set_draft_sent_message(draft_id, new_message_id)
         await self._reconcile(
@@ -184,7 +187,8 @@ class ReplyCoordinator:
         - definitive not-found → sent_unverified + controlled retry button.
         """
         attempts = 0
-        while attempts < self._settings.send_verification_attempts:
+        max_attempts = max(1, self._settings.send_verification_attempts)
+        while attempts < max_attempts:
             attempts += 1
             self._storage.bump_verification_attempts(draft_id)
             result: SendVerification = await self._gmail.verify_delivery(
@@ -202,7 +206,7 @@ class ReplyCoordinator:
                 return
             if not result.checked_ok:
                 break  # inconclusive — never resend without Gmail evidence
-            if attempts < self._settings.send_verification_attempts:
+            if attempts < max_attempts:
                 await asyncio.sleep(self._settings.send_verification_backoff_seconds)
 
         self._storage.set_draft_status(draft_id, DraftStatus.SENT_UNVERIFIED)
@@ -212,11 +216,12 @@ class ReplyCoordinator:
                 "No reenvío para evitar duplicados; lo comprobaré y te aviso."
             )
             return
+        owner_id = self._draft_owner(draft_id)
         await self._bot.send_notice(
             "No encuentro el correo en Gmail. Para evitar duplicados no reenvío "
             "automáticamente; usa el botón si quieres reintentar."
         )
-        await self._bot.offer_resend(draft_id, user_id=0)
+        await self._bot.offer_resend(draft_id, user_id=owner_id)
 
     # ── controlled retry (user-initiated, duplicate-safe) ───────────────────
 
@@ -329,15 +334,47 @@ class ReplyCoordinator:
     def _draft_tmp_dir(self, draft_id: int) -> Path:
         return self._tmp_dir / f"draft-{draft_id}"
 
+    def _claim_attachments(self, draft_id: int, draft: DraftReply) -> DraftReply:
+        """Move freshly downloaded files into ``tmp/draft-<id>/``.
+
+        Returns a draft whose attachment paths point at the claimed files, so
+        later resend/recovery lookups (`_load_attachments`) find them.
+        """
+        if not draft.attachments:
+            return draft
+        target_dir = self._draft_tmp_dir(draft_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        claimed: list[OutgoingAttachment] = []
+        for attachment in draft.attachments:
+            if not attachment.path:
+                claimed.append(attachment)
+                continue
+            source = Path(attachment.path)
+            target = target_dir / _safe_basename(attachment.filename)
+            try:
+                if source != target and source.is_file():
+                    if target.exists():
+                        target.unlink()
+                    source.replace(target)
+                claimed.append(
+                    OutgoingAttachment(
+                        filename=attachment.filename,
+                        mime_type=attachment.mime_type,
+                        size_bytes=attachment.size_bytes,
+                        path=str(target),
+                    )
+                )
+            except OSError:
+                logger.warning("could not claim attachment %s", attachment.filename)
+                claimed.append(attachment)
+        return replace(draft, attachments=tuple(claimed))
+
     def _cleanup_attachments(self, draft: DraftReply) -> None:
         for attachment in draft.attachments:
             if not attachment.path:
                 continue
             with contextlib.suppress(OSError):
                 Path(attachment.path).unlink(missing_ok=True)
-        for attachment in draft.attachments:
-            if not attachment.path:
-                continue
             parent = Path(attachment.path).parent
             with contextlib.suppress(OSError):
                 if parent.is_dir() and not any(parent.iterdir()):
@@ -345,12 +382,22 @@ class ReplyCoordinator:
                     break
 
     def cleanup_orphan_tmp(self) -> None:
-        """Remove temp dirs whose draft reached a terminal state, or that are stale."""
+        """Remove temp files/dirs whose draft reached a terminal state, or that
+        are stale (downloads that never became drafts)."""
         if not self._tmp_dir.is_dir():
             return
         max_age = timedelta(seconds=self._settings.tmp_max_age_seconds)
+        now = datetime.now(UTC)
         for child in self._tmp_dir.iterdir():
+            # Fresh downloads that never became drafts (e.g. crashed mid-request).
+            if child.is_file():
+                self._sweep_stale(child, now, max_age)
+                continue
             if not child.is_dir():
+                continue
+            if child.name == "incoming":
+                for file in child.iterdir():
+                    self._sweep_stale(file, now, max_age)
                 continue
             if not child.name.startswith("draft-"):
                 continue
@@ -372,15 +419,26 @@ class ReplyCoordinator:
                 continue
             else:
                 continue  # active draft: leave the files
-            try:
-                mtime = datetime.fromtimestamp(child.stat().st_mtime, tz=UTC)
-            except OSError:
-                continue
-            if datetime.now(UTC) - mtime > max_age:
+            self._sweep_stale(child, now, max_age)
+
+    @staticmethod
+    def _sweep_stale(path: Path, now: datetime, max_age: timedelta) -> None:
+        try:
+            mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+        except OSError:
+            return
+        if now - mtime > max_age:
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
                 with contextlib.suppress(OSError):
-                    shutil.rmtree(child, ignore_errors=True)
+                    path.unlink(missing_ok=True)
 
     # ── row → model reconstruction ──────────────────────────────────────────
+
+    def _draft_owner(self, draft_id: int) -> int:
+        row = self._storage.get_draft(draft_id)
+        return int(row["telegram_user_id"] or 0) if row else 0
 
     def _draft_from_row(self, row: dict[str, Any]) -> DraftReply:
         to: list[EmailAddress] = []
