@@ -10,16 +10,19 @@ import asyncio
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from telegram import (
     CallbackQuery,
     Chat,
+    Document,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
     Message,
     MessageEntity,
+    PhotoSize,
     ReplyParameters,
     Update,
     User,
@@ -28,12 +31,30 @@ from telegram.constants import ChatAction, ChatType, ParseMode
 
 from inboxbridge.config import Settings
 from inboxbridge.db import Storage
-from inboxbridge.models import DraftReply, EmailAddress, EmailSummary, ParsedEmail
+from inboxbridge.models import (
+    DraftReply,
+    EmailAddress,
+    EmailSummary,
+    OutgoingAttachment,
+    ParsedEmail,
+)
 from inboxbridge.telegram.bot import TelegramBot
 
 CHAT_ID = -100123456789
 BOT_ID = 42
 BOT_USERNAME = "inboxbridge_bot"
+
+
+class FakeFile:
+    """Minimal Telegram File stand-in with the blocking ``download`` API."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def download(self, custom_path: Any = None) -> Any:
+        path = Path(custom_path)
+        path.write_bytes(self._data)
+        return path
 
 
 class FakeSender:
@@ -43,6 +64,8 @@ class FakeSender:
         self.edited: list[tuple[int | None, str, InlineKeyboardMarkup | None]] = []
         self.answered: list[str] = []
         self.deleted: list[int] = []
+        self.files: dict[str, FakeFile] = {}
+        self.downloaded: list[Any] = []
         self._next_id = 1
 
     async def send_message(
@@ -95,6 +118,13 @@ class FakeSender:
     async def delete_message(self, chat_id: int | str, message_id: int) -> bool:
         self.deleted.append(message_id)
         return True
+
+    async def get_file(self, file_id: str) -> FakeFile:
+        if file_id not in self.files:
+            raise RuntimeError(f"unknown file id {file_id}")
+        file = self.files[file_id]
+        self.downloaded.append(file_id)
+        return file
 
 
 @pytest.fixture
@@ -996,3 +1026,266 @@ async def test_responder_flow_end_to_end_with_kill_switch(make_env: Any) -> None
     token = _button_data(markup, 0, 0).split(":", 1)[1]
     await bot.process_update(_callback_update(CHAT_ID, f"cancel:{token}", from_user_id=7))
     assert "Cancelado." in sender.answered
+
+
+# ── outgoing attachments (Telegram documents/photos) ─────────────────────
+
+
+def _document_message(
+    message_id: int,
+    *,
+    file_id: str = "file-1",
+    file_name: str = "factura.pdf",
+    mime_type: str = "application/pdf",
+    file_size: int = 1024,
+    caption: str | None = None,
+    chat_id: int = CHAT_ID,
+    user_id: int = 7,
+    reply_to: Message | None = None,
+) -> Message:
+    doc = Document(
+        file_id=file_id,
+        file_unique_id=f"uniq-{file_id}",
+        file_name=file_name,
+        mime_type=mime_type,
+        file_size=file_size,
+    )
+    return Message(
+        message_id=message_id,
+        date=datetime.now(UTC),
+        chat=Chat(id=chat_id, type=ChatType.GROUP),
+        from_user=_user(user_id),
+        document=doc,
+        caption=caption,
+        reply_to_message=reply_to,
+    )
+
+
+def _photo_message(
+    message_id: int,
+    *,
+    chat_id: int = CHAT_ID,
+    user_id: int = 7,
+    reply_to: Message | None = None,
+) -> Message:
+    photo = PhotoSize(
+        file_id="photo-1",
+        file_unique_id="uniq-photo",
+        width=100,
+        height=100,
+        file_size=2048,
+    )
+    return Message(
+        message_id=message_id,
+        date=datetime.now(UTC),
+        chat=Chat(id=chat_id, type=ChatType.GROUP),
+        from_user=_user(user_id),
+        photo=[photo],
+        reply_to_message=reply_to,
+    )
+
+
+async def test_document_attachment_downloads_and_rides_reply_request(
+    make_env: Any, tmp_path: Path
+) -> None:
+    bot, sender, storage = make_env()
+    bot._settings.tmp_dir = str(tmp_path)  # isolate temp storage
+    sender.files["file-1"] = FakeFile(b"%PDF-1.4 fake")
+    storage.set_meta("tg:10", "thread-1")
+    bot_message = _message(10, CHAT_ID, "Presupuesto", BOT_ID, is_bot=True)
+    message = _document_message(11, reply_to=bot_message, caption="Adjunto el contrato")
+    await bot.process_update(_update(message))
+
+    requests = await _drain(bot)
+    assert len(requests) == 1
+    assert requests[0].user_instructions == "Adjunto el contrato"
+    assert len(requests[0].attachments) == 1
+    attachment = requests[0].attachments[0]
+    assert attachment.filename == "factura.pdf"
+    assert attachment.mime_type == "application/pdf"
+    assert Path(attachment.path).is_file()
+    assert Path(attachment.path).read_bytes() == b"%PDF-1.4 fake"
+
+
+async def test_photo_attachment_is_supported(make_env: Any, tmp_path: Path) -> None:
+    bot, sender, storage = make_env()
+    bot._settings.tmp_dir = str(tmp_path)
+    sender.files["photo-1"] = FakeFile(b"jpeg-bytes")
+    storage.set_meta("tg:10", "thread-1")
+    bot_message = _message(10, CHAT_ID, "Presupuesto", BOT_ID, is_bot=True)
+    message = _photo_message(11, reply_to=bot_message)
+    await bot.process_update(_update(message))
+
+    requests = await _drain(bot)
+    assert len(requests) == 1
+    assert len(requests[0].attachments) == 1
+    attachment = requests[0].attachments[0]
+    assert attachment.filename.endswith(".jpg")
+    assert attachment.mime_type == "image/jpeg"
+
+
+async def test_path_traversal_filename_is_sanitized(make_env: Any, tmp_path: Path) -> None:
+    bot, sender, storage = make_env()
+    bot._settings.tmp_dir = str(tmp_path)
+    sender.files["file-1"] = FakeFile(b"data")
+    storage.set_meta("tg:10", "thread-1")
+    bot_message = _message(10, CHAT_ID, "Presupuesto", BOT_ID, is_bot=True)
+    message = _document_message(11, file_name="../../etc/evil.pdf", reply_to=bot_message)
+    await bot.process_update(_update(message))
+
+    requests = await _drain(bot)
+    attachment = requests[0].attachments[0]
+    assert attachment.filename == "evil.pdf"  # display name sanitized
+    assert ".." not in attachment.path  # temp path stays inside tmp_dir
+
+
+async def test_oversized_attachment_rejected_with_notice(make_env: Any, tmp_path: Path) -> None:
+    bot, sender, storage = make_env()
+    bot._settings.tmp_dir = str(tmp_path)
+    bot._settings.outgoing_attachment_max_bytes = 10
+    sender.files["file-1"] = FakeFile(b"x" * 100)
+    storage.set_meta("tg:10", "thread-1")
+    bot_message = _message(10, CHAT_ID, "Presupuesto", BOT_ID, is_bot=True)
+    message = _document_message(11, reply_to=bot_message)
+    await bot.process_update(_update(message))
+
+    requests = await _drain(bot)
+    assert requests[0].attachments == ()  # rejected
+    assert "grande" in (sender.messages[-1].text or "")  # notice posted
+
+
+async def test_too_many_attachments_rejected(make_env: Any, tmp_path: Path) -> None:
+    bot, sender, storage = make_env()
+    bot._settings.tmp_dir = str(tmp_path)
+    bot._settings.outgoing_attachment_max_count = 1
+    sender.files["file-1"] = FakeFile(b"a")
+    sender.files["photo-1"] = FakeFile(b"b")
+    storage.set_meta("tg:10", "thread-1")
+    bot_message = _message(10, CHAT_ID, "Presupuesto", BOT_ID, is_bot=True)
+    # ONE message carrying both a document and a photo → 2 files > max 1.
+    doc = Document(
+        file_id="file-1", file_unique_id="uniq-file", file_name="a.pdf",
+        mime_type="application/pdf", file_size=5,
+    )
+    photo = PhotoSize(
+        file_id="photo-1", file_unique_id="uniq-photo", width=10, height=10, file_size=5
+    )
+    message = Message(
+        message_id=11,
+        date=datetime.now(UTC),
+        chat=Chat(id=CHAT_ID, type=ChatType.GROUP),
+        from_user=_user(7),
+        document=doc,
+        photo=[photo],
+        caption="dos adjuntos",
+        reply_to_message=bot_message,
+    )
+    await bot.process_update(_update(message))
+
+    requests = await _drain(bot)
+    assert len(requests) == 1
+    assert requests[0].attachments == ()  # batch rejected
+    assert any("Demasiados adjuntos" in (m.text or "") for m in sender.messages)
+
+
+async def test_attachment_without_reply_intent_is_ignored(make_env: Any, tmp_path: Path) -> None:
+    bot, sender, storage = make_env()
+    bot._settings.tmp_dir = str(tmp_path)
+    sender.files["file-1"] = FakeFile(b"data")
+    message = _document_message(11)  # no reply-to-own, no mention, no pending
+    await bot.process_update(_update(message))
+    assert await _drain(bot) == []
+    assert sender.downloaded == []
+
+
+async def test_draft_confirmation_message_lists_attachments(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    draft = DraftReply(
+        thread_id="t1",
+        subject="Re: Proyecto",
+        to=[EmailAddress("Ana", "ana@example.com")],
+        cc=[],
+        body="Sehr geehrte Frau Ana,\n\ndanke.",
+        attachments=(
+            OutgoingAttachment(
+                filename="factura.pdf",
+                mime_type="application/pdf",
+                size_bytes=2048,
+                path="C:/tmp/factura.pdf",
+            ),
+        ),
+    )
+    await bot.send_draft_for_confirmation(draft, draft_id=1)
+    text = sender.messages[-1].text or ""
+    assert "Adjuntos:" in text
+    assert "factura.pdf" in text
+
+
+# ── "Reintentar envío" (resend) button ────────────────────────────────────
+
+
+async def test_resend_callback_invokes_coordinator_with_owner_validation(
+    make_env: Any, tmp_path: Path
+) -> None:
+    bot, sender, storage = make_env()
+    called: list[int] = []
+
+    async def resend(draft_id: int) -> None:
+        called.append(draft_id)
+
+    bot.register_resend_callback(resend)
+    draft = DraftReply(
+        thread_id="t1",
+        subject="Re: Proyecto",
+        to=[EmailAddress("Ana", "ana@example.com")],
+        cc=[],
+        body="danke",
+    )
+    draft_id = storage.create_draft("t1", None, draft, telegram_user_id=7)
+
+    # Unknown draft id → ignored.
+    await bot.process_update(_callback_update(CHAT_ID, "resend:999", from_user_id=7))
+    assert called == []
+
+    # Wrong member → rejected without invoking the coordinator.
+    await bot.process_update(_callback_update(CHAT_ID, f"resend:{draft_id}", from_user_id=8))
+    assert called == []
+    assert "otro miembro" in sender.answered[-1]
+
+    # Owner → coordinator invoked.
+    await bot.process_update(_callback_update(CHAT_ID, f"resend:{draft_id}", from_user_id=7))
+    assert called == [draft_id]
+
+
+async def test_resend_callback_ignored_from_unauthorized_chat(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    called: list[int] = []
+
+    async def resend(draft_id: int) -> None:
+        called.append(draft_id)
+
+    bot.register_resend_callback(resend)
+    draft = DraftReply(
+        thread_id="t1",
+        subject="Re: Proyecto",
+        to=[EmailAddress("Ana", "ana@example.com")],
+        cc=[],
+        body="danke",
+    )
+    draft_id = storage.create_draft("t1", None, draft)
+    await bot.process_update(_callback_update(-777, f"resend:{draft_id}", from_user_id=7))
+    assert called == []
+
+
+async def test_double_confirm_click_resolves_once(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    message_id = await bot.send_draft_for_confirmation(_draft(), user_id=7)
+    markup = sender.messages[-1].reply_markup
+    token = _button_data(markup, 0, 0).split(":", 1)[1]
+
+    task = asyncio.create_task(bot.wait_for_confirmation(message_id))
+    await asyncio.sleep(0)
+    await bot.process_update(_callback_update(CHAT_ID, f"confirm:{token}", from_user_id=7))
+    await bot.process_update(_callback_update(CHAT_ID, f"confirm:{token}", from_user_id=7))
+    result = await asyncio.wait_for(task, timeout=2)
+    assert result is True  # exactly one decision; no double-send downstream

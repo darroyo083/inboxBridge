@@ -1,8 +1,8 @@
 """Integration tests: reply flow (Telegram → thread → draft → confirm → send).
 
-Covers: full happy path, kill switch (SEND_EMAILS=false blocks sending),
-cancel/not-confirmed discards draft without persisting, unknown thread
-notifies the user.
+Covers: full happy path (send + Gmail reconciliation → sent_verified), kill
+switch (SEND_EMAILS=false blocks sending), cancel discards the draft to
+CANCELLED without sending, unknown thread notifies the user.
 """
 
 from __future__ import annotations
@@ -33,6 +33,20 @@ def _run_request(coordinator: ReplyCoordinator, request: ReplyRequest) -> None:
     asyncio.run(coordinator._handle_request(request))
 
 
+def _draft_rows(storage: Storage) -> list[dict[str, object]]:
+    return storage.drafts_in_statuses(
+        [
+            DraftStatus.PENDING,
+            DraftStatus.CONFIRMED,
+            DraftStatus.SENDING,
+            DraftStatus.SENT_UNVERIFIED,
+            DraftStatus.SENT_VERIFIED,
+            DraftStatus.SEND_FAILED,
+            DraftStatus.CANCELLED,
+        ]
+    )
+
+
 def test_reply_happy_path_with_confirmation(tmp_path: object) -> None:
     settings = make_settings(SEND_EMAILS=True)
     storage = make_storage(tmp_path)
@@ -56,10 +70,13 @@ def test_reply_happy_path_with_confirmation(tmp_path: object) -> None:
     assert "Bescheid" in gmail.sent[0].body
     assert gmail.sent[0].to[0].email == "anna@example.com"  # reply to sender, not all
 
-    drafts = storage._conn.execute("SELECT * FROM drafts").fetchall()  # type: ignore[attr-defined]
-    assert len(drafts) == 1
-    assert drafts[0]["status"] == DraftStatus.SENT.value
-    assert any("Enviado" in n for n in bot.notices)
+    rows = _draft_rows(storage)
+    assert len(rows) == 1
+    # Strong success only after Gmail reconciliation.
+    assert rows[0]["status"] == DraftStatus.SENT_VERIFIED.value
+    assert rows[0]["sent_message_id"]
+    assert any("verificado" in n for n in bot.notices)
+    assert "Enviado y verificado" in " ".join(bot.notices)
 
 
 def test_kill_switch_blocks_sending_and_keeps_draft(tmp_path: object) -> None:
@@ -77,13 +94,13 @@ def test_kill_switch_blocks_sending_and_keeps_draft(tmp_path: object) -> None:
     )
 
     assert gmail.sent == []  # technically impossible to send
-    drafts = storage._conn.execute("SELECT * FROM drafts").fetchall()  # type: ignore[attr-defined]
-    assert len(drafts) == 1
-    assert drafts[0]["status"] == DraftStatus.CONFIRMED.value
+    rows = _draft_rows(storage)
+    assert len(rows) == 1
+    assert rows[0]["status"] == DraftStatus.CONFIRMED.value
     assert any("SEND_EMAILS=false" in n for n in bot.notices)
 
 
-def test_not_confirmed_draft_is_discarded(tmp_path: object) -> None:
+def test_not_confirmed_draft_is_cancelled_without_send(tmp_path: object) -> None:
     settings = make_settings(SEND_EMAILS=True)
     storage = make_storage(tmp_path)
     gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
@@ -98,8 +115,10 @@ def test_not_confirmed_draft_is_discarded(tmp_path: object) -> None:
     )
 
     assert gmail.sent == []
-    drafts = storage._conn.execute("SELECT * FROM drafts").fetchall()  # type: ignore[attr-defined]
-    assert drafts == []  # nothing persisted
+    rows = _draft_rows(storage)
+    assert len(rows) == 1
+    assert rows[0]["status"] == DraftStatus.CANCELLED.value
+    assert any("cancelado" in n for n in bot.notices)
 
 
 def test_unknown_thread_notifies_user(tmp_path: object) -> None:

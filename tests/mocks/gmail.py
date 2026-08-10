@@ -21,6 +21,10 @@ class FakeRequest:
         self._response = response
 
     def execute(self) -> Any:
+        # Route responders may return an exception instance: raise it at
+        # execute-time like the real googleapiclient does.
+        if isinstance(self._response, BaseException):
+            raise self._response
         return self._response
 
 
