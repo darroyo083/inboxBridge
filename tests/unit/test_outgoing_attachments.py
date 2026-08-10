@@ -66,7 +66,8 @@ class TestGuessMime:
         assert _guess_mime("scan.pdf") == "application/pdf"
 
     def test_unknown_extension_defaults_octet(self) -> None:
-        assert _guess_mime("file.xyz") == "application/octet-stream"
+        # No dot → no extension → no mapping on any platform.
+        assert _guess_mime("attachment") == "application/octet-stream"
 
 
 class TestOutgoingMime:
