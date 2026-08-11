@@ -661,7 +661,10 @@ async def test_flow_r_thread_summary(stack: Stack) -> None:
 
 async def test_flow_s_forward(stack: Stack) -> None:
     stack.contacts.create_contact("Daniel", "daniel@forward.ch")
-    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    original = email_with_attachments(make_email(message_id="m-fwd", subject="Presupuesto"))
+    stack.gmail.messages["m-fwd"] = original
+    stack.gmail.attachment_bytes[("m-fwd", 0)] = b"%PDF-1.4 fake pdf content"
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
     await stack.send_bg("reenvíaselo a Daniel", reply_to=stack.bot_message(summary_id))
     previews = [
         m.text
@@ -670,11 +673,13 @@ async def test_flow_s_forward(stack: Stack) -> None:
     ]
     assert previews
     assert "daniel@forward.ch" in previews[-1]  # real address visible
+    assert "presupuesto.pdf" in previews[-1]  # original attachment represented
     await stack.send("envíalo")
     await stack.join_background()
     assert len(stack.gmail.sent) == 1
     assert stack.gmail.sent[0].to[0].email == "daniel@forward.ch"
     assert stack.gmail.sent[0].subject.startswith("Fwd:")
+    assert stack.gmail.sent[0].attachments[0].filename == "presupuesto.pdf"
     assert stack.draft_row(1)["status"] == DraftStatus.SENT_VERIFIED.value
 
 

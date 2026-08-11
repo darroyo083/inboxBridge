@@ -490,6 +490,10 @@ class ReplyCoordinator:
                 for file in child.iterdir():
                     self._sweep_stale(file, now, max_age)
                 continue
+            if child.name == "delivery":
+                for file in child.iterdir():
+                    self._sweep_stale(file, now, max_age)
+                continue
             if not child.name.startswith("draft-"):
                 continue
             try:

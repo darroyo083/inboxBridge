@@ -30,7 +30,7 @@ from .gmail.client import GmailClient
 from .llm import prompts
 from .llm.ai_service import AIService
 from .llm.base import LLMError
-from .models import DraftReply, EmailAddress, ParsedEmail
+from .models import DraftReply, EmailAddress, OutgoingAttachment, ParsedEmail
 from .reminders import ReminderParseError, ReminderService
 from .telegram.bot import TelegramBot
 
@@ -339,6 +339,7 @@ class EmailAssistant:
         name = str(payload.get("name") or "").strip()
         email = str(payload.get("email") or "").strip()
         instruction = str(payload.get("instruction") or "").strip()
+        owner = int(payload.get("user_id") or 0)
         if not name or not email:
             parsed = _parse_contact_instruction(instruction)
             if parsed is None:
@@ -352,6 +353,7 @@ class EmailAssistant:
             f"¿Guardo el contacto {name} <{email}>?",
             "contact_create_confirm",
             {"name": name, "email": email},
+            user_id=owner,
         )
 
     async def _act_contact_update(self, payload: dict[str, Any]) -> None:
@@ -541,14 +543,46 @@ class EmailAssistant:
             await self._bot.send_notice("No pude preparar el reenvío ahora; inténtalo otra vez.")
             return
         subject = f"Fwd: {original.subject}"
+        # Include the original's attachments (bounded; the preview shows them
+        # and the send pipeline verifies them against Gmail).
+        attachments = await self._collect_original_attachments(original)
         draft = DraftReply(
             thread_id="",
             subject=subject,
             to=[EmailAddress(contact["display_name"], contact["email"])],
             cc=[],
             body=body,
+            attachments=attachments,
         )
         await self._present_new_draft(draft, user_id=user_id)
+
+    async def _collect_original_attachments(
+        self, original: ParsedEmail
+    ) -> tuple[OutgoingAttachment, ...]:
+        """Claim the original's supported attachments as temp files (bounded)."""
+        collected: list[OutgoingAttachment] = []
+        for index, meta in enumerate(original.attachments):
+            if len(collected) >= self._settings.outgoing_attachment_max_count:
+                break
+            if meta.size_bytes > self._settings.outgoing_attachment_max_bytes:
+                continue
+            if not any(
+                meta.mime_type.startswith(t) for t in _DELIVERABLE_TYPES
+            ) and not meta.mime_type.startswith("image/"):
+                continue
+            data = await self._gmail.fetch_attachment_bytes(original.message_id, index)
+            if data is None:
+                continue
+            path = self._bot.write_temp_file(meta.filename, data)
+            collected.append(
+                OutgoingAttachment(
+                    filename=meta.filename,
+                    mime_type=meta.mime_type,
+                    size_bytes=len(data),
+                    path=path,
+                )
+            )
+        return tuple(collected)
 
     async def _present_new_draft(self, draft: DraftReply, *, user_id: int) -> None:
         """Present a new-email/forward draft through the SHARED verified path
@@ -564,6 +598,12 @@ class EmailAssistant:
         The LLM NEVER invents an address — resolution is deterministic.
         """
         phrase = phrase.strip().strip(".,;:!?¿¡")
+        # Accept a display form "Name <email>" (e.g. from candidate selection).
+        import re as _re
+
+        display_match = _re.search(r"<([^<>@\s]+@[^<>\s]+)>", phrase)
+        if display_match:
+            phrase = display_match.group(1)
         # Bare valid email → direct destination (still shown in preview).
         from .contacts import validate_email
 

@@ -998,10 +998,10 @@ class TelegramBot(TelegramNotifier):
         )
 
     async def request_confirmation(
-        self, text: str, action: str, payload: dict[str, Any]
+        self, text: str, action: str, payload: dict[str, Any], *, user_id: int = 0
     ) -> None:
         """Public one-shot confirmation UI (assistant contact/reminder flows)."""
-        await self._confirm_flow(0, text, action, payload)
+        await self._confirm_flow(user_id, text, action, payload)
 
     async def _confirm_flow(
         self,
@@ -1010,13 +1010,18 @@ class TelegramBot(TelegramNotifier):
         action: str,
         payload: dict[str, Any],
     ) -> None:
-        """One-shot confirmation UI for persistent/destructive changes."""
+        """One-shot confirmation UI for persistent/destructive changes.
+
+        The token is unguessable; the flow records the requesting user so a
+        (leaked/replayed) confirmation from someone else is inert.
+        """
         token = secrets.token_urlsafe(8)
         self._pending_flows[user_id] = {
             "flow": "confirm",
             "confirm_token": token,
             "action": action,
             "payload": payload,
+            "user_id": user_id,
         }
         keyboard = InlineKeyboardMarkup(
             [
@@ -1472,6 +1477,12 @@ class TelegramBot(TelegramNotifier):
         if flow is None:
             await self._ensure_sender().answer_callback_query(
                 query.id, "Esa confirmación ya no está disponible."
+            )
+            return
+        owner = int(flow.get("user_id") or 0)
+        if owner and query.from_user.id != owner:
+            await self._ensure_sender().answer_callback_query(
+                query.id, "Esa confirmación pertenece a otro miembro."
             )
             return
         await self._ensure_sender().answer_callback_query(query.id, "Hecho ✓")
