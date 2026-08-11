@@ -95,8 +95,30 @@ class EmailAssistant:
 
     # ── dispatcher (called by the bot with validated intents) ───────────────
 
+    #: Intent action values → handler suffixes (keeps handler names readable).
+    _ALIASES = {
+        "compose_new_email": "compose",
+        "forward_email": "forward",
+        "create_contact": "contact_create",
+        "update_contact": "contact_update",
+        "delete_contact": "contact_delete",
+        "add_alias": "contact_add_alias",
+        "remove_alias": "contact_remove_alias",
+        "get_attachment": "get_attachment",
+        "ask_about_email": "ask_about_email",
+        "summarize_thread": "summarize_thread",
+        "mark_read": "mark_read",
+        "archive": "archive",
+        "create_reminder": "create_reminder",
+        "list_reminders": "list_reminders",
+        "cancel_reminder": "cancel_reminder",
+        "list_contacts": "list_contacts",
+        "help": "help",
+    }
+
     async def handle(self, action: str, payload: dict[str, Any]) -> None:
-        handler = getattr(self, f"_act_{action}", None)
+        handler_name = self._ALIASES.get(action, action)
+        handler = getattr(self, f"_act_{handler_name}", None)
         if handler is None:
             logger.warning("assistant: unknown action %s", action)
             await self._bot.send_notice("No puedo hacer eso todavía.")
@@ -202,6 +224,16 @@ class EmailAssistant:
             await self._bot.send_notice("Ese correo no tiene adjuntos.")
             return
         if index == -1:
+            # Natural-language request: deliver a matching attachment directly
+            # ("mándame el pdf" → first pdf); otherwise show the panel.
+            wanted = _attachment_kind(str(payload.get("instruction") or ""))
+            if wanted:
+                for att_index, att in enumerate(email.attachments):
+                    if wanted(att):
+                        await self._deliver_attachment(tg_message_id, email, att_index)
+                        return
+                await self._bot.send_notice("No encontré un adjunto de ese tipo.")
+                return
             await self._bot.show_attachments_panel(tg_message_id, email)
             return
         if index < 0 or index >= len(email.attachments):
@@ -306,8 +338,112 @@ class EmailAssistant:
     async def _act_contact_create(self, payload: dict[str, Any]) -> None:
         name = str(payload.get("name") or "").strip()
         email = str(payload.get("email") or "").strip()
+        instruction = str(payload.get("instruction") or "").strip()
+        if not name or not email:
+            parsed = _parse_contact_instruction(instruction)
+            if parsed is None:
+                await self._bot.send_notice(
+                    "Dime el nombre y el correo, por ejemplo: "
+                    "«cuando diga Roman usa femo@femo.ch»."
+                )
+                return
+            name, email = parsed
+        await self._bot.request_confirmation(
+            f"¿Guardo el contacto {name} <{email}>?",
+            "contact_create_confirm",
+            {"name": name, "email": email},
+        )
+
+    async def _act_contact_update(self, payload: dict[str, Any]) -> None:
+        """NL 'cambia el correo de X a Y' / 'cambia el nombre de X a Y'."""
+        instruction = str(payload.get("instruction") or "").strip()
+        parsed = _parse_contact_update(instruction)
+        if parsed is None:
+            await self._bot.send_notice(
+                "Dime qué cambio, por ejemplo: «cambia el correo de Roman a roman@femo.ch»."
+            )
+            return
+        kind, target, value = parsed
+        resolution = self._contacts.resolve(target)
+        if not resolution.resolved:
+            await self._bot.send_notice(f"No tengo a nadie guardado como «{target}».")
+            return
+        assert resolution.contact is not None
+        contact_id = int(resolution.contact["id"])
+        if kind == "email":
+            await self._bot.request_confirmation(
+                f"¿Cambio el correo de {resolution.contact['display_name']} a {value}?",
+                "contact_update_email",
+                {"contact_id": contact_id, "email": value},
+            )
+        else:
+            await self._bot.request_confirmation(
+                f"¿Renombro {resolution.contact['display_name']} a «{value}»?",
+                "contact_rename",
+                {"contact_id": contact_id, "name": value},
+            )
+
+    async def _act_contact_delete(self, payload: dict[str, Any]) -> None:
+        instruction = str(payload.get("instruction") or "").strip()
+        name = str(payload.get("name") or "").strip() or _parse_contact_delete(instruction)
+        if not name:
+            await self._bot.send_notice("¿Qué contacto quieres borrar?")
+            return
+        resolution = self._contacts.resolve(name)
+        if not resolution.resolved:
+            await self._bot.send_notice(f"No tengo a nadie guardado como «{name}».")
+            return
+        assert resolution.contact is not None
+        await self._bot.request_confirmation(
+            f"¿Borro el contacto {resolution.contact['display_name']} y sus alias?",
+            "contact_delete_confirm",
+            {"contact_id": int(resolution.contact["id"])},
+        )
+
+    async def _act_contact_add_alias(self, payload: dict[str, Any]) -> None:
+        instruction = str(payload.get("instruction") or "").strip()
+        alias = str(payload.get("alias") or "").strip()
+        contact_phrase = str(payload.get("contact") or "").strip()
+        if not alias or not contact_phrase:
+            parsed = _parse_alias_instruction(instruction, add=True)
+            if parsed is None:
+                await self._bot.send_notice(
+                    "Dime qué alias añadir y a quién, por ejemplo: "
+                    "«añade mi jefe como alias de Roman»."
+                )
+                return
+            alias, contact_phrase = parsed
+        resolution = self._contacts.resolve(contact_phrase)
+        if not resolution.resolved:
+            await self._bot.send_notice(f"No tengo a nadie guardado como «{contact_phrase}».")
+            return
+        assert resolution.contact is not None
+        await self._bot.request_confirmation(
+            f"¿Guardo «{alias}» como alias de {resolution.contact['display_name']}?",
+            "contact_add_alias_confirm",
+            {"contact_id": int(resolution.contact["id"]), "alias": alias},
+        )
+
+    async def _act_contact_remove_alias(self, payload: dict[str, Any]) -> None:
+        instruction = str(payload.get("instruction") or "").strip()
+        alias = str(payload.get("alias") or "").strip()
+        if not alias:
+            parsed = _parse_alias_instruction(instruction, add=False)
+            if parsed is None:
+                await self._bot.send_notice("¿Qué alias quieres quitar?")
+                return
+            alias, _contact_phrase = parsed
+        await self._bot.request_confirmation(
+            f"¿Elimino el alias «{alias}»?",
+            "contact_remove_alias_confirm",
+            {"alias": alias},
+        )
+
+    async def _act_contact_create_confirm(self, payload: dict[str, Any]) -> None:
         try:
-            contact = self._contacts.create_contact(name, email)
+            contact = self._contacts.create_contact(
+                str(payload.get("name") or ""), str(payload.get("email") or "")
+            )
         except ContactError as exc:
             await self._bot.send_notice(str(exc))
             return
@@ -320,9 +456,8 @@ class EmailAssistant:
         except ContactError as exc:
             await self._bot.send_notice(str(exc))
             return
-        await self._bot.send_notice(
-            f"Correo actualizado: {contact['display_name']} <{contact['email']}>"
-        )
+        updated = f"{contact['display_name']} <{contact['email']}>"
+        await self._bot.send_notice(f"Correo actualizado: {updated}")
 
     async def _act_contact_rename(self, payload: dict[str, Any]) -> None:
         try:
@@ -332,11 +467,11 @@ class EmailAssistant:
             return
         await self._bot.send_notice(f"Nombre actualizado: {contact['display_name']}")
 
-    async def _act_contact_delete(self, payload: dict[str, Any]) -> None:
+    async def _act_contact_delete_confirm(self, payload: dict[str, Any]) -> None:
         self._contacts.delete(int(payload["contact_id"]))
         await self._bot.send_notice("Contacto borrado.")
 
-    async def _act_contact_add_alias(self, payload: dict[str, Any]) -> None:
+    async def _act_contact_add_alias_confirm(self, payload: dict[str, Any]) -> None:
         try:
             alias = self._contacts.add_alias(int(payload["contact_id"]), str(payload["alias"]))
         except ContactError as exc:
@@ -344,7 +479,7 @@ class EmailAssistant:
             return
         await self._bot.send_notice(f"Alias guardado: «{alias}»")
 
-    async def _act_contact_remove_alias(self, payload: dict[str, Any]) -> None:
+    async def _act_contact_remove_alias_confirm(self, payload: dict[str, Any]) -> None:
         removed = self._contacts.remove_alias(str(payload["alias"]))
         if removed:
             await self._bot.send_notice("Alias eliminado.")
@@ -462,6 +597,104 @@ class EmailAssistant:
 
 def _cap(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 30] + "\n[…truncado…]"
+
+
+def _attachment_kind(instruction: str) -> Any | None:
+    """Return a matcher for a requested attachment kind, or None when the
+    request is generic (panel)."""
+    import re
+
+    lowered = instruction.casefold()
+    if re.search(r"\b(pdf|documento)\b", lowered):
+        def is_pdf(att: Any) -> bool:
+            return bool(
+                att.mime_type == "application/pdf"
+                or att.filename.casefold().endswith(".pdf")
+            )
+
+        return is_pdf
+    if re.search(r"\b(foto|im[aá]gen(es)?)\b", lowered):
+        return lambda att: att.mime_type.startswith("image/")
+    if re.search(r"\b(adjuntos?|archivos?)\b", lowered):
+        return None  # generic → panel
+    return None
+
+
+# ── NL contact-instruction parsing (deterministic; never LLM-invented) ───────
+
+
+def _parse_contact_instruction(text: str) -> tuple[str, str] | None:
+    """'cuando diga X usa a@b.ch' / 'guarda a X como a@b.ch' / 'añade a X con correo a@b.ch'."""
+    import re
+
+    patterns = (
+        r"cuando diga (.+?)\s+usa\s+(\S+@\S+)",
+        r"guarda a (.+?)\s+como\s+(\S+@\S+)",
+        r"a[nñ]ade a (.+?)\s+(?:con correo|como)?\s*(\S+@\S+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            name = match.group(1).strip().strip("'\",.;:!?¿¡")
+            email = match.group(2).strip().strip("'\",.;:!?¿¡")
+            if name and email:
+                return name, email
+    return None
+
+
+def _parse_contact_update(text: str) -> tuple[str, str, str] | None:
+    """'cambia el correo de X a a@b.ch' → ('email', X, addr)
+    'cambia el nombre de X a Y' → ('name', X, Y)."""
+    import re
+
+    match = re.search(
+        r"cambia el (correo|email|direcci[oó]n|nombre) de (.+?)\s+(?:a|por)\s+(.+)",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    kind = match.group(1).lower()
+    kind = "email" if kind in ("correo", "email", "dirección", "direccion") else "name"
+    target = match.group(2).strip().strip("'\",.;:!?¿¡")
+    value = match.group(3).strip().strip("'\",.;:!?¿¡")
+    if not target or not value:
+        return None
+    return kind, target, value
+
+
+def _parse_contact_delete(text: str) -> str:
+    import re
+
+    match = re.search(r"(?:borra|elimina|quita) el contacto (.+)", text, re.IGNORECASE)
+    if not match:
+        return ""
+    return match.group(1).strip().strip("'\",.;:!?¿¡")
+
+
+def _parse_alias_instruction(text: str, *, add: bool) -> tuple[str, str] | None:
+    """'añade X como alias de Y' (add) / 'quita el alias X de Y' (remove)."""
+    import re
+
+    if add:
+        match = re.search(r"a[nñ]ade (.+?)\s+como alias de (.+)", text, re.IGNORECASE)
+        if not match:
+            match = re.search(r"pon (.+?)\s+como alias de (.+)", text, re.IGNORECASE)
+    else:
+        match = re.search(r"quita el alias (.+?)\s+de (.+)", text, re.IGNORECASE)
+        if not match:
+            match = re.search(r"(?:quita|borra|elimina) el alias (.+)", text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip().strip("'\",.;:!?¿¡"), ""
+    if not match:
+        return None
+    alias = match.group(1).strip().strip("'\",.;:!?¿¡")
+    contact = (
+        match.group(2).strip().strip("'\",.;:!?¿¡")
+        if match.lastindex and match.lastindex >= 2
+        else ""
+    )
+    return alias, contact
 
 
 def _default_subject(instruction: str) -> str:

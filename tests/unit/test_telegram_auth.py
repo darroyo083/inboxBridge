@@ -66,6 +66,7 @@ class FakeSender:
         self.deleted: list[int] = []
         self.files: dict[str, FakeFile] = {}
         self.downloaded: list[Any] = []
+        self.files_delivered: list[tuple[str, bytes]] = []
         self._next_id = 1
 
     async def send_message(
@@ -125,6 +126,25 @@ class FakeSender:
         file = self.files[file_id]
         self.downloaded.append(file_id)
         return file
+
+    async def send_document(
+        self,
+        chat_id: int | str,
+        document: Any,
+        *,
+        filename: str | None = None,
+        reply_parameters: ReplyParameters | None = None,
+    ) -> Message:
+        data = document if isinstance(document, bytes) else document.read()
+        self.files_delivered.append((filename or "file", bytes(data)))
+        message = Message(
+            message_id=self._next_id,
+            date=datetime.now(UTC),
+            chat=Chat(id=cast(int, chat_id), type=ChatType.GROUP),
+            text="",
+        )
+        self._next_id += 1
+        return message
 
 
 @pytest.fixture

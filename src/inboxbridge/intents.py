@@ -323,7 +323,11 @@ def _rule_classify(text: str) -> _RuleResult:
 
     # Questions / attachments / summaries.
     if _ATTACHMENT.search(stripped):
-        return _RuleResult(IntentAction.GET_ATTACHMENT, explicit=False)
+        return _RuleResult(
+            IntentAction.GET_ATTACHMENT,
+            explicit=False,
+            payload={"instruction": stripped},
+        )
     if _ASK.search(stripped):
         return _RuleResult(IntentAction.ASK_ABOUT_EMAIL, explicit=False)
     if _THREAD_SUMMARY.search(stripped):

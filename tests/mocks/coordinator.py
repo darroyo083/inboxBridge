@@ -49,6 +49,8 @@ class FakeGmail:
     verify_error: bool = False
     verify_delay_ok: bool = False  # first verification returns not-found, then found
     ambiguous_accepts: bool = True  # False: ambiguous send never reached Gmail
+    labelled: list[tuple[str, list[str], list[str]]] = field(default_factory=list)
+    attachment_bytes: dict[tuple[str, int], bytes] = field(default_factory=dict)
     _next_id: int = 100
 
     async def fetch_message(self, message_id: str) -> ParsedEmail:
@@ -63,6 +65,20 @@ class FakeGmail:
             return self.threads[thread_id]
         except KeyError as exc:
             raise RuntimeError(f"unknown thread {thread_id}") from exc
+
+    async def modify_labels(
+        self,
+        message_id: str,
+        *,
+        add_labels: list[str] | None = None,
+        remove_labels: list[str] | None = None,
+    ) -> None:
+        self.labelled.append((message_id, add_labels or [], remove_labels or []))
+
+    async def fetch_attachment_bytes(
+        self, message_id: str, attachment_index: int
+    ) -> bytes | None:
+        return self.attachment_bytes.get((message_id, attachment_index))
 
     async def send_reply(self, draft: DraftReply) -> str:
         if not self.send_ok:

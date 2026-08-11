@@ -439,7 +439,12 @@ class TelegramBot(TelegramNotifier):
         if message.from_user.is_bot:
             return
         text = message.text
-        if text is None and message.document is None and not message.photo:
+        if (
+            text is None
+            and message.document is None
+            and not message.photo
+            and message.voice is None
+        ):
             return
         if text is not None and text.startswith("/"):
             await self._handle_command(message, text)
@@ -721,6 +726,28 @@ class TelegramBot(TelegramNotifier):
             await self._edit_draft_via_text(user_id, text, action)
             return
 
+        # LLM-classified "reply to email": the classic reply flow.
+        if action == IntentAction.REPLY_TO_EMAIL and fallback_to_reply:
+            attachments = (
+                await self._collect_outgoing_attachments(message)
+                if message is not None
+                else ()
+            )
+            memory = tuple(m["value"] for m in self._storage.list_memories(user_id))
+            self._queue.put_nowait(
+                ReplyRequest(
+                    thread_id=thread_id,
+                    user_instructions=text,
+                    source_message_id=(
+                        message.message_id if message is not None else tg_message_id
+                    ),
+                    memory=memory,
+                    user_id=user_id,
+                    attachments=attachments,
+                )
+            )
+            return
+
         if self._action_callback is None:
             await self._send("No puedo hacer eso ahora mismo.")
             return
@@ -824,7 +851,7 @@ class TelegramBot(TelegramNotifier):
             await self._confirm_flow(
                 user_id,
                 f"¿Guardo «{text.strip()}» como alias?",
-                "contact_add_alias",
+                "contact_add_alias_confirm",
                 {"contact_id": int(flow["contact_id"]), "alias": text.strip()},
             )
             return True
@@ -832,7 +859,7 @@ class TelegramBot(TelegramNotifier):
             await self._confirm_flow(
                 user_id,
                 f"¿Elimino el alias «{text.strip()}»?",
-                "contact_remove_alias",
+                "contact_remove_alias_confirm",
                 {"alias": text.strip()},
             )
             return True
@@ -969,6 +996,12 @@ class TelegramBot(TelegramNotifier):
             "contact_create",
             {"name": flow["name"], "email": email_text.strip()},
         )
+
+    async def request_confirmation(
+        self, text: str, action: str, payload: dict[str, Any]
+    ) -> None:
+        """Public one-shot confirmation UI (assistant contact/reminder flows)."""
+        await self._confirm_flow(0, text, action, payload)
 
     async def _confirm_flow(
         self,
@@ -1573,7 +1606,7 @@ class TelegramBot(TelegramNotifier):
         await self._confirm_flow(
             query.from_user.id,
             "¿Borro este contacto y sus alias?",
-            "contact_delete",
+            "contact_delete_confirm",
             {"contact_id": contact_id},
         )
 
