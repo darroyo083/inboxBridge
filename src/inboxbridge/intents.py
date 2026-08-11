@@ -97,7 +97,7 @@ class Intent:
 # ── deterministic rules ──────────────────────────────────────────────────────
 
 _YES_ONLY = re.compile(
-    r"^(ok|oka?y|vale|s[ií]|perfecto|perfecto,|bien|de acuerdo|entendido|listo|d[aá]le|adelante|confirmo|confirmado)[\s.!?]*$",
+    r"^(ok|oka?y|vale|s[ií]|perfecto|bien|de acuerdo|entendido|listo|d[aá]le|adelante|confirmo|confirmado)[\s.!?]*$",
     re.IGNORECASE,
 )
 
@@ -138,12 +138,11 @@ _THREAD_SUMMARY = re.compile(
     re.IGNORECASE,
 )
 _ATTACHMENT = re.compile(
-    r"\b(m[aá]ndame (el|la|los|las) (pdf|adjunto|adjuntos|archivo|archivos|foto|fotos|imagen|im[aá]genes)|"
-    r"ens[eé][nñ]ame los adjuntos|m[aá]ndame el adjunto|p[aá]same el (pdf|adjunto)|"
-    r"dame el (pdf|adjunto)|quiero el (pdf|adjunto)|dime qu[eé] adjuntos tiene)\b",
+    r"\b(m[aá]ndame (el|la|los|las) (pdf|adjuntos?|archivos?|fotos?|im[aá]genes?)|"
+    r"ens[eé][nñ]ame los adjuntos|m[aá]ndame el adjunto|"
+    r"(p[aá]same|dame|quiero) el (pdf|adjunto)|dime qu[eé] adjuntos tiene)\b",
     re.IGNORECASE,
-)
-_MARK_READ = re.compile(
+)_MARK_READ = re.compile(
     r"\b(m[aá]rcalo como le[ií]do|m[aá]rcalo le[ií]do|m[aá]rcame como le[ií]do|"
     r"marca como le[ií]do|m[aá]rcarlo como le[ií]do)\b",
     re.IGNORECASE,
@@ -234,7 +233,8 @@ def _extract_after(text: str, pattern: re.Pattern[str]) -> str:
     end = match.end()
     rest = text[end:].strip()
     # Trim trailing punctuation/connectors that are not part of the target.
-    rest = re.split(r"\b(y dile|y cu[eé]ntale|y dile que|que| por favor| gracias| pls)\b", rest, maxsplit=1)[0]
+    connectors = r"\b(y dile|y cu[eé]ntale|y dile que|que| por favor| gracias| pls)\b"
+    rest = re.split(connectors, rest, maxsplit=1)[0]
     return rest.strip(" .,;:!?¿¡")
 
 
