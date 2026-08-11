@@ -1,14 +1,24 @@
 # InboxBridge
 
 Self-hosted email assistant that connects your Gmail **Primary** inbox with a
-private Telegram group.
+private Telegram group. **Natural language first**: no slash commands needed —
+talk to it like a person.
 
 - New Gmail emails (Primary tab) → LLM → natural **Spanish** summary → your
   private Telegram group.
-- From Telegram you can ask for a reply → InboxBridge drafts a professional
-  **German** email in the same Gmail thread → you confirm → it is sent.
-- You can attach Telegram documents/photos to a reply; the confirmation shows
-  exactly what will be sent.
+- Reply by simply answering the summary: *"respóndele que el viernes sí puedo"*
+  → professional **German** draft in the same Gmail thread → you confirm →
+  it is sent.
+- Refine drafts naturally: *"hazlo más corto"*, *"más formal"*,
+  *"cambia las 18:00 por las 19:00"* — every edit re-renders the full preview.
+- **New emails** and **forwards**: *"escribe a Roman y dile que mañana llego a
+  las seis"* — recipients resolve through your saved **contacts/aliases**.
+- Buttons protect against mis-taps: SEND / EDIT / CANCEL always ask "¿seguro?".
+- *"mándame el pdf"* → the original attachment arrives in Telegram (temp only).
+- *"márcalo como leído"*, *"archívalo"*, *"¿qué me está pidiendo?"*,
+  *"resume toda la conversación"*, *"recuérdamelo mañana"* — all work as text.
+- **AI routing**: DeepSeek for text, MiMo for vision (scanned PDFs/images),
+  Luna configured as the technical-fallback vision model — zero local OCR.
 - **Verified delivery**: after sending, InboxBridge reconciles against Gmail
   and only reports "sent ✓" once the message is confirmed in the right thread
   with the right recipients/attachments. Ambiguous timeouts never trigger a
@@ -23,7 +33,8 @@ private Telegram group.
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) — flow, modules, send state machine,
-  verified delivery, attachment lifecycle, data/privacy model.
+  verified delivery, attachment lifecycle, natural-language routing,
+  AI routing, data/privacy model.
 - [Installation](docs/INSTALL.md) — VPS + Docker Compose setup.
 - [Migration](docs/MIGRATION.md) — moving to another VPS.
 
@@ -40,7 +51,7 @@ pytest
 
 ```bash
 pytest                              # deterministic suite (no credentials needed)
-RUN_REAL_LLM=1 pytest -m real_llm   # opt-in REAL LLM validation (synthetic content)
+RUN_REAL_LLM=1 pytest -m real_llm   # opt-in REAL AI validation (synthetic content)
 ```
 
 ## MVP verification
@@ -51,29 +62,38 @@ RUN_REAL_LLM=1 pytest -m real_llm   # opt-in REAL LLM validation (synthetic cont
 4. Email summarized in natural Spanish.
 5. PDF, password-PDF, DOCX, TXT attachments work.
 6. Summary only reaches the authorized group.
-7. Replying to the bot's message lets you request a reply.
-8. InboxBridge recovers thread context.
-9. Draft is professional/natural German.
-10. Recipients, attachments and content shown before sending.
-11. Explicit confirmation required.
-12. With `SEND_EMAILS=true` + confirmation, reply lands in the same Gmail thread.
+7. Natural language drives everything; buttons and slash commands are extras.
+8. Reply drafts are professional/natural German with thread context.
+9. Recipients, attachments and content shown before sending — always the real
+   addresses, never just friendly names.
+10. Explicit confirmation required; SEND/EDIT/CANCEL buttons ask "¿seguro?".
+11. "ok"/"sí"/"vale" can never authorize a send — only explicit verbs.
+12. Draft edits re-render the full preview; a stale preview cannot be sent.
 13. Delivery is reconciled against Gmail; success is shown only after verification.
 14. Ambiguous send failures are resolved by reconciliation, never by blind resend.
-15. Telegram documents/photos can be attached; temp binaries are cleaned up.
-16. Container restart breaks nothing; in-flight drafts are reconciled, not resent.
-17. LLM/Pub/Sub failure does not silently lose the email (retry queue).
-18. No bodies/attachments persisted (SQLite holds metadata only).
-19. No secrets committed or logged.
-20. Project moves to another VPS via Docker Compose + config + small volume.
+15. New emails and forwards use the SAME verified-delivery pipeline.
+16. Contacts/aliases managed from Telegram (e.g. "cuando diga Roman usa femo@femo.ch");
+    the LLM never invents an address; ambiguous recipients always ask.
+17. Telegram documents/photos attach to replies; Gmail attachments come to Telegram.
+18. Reminders survive restarts, fire once, and are cancelable.
+19. Scanned PDFs and images are read by the external vision model (no local OCR).
+20. Prompt-injected emails/attachments/images can never mutate contacts or send mail.
+21. Container restart breaks nothing; in-flight drafts are reconciled, not resent.
+22. No bodies/attachments persisted (SQLite holds metadata only).
+23. No secrets committed or logged.
+24. Project moves to another VPS via Docker Compose + config + small volume.
 
 ## Data & privacy
 
 Email bodies and attachment content are used in memory for the current
 processing step and are sent to the configured AI provider (OpenCode Go /
-DeepSeek / OpenAI-compatible endpoint) to produce the summary/draft. They are
-never written to SQLite or logs, and temp attachment files are deleted after
-verified delivery, cancellation, failure, or the cleanup sweep. Gmail remains
-the source of truth for email content.
+DeepSeek text; MiMo vision; Luna fallback) to produce summaries, drafts,
+answers and document understanding. They are never written to SQLite or logs,
+and temp files (attachments, voice notes, rendered PDF pages) are deleted
+after use, cancellation, failure, or the cleanup sweep. Gmail remains the
+source of truth for email content. Contacts/aliases and reminders persist
+explicit user-configured application data (names, addresses, IDs, times) —
+never email bodies.
 
 ## License
 

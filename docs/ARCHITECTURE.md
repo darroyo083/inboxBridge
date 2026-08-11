@@ -5,6 +5,19 @@ Telegram group. Summarizes incoming emails in Spanish via LLM; allows drafting
 and sending replies in German from Telegram with explicit confirmation,
 verified delivery against Gmail, and outgoing attachments from Telegram.
 
+**Natural language first (V1.1):** ordinary usage needs no slash commands.
+Messages are routed through a validated intent boundary:
+
+    Telegram text
+    → deterministic rule pre-checks (explicit verbs)
+    → LLM classification fallback (structured JSON, validated)
+    → validated Intent
+    → deterministic application state machine
+    → allowed action
+
+The LLM never gains authority: sending, cancelling, archiving and contact
+mutation stay deterministic application logic behind explicit intents.
+
 ## High-level flow
 
 ```
@@ -20,13 +33,15 @@ fetch message via Gmail API (thread-aware)
 extract text (HTML cleanup) + attachments (PDF / password-PDF / DOCX / TXT)
       │
       ▼
-LLM provider (OpenAI-compatible, e.g. OpenCode Go / DeepSeek V4 Flash)
+AI provider (DeepSeek text; MiMo vision for scans/images; Luna fallback)
       │
       ▼
 natural Spanish summary → private Telegram group (authorized chat_id only)
 
 --- reply flow (from Telegram, replying to bot's message) ---
-Telegram reply / mention / command (+ optional document/photo)
+Telegram reply / mention / command (+ optional document/photo/voice)
+      ▼
+intent routing (validated)
       ▼
 recover Gmail thread context
       ▼
@@ -51,16 +66,103 @@ sent_verified → "Enviado y verificado ✓" (only after Gmail evidence)
 - **Idempotent pipeline.** Deduplication by `message_id` + `history_id`;
   Pub/Sub at-least-once delivery is safe.
 - **State minimal.** SQLite only for dedup ids, thread mapping, telegram ids,
-  statuses, retry timestamps. No full email bodies, no attachment text, no
-  attachment binaries, no secrets. Volume is tiny and portable to another VPS.
-- **Untrusted content.** Emails/attachments are data, never instructions.
-  Prompt-injection defenses, HTML/tracker cleanup, no link clicks, no
-  attachment execution, no OCR/vision.
+  statuses, retry timestamps, contacts and reminders. No full email bodies,
+  no attachment text, no attachment binaries, no secrets.
+- **Untrusted content.** Emails/attachments/images are data, never
+  instructions. Prompt-injection defenses, HTML/tracker cleanup, no link
+  clicks, no attachment execution, no local OCR.
 - **Kill switch.** `SEND_EMAILS=false` (default) makes sending technically
   impossible in dev/test. Sending only happens with `SEND_EMAILS=true` AND
   explicit Telegram confirmation.
 - **No secret leakage.** `.env` ignored by git; `.env.example` has placeholders
   only; structured logs never include secrets or bodies.
+
+## Intent routing
+
+`intents.py` classifies every user message:
+
+- **Deterministic rules first**: explicit verbs ("envíalo", "cancela el
+  borrador", "archívalo", "márcalo como leído", "reenvíaselo a…",
+  "escribe a…", "recuérdame…", contact management…) produce high-confidence,
+  `explicit` intents. Ambiguous acks ("ok", "vale", "sí", "perfecto") NEVER
+  authorize send/cancel — they surface as CLARIFY and the bot asks.
+- **LLM fallback**: for anything unmatched, the text model classifies into a
+  fixed JSON vocabulary. The LLM vocabulary EXCLUDES send/cancel entirely
+  (rejected → UNKNOWN), and LLM results are never `explicit`. High-impact
+  actions only execute on deterministic explicit verbs.
+- **Context resolution**: replying to a summary binds the Gmail thread;
+  an active draft binds edit/send/cancel intents; ambiguity asks.
+
+## Draft safety (V1.1)
+
+- Every draft preview shows the REAL recipient addresses, CC, subject,
+  attachments and type (Respuesta / Nuevo correo / Reenvío).
+- Previews are **versioned**: any edit re-renders the full preview and bumps
+  the version; a stale preview can never authorize a send.
+- Buttons SEND / EDIT / CANCEL are **two-step**: a tap shows
+  "¿Seguro?" → [Sí] [Volver]. Callbacks are one-shot, owner-scoped and
+  replay-safe.
+- Explicit TEXT acts ("envíalo", "cancela el borrador") skip the second
+  button confirmation but keep every other safety invariant; "ok"/"sí" never
+  suffice.
+- Text and button confirmations resolve the SAME pending future; the
+  coordinator's atomic `claim_draft_for_send` prevents any double send.
+
+## Logical contacts + aliases
+
+`contacts.py` + SQLite (`contacts`, `contact_aliases`):
+
+- A LogicalContact has a display name, one preferred email and normalized
+  unique aliases. Several logical names may map to one shared mailbox
+  (Roman → femo@femo.ch, FEMO → femo@femo.ch).
+- Aliases normalize with NFKC/casefold; emails are syntactically validated
+  (control chars, spaces, multiple @ rejected).
+- Resolution is deterministic: normalized alias → display name → exact email.
+  Ambiguity ALWAYS asks; unknown names ALWAYS ask (the LLM never invents an
+  address).
+- All persistent mutations (create/change/delete/alias) render the
+  interpreted change and require a one-shot confirmation. Nothing is learned
+  silently.
+- Reply semantics ignore aliases: replying to a thread always uses the
+  original Gmail recipients.
+
+## Reminders
+
+`reminders.py` + SQLite `reminders` (IDs + due + status + user note only —
+never email bodies). Deterministic Spanish time parsing ("en dos horas",
+"mañana", "el viernes a las 18:00", "a las 15:30"…). `ReminderScheduler`
+fires due reminders exactly once (atomic claim), survives restarts, and is
+cancelable/listable from Telegram.
+
+## AI routing (V1.1)
+
+`llm/ai_service.py` — configuration-driven, no hardcoded model IDs:
+
+```
+AIService
+├── text(...)             → configured text model (DeepSeek)
+├── vision(...)           → configured vision model (MiMo), bounded fallback
+│                            to the fallback model (Luna) ONLY on technical
+│                            failures (unavailable/rate-limit/empty/malformed/
+│                            unsupported modality) — never on "didn't like it"
+├── document_vision(...)  → scanned PDF: bounded page render (PyMuPDF) →
+│                            vision model (zero local OCR, zero local models)
+└── audio(...)            → experimental, gated by ai_audio_enabled
+```
+
+- Text-only work (summaries, drafts, edits, Q&A, intents) uses the text model.
+- Images and image-only PDFs go to the vision model. PDFs with a usable text
+  layer are extracted deterministically — vision is NOT wasted on them.
+- Bounds: `ai_vision_max_pages`, `ai_vision_max_dimension`, per-page size.
+- Observability is metadata-only (task, model, duration, success,
+  fallback_used) — never content.
+- Voice notes (experimental): bounded download → transcription → intent flow;
+  gated by `AI_AUDIO_ENABLED` (default off); any failure asks the user to type.
+- REAL provider evidence (opt-in suite): MiMo reads synthetic images and
+  scanned PDFs; text PDFs avoid vision; the configured fallback model
+  (`gpt-5.6-luna`) currently rejects image input via the OpenCode Go gateway
+  (HTTP 400) — documented limitation, graceful typed failure, single bounded
+  fallback attempt.
 
 ## Send state machine (verified delivery)
 
@@ -91,96 +193,87 @@ Rules:
   at startup (and periodically by `ReconciliationSweep`) — never blindly
   resent. Orphan temp files are swept.
 - Retry (`resend_draft`) re-verifies Gmail FIRST and only sends again on
-  definitive evidence the mail never left.
+  definitive evidence the mail never left. Per-draft locks + atomic
+  `claim_draft_for_send` serialize all send paths (double-tap, sweep races).
+- New emails and forwards reuse this EXACT pipeline (`present_draft` hook).
 
 ## Outgoing attachments (Telegram → Gmail)
 
 - Telegram documents and photos attached to a reply intent are downloaded to
-  `TMP_DIR/incoming/` (bounded: `outgoing_attachment_max_count`,
-  `outgoing_attachment_max_bytes`; batches violating limits are rejected with
-  a notice).
-- Filenames are sanitized display metadata (basename only, no traversal, no
-  control chars) — never used as trusted filesystem paths.
+  `TMP_DIR/incoming/` (bounded count/size, re-validated after download) and
+  claimed into `tmp/draft-<id>/` with deterministic order-prefixed names.
+- Filenames are sanitized display metadata — never trusted paths.
 - The confirmation message lists every attachment that would be sent.
 - MIME: `EmailMessage.add_attachment` with the Telegram mime type (fallback
   `application/octet-stream`); thread semantics unchanged.
 - Binaries live ONLY in the temp dir for the bounded workflow: deleted after
-  verified delivery, cancellation, terminal failure, or the orphan sweep
-  (`TMP_MAX_AGE_SECONDS`). SQLite stores metadata only.
+  verified delivery, cancellation, terminal failure, or the orphan sweep.
+
+## Incoming attachments (Gmail → Telegram)
+
+- "mándame el pdf" / the 📎 Adjuntos button delivers supported original
+  attachments to the group (temp file → send → remove). Types: PDF, DOCX,
+  TXT, CSV, images; bounded count/size; no traversal; authorized chat only.
+- Vision handles image-only PDFs/images when the user asks questions about
+  them (bounded render → MiMo).
 
 ## Modules
 
 | Module | Responsibility | Owner |
 |---|---|---|
-| `config.py` | pydantic-settings, .env, limits, kill switch | core |
+| `config.py` | pydantic-settings, .env, limits, kill switch, AI routing | core |
 | `models.py` | Shared contracts (dataclasses/pydantic) | core |
-| `db.py` | SQLite state, dedup, retry bookkeeping, deterministic migrations | core |
+| `db.py` | SQLite state, dedup, retry, contacts, reminders, deterministic migrations | core |
+| `intents.py` | NL intent routing (rules + validated LLM fallback) | core (V1.1) |
+| `assistant.py` | Executes validated intents: edits, Q&A, summaries, attachments, actions, reminders, contacts, compose/forward, voice | core (V1.1) |
+| `contacts.py` | Logical contacts + aliases, resolution, hijack-safe validation | core (V1.1) |
+| `reminders.py` | Deterministic time parsing, CRUD, fire-once scheduler | core (V1.1) |
 | `gmail/auth.py` | OAuth 2.0 local flow, token store, per-install credentials | worker A |
-| `gmail/client.py` | Gmail API: get message/thread, send reply (MIME+attachments), `verify_delivery` | worker A |
+| `gmail/client.py` | Gmail API: get message/thread, send reply (MIME+attachments), `verify_delivery`, labels, attachment bytes | worker A |
 | `gmail/watcher.py` | `users.watch` lifecycle, auto-renew before expiry, historyId | worker A |
 | `gmail/pubsub.py` | StreamingPull subscription (no public webhook) | worker A |
 | `gmail/parse.py` | HTML cleanup, tracker/signature removal, plain text | worker A |
 | `gmail/attachments.py` | PDF (+password), DOCX, TXT local extraction, limits | worker A |
-| `llm/base.py` | Provider abstraction | worker B |
-| `llm/openai_compat.py` | OpenAI-compatible client (OpenCode Go / DeepSeek / OpenRouter) | worker B |
-| `llm/prompts.py` | ES summary + DE reply prompts, injection defense | worker B |
-| `telegram/bot.py` | Bot API, group auth, confirm/cancel/resend buttons, outgoing attachment download | worker B |
+| `llm/base.py` | Provider abstraction + retry machinery | worker B |
+| `llm/openai_compat.py` | OpenAI-compatible client (text/vision/audio) | worker B |
+| `llm/ai_service.py` | Routing facade: text/vision/document_vision/audio, bounded fallback | worker B (V1.1) |
+| `llm/pdf_render.py` | Bounded PDF page rendering (PyMuPDF; no OCR) | worker B (V1.1) |
+| `llm/prompts.py` | ES/DE prompts, edits, Q&A, thread summaries, compose/forward, injection defense | worker B |
+| `telegram/bot.py` | Bot API, group auth, intent dispatch, two-step buttons, panels, attachment download, voice | worker B |
 | `pipeline.py` | Orchestrates: pubsub event → fetch → parse → LLM → telegram | core (integration) |
 | `responder.py` | Draft → confirm → send → verify state machine, reconciliation, retry, recovery | core (integration) |
 | `status.py` | `/status`: checks Gmail, Pub/Sub, Telegram, LLM w/o secrets | core |
-| `app.py` | Entrypoint, asyncio tasks, graceful shutdown, retries | core |
+| `app.py` | Entrypoint, asyncio tasks, graceful shutdown, wiring | core |
 
 ## Persistence (SQLite)
 
-Schema (owned by core `db.py`):
-
-- `messages`: `message_id`, `thread_id`, `history_id`, `telegram_message_id`,
-  `status` (received|summarizing|sent_telegram|failed), `created_at`,
-  `updated_at`, `retry_count`, `next_retry_at`.
-- `drafts`: `id`, `thread_id`, `message_id`, `body` (the user's own generated
-  reply, needed for safe retry), `to_json`, `subject`, `status`
-  (pending|confirmed|sending|sent_unverified|sent_verified|send_failed|
-  cancelled|rejected), `telegram_user_id` (ownership), `sent_message_id`,
-  `send_started_at`, `verification_attempts`, `attachments_json` (metadata
-  only: filename/mime/size), timestamps.
-- `memories`: explicit per-member facts (`/remember`), keyed by Telegram user.
-- `meta`: `key`/`value` — `last_history_id`, `watch_expires_at`, tg↔thread
-  mappings, temporary "ver original" state.
+- `messages`: dedup/status identifiers only.
+- `drafts`: the user's own generated reply (needed for retry), recipients,
+  subject, status (pending|confirmed|sending|sent_unverified|sent_verified|
+  send_failed|cancelled|rejected), owner, sent message id, timestamps.
+- `contacts` / `contact_aliases`: explicit user-configured application data
+  (display name, preferred email, normalized aliases).
+- `reminders`: message/thread IDs, due time, status, user, note (user's words).
+- `memories`: explicit per-member facts (`/remember`).
+- `meta`: history baseline, watch expiry, tg↔thread mappings, temp view state.
 
 No email bodies, no extracted attachment text, no attachment binaries, no
-secrets stored. Draft bodies persist only until terminal states are reached
-(retry needs them); incoming content is never persisted. Schema migrations
-(`_ensure_column`) are deterministic and tested.
+secrets. Incoming content is never persisted; temp files are swept by age.
 
 ## Data lifecycle (privacy)
 
 ```
-Gmail/Telegram  →  temporary processing (memory, TMP_DIR)  →  LLM provider
-        →  generated result (summary / draft)  →  Telegram
+Gmail/Telegram  →  temporary processing (memory, TMP_DIR)  →  AI provider
+        →  generated result (summary / draft / answer)  →  Telegram
         →  temp data destroyed (verified / cancelled / failed / sweep)
-SQLite keeps only minimal workflow metadata (IDs, statuses, timestamps).
+SQLite keeps only minimal workflow metadata + explicit user data.
 ```
 
 What is sent to the configured AI provider: the incoming email's cleaned text
-body, bounded attachment text (PDF/DOCX/TXT, truncated), and thread context
-for drafts — i.e. email content DOES reach the provider while processing.
-Nothing else. The provider is self-configured (OpenCode Go / DeepSeek /
-OpenRouter endpoint). Secrets, tokens and bot credentials are never part of
-LLM payloads.
-
-## LLM provider abstraction
-
-```python
-class LLMProvider(Protocol):
-    async def summarize_email(self, email: ParsedEmail) -> EmailSummary: ...
-    async def draft_reply(self, request: DraftRequest, thread: ThreadContext) -> DraftReply: ...
-```
-
-OpenAI-compatible via the `openai` SDK (`base_url` configurable). No automatic
-paid fallback between providers. On failure, email stays pending for retry
-(with backoff); it is never silently lost. Real-provider validation lives in
-`tests/integration/test_llm_real.py` (opt-in via `RUN_REAL_LLM=1`, synthetic
-content only).
+body, bounded attachment text, bounded rendered pages of scanned PDFs, user
+instructions, and thread context for drafts — email content DOES reach the
+provider while processing. Nothing else. Secrets, tokens and credentials are
+never part of AI payloads.
 
 ## Operations
 
@@ -195,14 +288,17 @@ content only).
 
 ```
 src/inboxbridge/
-  config.py models.py db.py pipeline.py responder.py status.py app.py
+  config.py models.py db.py intents.py assistant.py contacts.py reminders.py
+  pipeline.py responder.py status.py app.py
   gmail/    (auth, client, watcher, pubsub, parse, attachments)
-  llm/      (base, openai_compat, prompts)
+  llm/      (base, openai_compat, ai_service, pdf_render, prompts)
   telegram/ (bot)
 tests/
   unit/  integration/  mocks/
-  integration/test_verified_delivery.py   # state machine, ambiguity, retry
-  integration/test_llm_real.py            # opt-in real provider validation
+  integration/test_verified_delivery.py    # state machine, ambiguity, retry
+  integration/test_v11_flows.py            # simulated V1.1 E2E (flows A-T)
+  integration/test_v11_security_restart.py # injection/restart/concurrency
+  integration/test_llm_real.py             # opt-in real AI validation
 docs/ARCHITECTURE.md
 .env.example  .gitignore  pyproject.toml  Dockerfile  docker-compose.yml
 .github/workflows/ci.yml
