@@ -49,6 +49,7 @@ Key design decisions (documented for the coordinator):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import mimetypes
@@ -78,11 +79,12 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes, Messag
 from ..config import Settings
 from ..contracts import TelegramNotifier
 from ..db import Storage
+from ..intents import IntentAction, IntentClassifier
 from ..models import DraftReply, EmailSummary, OutgoingAttachment, ParsedEmail
 
 logger = logging.getLogger(__name__)
 
-_CALLBACK_RE = re.compile(r"^(confirm|cancel|view|hide|reply|resend):([A-Za-z0-9_-]{1,64})$")
+_CALLBACK_RE = re.compile(r"^([A-Za-z]+):([A-Za-z0-9_-]{1,96})$")
 _URL_SCHEME_RE = re.compile(r"https?://", re.IGNORECASE)
 _TG_META_PREFIX = "tg:"  # tg message_id -> thread_id
 _TG_GMAIL_PREFIX = "tgm:"  # tg message_id -> gmail message_id (IDs only)
@@ -94,6 +96,8 @@ _CONFIRM_TIMEOUT_SECONDS = 900.0
 _MAX_MSG_CHARS = 3900
 #: Cap on temporary "original" messages to avoid flooding the group.
 _MAX_ORIGINAL_MESSAGES = 8
+#: Cap on attachment buttons in the delivery panel.
+MAX_ATTACHMENTS_PANEL = 8
 
 #: Explicit memory V1: a fact's matching key is its first N normalized words.
 _MEMORY_KEY_WORDS = 4
@@ -149,6 +153,15 @@ class Sender(Protocol):
 
     async def get_file(self, file_id: str) -> File: ...
 
+    async def send_document(
+        self,
+        chat_id: int | str,
+        document: Any,
+        *,
+        filename: str | None = None,
+        reply_parameters: ReplyParameters | None = None,
+    ) -> Message: ...
+
 
 @dataclass(frozen=True)
 class ReplyRequest:
@@ -175,9 +188,15 @@ class _PendingDraft:
     token: str
     draft: DraftReply
     message_id: int
+    #: Persisted draft row id (owner checks + coordinator state).
+    draft_id: int = 0
     #: Telegram user id that requested the draft; only this member may
     #: confirm/cancel it (group isolation).
     user_id: int = 0
+    #: Every edit bumps draft_version; the preview shown bumps preview_version.
+    #: Sending requires preview_version == draft_version (no stale preview).
+    draft_version: int = 1
+    preview_version: int = 1
     decided: bool | None = None
     future: asyncio.Future[bool] | None = None
 
@@ -314,18 +333,41 @@ class TelegramBot(TelegramNotifier):
         self._status_provider = status_provider
         self._original_fetcher = original_fetcher
         self._resend_callback: Callable[[int], Awaitable[None]] | None = None
+        self._action_callback: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None
+        self._intent_classifier: Any | None = None
+        self._assistant: Any | None = None
+        self._contacts: Any | None = None
+        self._reminders: Any | None = None
         self._allowed_chat_id = settings.telegram_allowed_chat_id
         self._queue: asyncio.Queue[ReplyRequest] = asyncio.Queue()
         self._pending_drafts: dict[str, _PendingDraft] = {}
-        #: user_id -> (tg summary message_id, thread_id): a member pressed
-        #: "Responder" and their next plain message is their reply intent.
-        self._pending_replies: dict[int, tuple[int, str]] = {}
+        #: user_id -> (tg summary message_id, thread_id, mode)
+        #: mode: "reply" (Responder) | "question" (Preguntar)
+        self._pending_replies: dict[int, tuple[int, str, str]] = {}
+        #: user_id -> pending multi-step UI state (compose, contact ops)
+        self._pending_flows: dict[int, dict[str, Any]] = {}
         self._application: Application[Any, Any, Any, Any, Any, Any] | None = None
         self._started = False
 
     def register_resend_callback(self, callback: Callable[[int], Awaitable[None]]) -> None:
         """Wire the "Reintentar envío" button to the reply coordinator."""
         self._resend_callback = callback
+
+    def register_action_callback(
+        self, callback: Callable[[str, dict[str, Any]], Awaitable[None]]
+    ) -> None:
+        """Wire NL/button actions (draft edit/send/cancel, contacts, reminders,
+        attachments, mark/archive, compose, forward, Q&A) to the coordinator."""
+        self._action_callback = callback
+
+    def set_intent_classifier(self, classifier: Any) -> None:
+        self._intent_classifier = classifier
+
+    def register_assistant(self, assistant: Any) -> None:
+        """Wire the V1.1 assistant (contacts/reminders/AI access for UI flows)."""
+        self._assistant = assistant
+        self._contacts = getattr(assistant, "contacts", None)
+        self._reminders = getattr(assistant, "reminders", None)
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
@@ -417,6 +459,14 @@ class TelegramBot(TelegramNotifier):
             await self._run_status(message)
         elif command == "/cancel":
             await self._run_cancel(message)
+        elif command == "/menu" or command == "/ayuda" or command == "/help":
+            await self.show_menu()
+        elif command == "/contactos":
+            await self.show_contacts_panel()
+        elif command == "/recordatorios":
+            await self.show_reminders(user.id)
+        elif command == "/nuevo":
+            await self.prompt_compose_recipient(user.id)
         elif command == "/remember":
             await self._run_remember(message, user.id, arg)
         elif command == "/memory":
@@ -512,13 +562,35 @@ class TelegramBot(TelegramNotifier):
         user = message.from_user
         if user is None:
             return
-        # "Responder" flow: the member pressed the button; this message (with
-        # any document/photo) is their reply intent.
+        # Experimental voice: bounded download → transcription → intent flow.
+        if message.voice is not None:
+            await self._handle_voice(message, user.id)
+            return
+
+        text = message.text or message.caption or ""
+
+        # Multi-step UI flows (compose recipient/instruction, contact inputs,
+        # candidate selection, draft edit mode) take precedence.
+        flow = self._pending_flows.get(user.id)
+        if flow is not None:
+            handled = await self._handle_flow_input(message, user.id, flow, text)
+            if handled:
+                return
+
+        # "Responder"/"Preguntar" button flows: next message is the intent.
         pending = self._pending_replies.pop(user.id, None)
         if pending is not None:
+            tg_message_id, thread_id, mode = pending
+            if mode == "question":
+                await self._dispatch_intent(
+                    text,
+                    thread_id=thread_id,
+                    tg_message_id=tg_message_id,
+                    user_id=user.id,
+                    force=IntentAction.ASK_ABOUT_EMAIL,
+                )
+                return
             attachments = await self._collect_outgoing_attachments(message)
-            _tg_message_id, thread_id = pending
-            text = message.text or message.caption or ""
             memory = tuple(m["value"] for m in self._storage.list_memories(user.id))
             self._queue.put_nowait(
                 ReplyRequest(
@@ -531,28 +603,593 @@ class TelegramBot(TelegramNotifier):
                 )
             )
             return
-        if not (self._is_reply_to_own(message) or self._is_mentioned(message)):
+
+        # Draft edit mode: an active draft for this user; the message is an edit
+        # instruction (e.g. after pressing EDIT).
+        if self._active_pending_for(user.id) is not None and text.strip():
+            await self._dispatch_intent(
+                text, thread_id="", tg_message_id=0, user_id=user.id
+            )
             return
-        # Reply intent confirmed: only now download any attachments (files are
-        # never fetched for messages without a workflow purpose).
-        attachments = await self._collect_outgoing_attachments(message)
+
+        if not (self._is_reply_to_own(message) or self._is_mentioned(message)):
+            # Standalone natural-language commands are still handled (e.g.
+            # "escribe a Roman…", "recuérdame…", contact management).
+            if self._action_callback is not None and text.strip():
+                await self._dispatch_intent(
+                    text, thread_id="", tg_message_id=0, user_id=user.id
+                )
+            return
+
+        # Reply-to-own message: resolve context, then intent-dispatch.
         thread_id = ""
+        tg_message_id = 0
         reply = message.reply_to_message
         if reply is not None and self._is_own_message(reply):
-            if any(p.message_id == reply.message_id for p in self._pending_drafts.values()):
-                return  # draft confirmation message: use the inline buttons
+            if self._pending_draft_for_message(reply.message_id) is not None:
+                # A draft confirmation message: "ok" would be ambiguous — ask.
+                await self._send(
+                    "Usa los botones del borrador (o escribe «envíalo» / "
+                    "«cancela el borrador»)."
+                )
+                return
+            tg_message_id = reply.message_id
             thread_id = self._storage.get_meta(f"{_TG_META_PREFIX}{reply.message_id}") or ""
-        memory = tuple(m["value"] for m in self._storage.list_memories(user.id))
-        self._queue.put_nowait(
-            ReplyRequest(
-                thread_id=thread_id,
-                user_instructions=message.text or message.caption or "",
-                source_message_id=message.message_id,
-                memory=memory,
-                user_id=user.id,
-                attachments=attachments,
-            )
+        await self._dispatch_intent(
+            text,
+            thread_id=thread_id,
+            tg_message_id=tg_message_id,
+            user_id=user.id,
+            fallback_to_reply=True,
+            message=message,
         )
+
+    async def _dispatch_intent(
+        self,
+        text: str,
+        *,
+        thread_id: str,
+        tg_message_id: int,
+        user_id: int,
+        force: IntentAction | None = None,
+        fallback_to_reply: bool = False,
+        message: Message | None = None,
+    ) -> None:
+        """Classify + execute one user message (validated, deterministic).
+
+        ``fallback_to_reply``: when the message replies to one of our summary
+        messages and the intent is unclear, treat it as a plain reply
+        instruction (the classic flow) instead of asking.
+        """
+        classifier = self._intent_classifier or IntentClassifier()
+        has_draft = self._active_pending_for(user_id) is not None
+        context = f"hilo={thread_id or 'ninguno'}; borrador_activo={'sí' if has_draft else 'no'}"
+        intent = await classifier.classify(text, context=context)
+        action = force or intent.action
+        payload: dict[str, Any] = dict(intent.payload)
+        payload.setdefault("user_id", user_id)
+        payload.setdefault("thread_id", thread_id)
+        payload.setdefault("tg_message_id", tg_message_id)
+        if tg_message_id:
+            payload.setdefault(
+                "message_id", self._storage.get_meta(f"{_TG_GMAIL_PREFIX}{tg_message_id}") or ""
+            )
+
+        if action in (IntentAction.CLARIFY, IntentAction.UNKNOWN):
+            if fallback_to_reply:
+                # Classic reply flow: the member's message is the reply intent
+                # (empty thread → the coordinator asks for context).
+                attachments = (
+                    await self._collect_outgoing_attachments(message)
+                    if message is not None
+                    else ()
+                )
+                memory = tuple(m["value"] for m in self._storage.list_memories(user_id))
+                self._queue.put_nowait(
+                    ReplyRequest(
+                        thread_id=thread_id,
+                        user_instructions=text,
+                        source_message_id=(
+                            message.message_id
+                            if message is not None
+                            else tg_message_id
+                        ),
+                        memory=memory,
+                        user_id=user_id,
+                        attachments=attachments,
+                    )
+                )
+                return
+            if has_draft:
+                await self._send(
+                    "Tienes un borrador pendiente. Puedes decir: «envíalo», "
+                    "«cancela el borrador», «hazlo más corto»… o editar el texto."
+                )
+            else:
+                await self._send("No te he entendido del todo. ¿Qué quieres que haga?")
+            return
+
+        # High-impact text acts execute only on EXPLICIT deterministic verbs.
+        if action == IntentAction.SEND_DRAFT:
+            await self._send_draft_via_text(user_id)
+            return
+        if action == IntentAction.CANCEL_DRAFT:
+            await self._cancel_draft_via_text(user_id)
+            return
+
+        if action in (IntentAction.MODIFY_DRAFT, IntentAction.REGENERATE_DRAFT):
+            await self._edit_draft_via_text(user_id, text, action)
+            return
+
+        if self._action_callback is None:
+            await self._send("No puedo hacer eso ahora mismo.")
+            return
+        await self._action_callback(action.value, payload)
+
+    # ── text draft actions (explicit only; never on "ok"/"sí") ─────────────
+
+    def _active_pending_for(self, user_id: int) -> _PendingDraft | None:
+        for pending in self._pending_drafts.values():
+            if pending.user_id == user_id:
+                return pending
+        return None
+
+    def _pending_draft_for_message(self, message_id: int) -> _PendingDraft | None:
+        for pending in self._pending_drafts.values():
+            if pending.message_id == message_id:
+                return pending
+        return None
+
+    def pending_draft_for_owner(self, draft_id: int, user_id: int) -> _PendingDraft | None:
+        for pending in self._pending_drafts.values():
+            if pending.draft_id == draft_id and pending.user_id == user_id:
+                return pending
+        return None
+
+    async def _send_draft_via_text(self, user_id: int) -> None:
+        pending = self._active_pending_for(user_id)
+        if pending is None:
+            await self._send("No hay ningún borrador pendiente para enviar.")
+            return
+        if pending.preview_version != pending.draft_version:
+            await self._send(
+                "El borrador cambió y aún no te he mostrado la versión final. "
+                "Revisa la vista previa actualizada antes de enviar."
+            )
+            return
+        self._pending_drafts.pop(pending.token, None)
+        pending.resolve(True)
+
+    async def _cancel_draft_via_text(self, user_id: int) -> None:
+        pending = self._active_pending_for(user_id)
+        if pending is None:
+            await self._send("No hay ningún borrador pendiente para cancelar.")
+            return
+        self._pending_drafts.pop(pending.token, None)
+        pending.resolve(False)
+
+    async def _edit_draft_via_text(
+        self, user_id: int, text: str, action: IntentAction
+    ) -> None:
+        pending = self._active_pending_for(user_id)
+        if pending is None:
+            await self._send("No hay ningún borrador activo para editar.")
+            return
+        instruction = text if action == IntentAction.MODIFY_DRAFT else "reescribe por completo"
+        if self._action_callback is None:
+            await self._send("No puedo editar el borrador ahora mismo.")
+            return
+        await self._action_callback(
+            "edit_draft",
+            {"draft_id": pending.draft_id, "instruction": instruction, "user_id": user_id},
+        )
+
+    # ── pending flow inputs (compose steps, contact inputs, candidates) ─────
+
+    async def _handle_flow_input(
+        self, message: Message, user_id: int, flow: dict[str, Any], text: str
+    ) -> bool:
+        flow_name = str(flow.get("flow") or "")
+        if flow_name == "compose_recipient":
+            await self._compose_recipient_step(user_id, text)
+            return True
+        if flow_name == "compose_instruction":
+            await self._compose_instruction_step(user_id, text)
+            return True
+        if flow_name == "forward_recipient":
+            await self._forward_recipient_step(user_id, text)
+            return True
+        if flow_name == "choose_candidate":
+            await self._choose_candidate_step(user_id, flow, text)
+            return True
+        if flow_name == "contact_new_name":
+            self._pending_flows[user_id] = {
+                "flow": "contact_new_email",
+                "name": text.strip(),
+            }
+            await self._send("¿Y cuál es su correo?")
+            return True
+        if flow_name == "contact_new_email":
+            await self._confirm_contact_new(user_id, flow, text)
+            return True
+        if flow_name == "contact_email_wait":
+            await self._confirm_flow(
+                user_id,
+                f"¿Cambio el correo del contacto a {text.strip()}?",
+                "contact_update_email",
+                {"contact_id": int(flow["contact_id"]), "email": text.strip()},
+            )
+            return True
+        if flow_name == "contact_alias_wait":
+            await self._confirm_flow(
+                user_id,
+                f"¿Guardo «{text.strip()}» como alias?",
+                "contact_add_alias",
+                {"contact_id": int(flow["contact_id"]), "alias": text.strip()},
+            )
+            return True
+        if flow_name == "contact_aliasdel_wait":
+            await self._confirm_flow(
+                user_id,
+                f"¿Elimino el alias «{text.strip()}»?",
+                "contact_remove_alias",
+                {"alias": text.strip()},
+            )
+            return True
+        if flow_name == "contact_rename_wait":
+            await self._confirm_flow(
+                user_id,
+                f"¿Renombro el contacto a «{text.strip()}»?",
+                "contact_rename",
+                {"contact_id": int(flow["contact_id"]), "name": text.strip()},
+            )
+            return True
+        if flow_name == "ask_unknown_recipient":
+            # User replied with an address (or a different name).
+            self._pending_flows.pop(user_id, None)
+            await self._compose_recipient_step(user_id, text, flow.get("fallback_instruction"))
+            return True
+        return False
+
+    async def _compose_recipient_step(
+        self, user_id: int, text: str, instruction_hint: str | None = None
+    ) -> None:
+        from ..contacts import validate_email
+
+        phrase = text.strip().strip(".,;:!?¿¡")
+        if validate_email(phrase):
+            self._pending_flows[user_id] = {
+                "flow": "compose_instruction",
+                "recipient": phrase,
+                "display_name": phrase.split("@")[0],
+            }
+        else:
+            resolution = self._contacts.resolve(phrase) if self._contacts is not None else None
+            if resolution is None or not resolution.resolved:
+                if resolution is not None and resolution.ambiguous:
+                    await self.choose_candidate(
+                        user_id,
+                        "Hay varios contactos que coinciden; dime cuál:",
+                        resolution.candidates,
+                        flow="compose",
+                    )
+                    return
+                await self.ask_unknown_recipient(user_id, phrase, "No tengo a nadie guardado como")
+                return
+            assert resolution.contact is not None
+            self._pending_flows[user_id] = {
+                "flow": "compose_instruction",
+                "recipient": resolution.contact["email"],
+                "display_name": resolution.contact["display_name"],
+            }
+        if instruction_hint:
+            await self._compose_instruction_step(user_id, instruction_hint)
+        else:
+            await self._send("¿Qué le digo?")
+
+    async def _compose_instruction_step(self, user_id: int, text: str) -> None:
+        flow = self._pending_flows.pop(user_id, None)
+        if flow is None:
+            return
+        if self._action_callback is None:
+            await self._send("No puedo redactar ahora mismo.")
+            return
+        await self._action_callback(
+            "compose",
+            {
+                "recipient": f"{flow['display_name']} <{flow['recipient']}>",
+                "instruction": text,
+                "user_id": user_id,
+            },
+        )
+
+    async def _forward_recipient_step(self, user_id: int, text: str) -> None:
+        flow = self._pending_flows.pop(user_id, None)
+        if flow is None:
+            return
+        if self._action_callback is None:
+            await self._send("No puedo reenviar ahora mismo.")
+            return
+        await self._action_callback(
+            "forward",
+            {
+                "recipient": text.strip(),
+                "tg_message_id": int(flow.get("tg_message_id") or 0),
+                "user_id": user_id,
+            },
+        )
+
+    async def _choose_candidate_step(
+        self, user_id: int, flow: dict[str, Any], text: str
+    ) -> None:
+        candidates = list(flow.get("candidates") or [])
+        choice = text.strip()
+        selected: dict[str, Any] | None = None
+        if choice.isdigit():
+            index = int(choice) - 1
+            if 0 <= index < len(candidates):
+                selected = candidates[index]
+        else:
+            for candidate in candidates:
+                if str(candidate.get("display_name") or "").casefold() == choice.casefold():
+                    selected = candidate
+                    break
+        if selected is None:
+            await self._send("No reconocí esa opción. Escribe el número o el nombre.")
+            return
+        self._pending_flows.pop(user_id, None)
+        flow_name = str(flow.get("target_flow") or "compose")
+        if flow_name == "compose":
+            self._pending_flows[user_id] = {
+                "flow": "compose_instruction",
+                "recipient": selected["email"],
+                "display_name": selected["display_name"],
+            }
+            await self._send("¿Qué le digo?")
+        else:
+            callback = self._action_callback
+            if callback is None:
+                return
+            await callback(
+                "forward",
+                {
+                    "recipient": f"{selected['display_name']} <{selected['email']}>",
+                    "tg_message_id": int(flow.get("tg_message_id") or 0),
+                    "user_id": user_id,
+                },
+            )
+
+    async def _confirm_contact_new(
+        self, user_id: int, flow: dict[str, Any], email_text: str
+    ) -> None:
+        self._pending_flows.pop(user_id, None)
+        await self._confirm_flow(
+            user_id,
+            f"¿Guardo el contacto {flow['name']} <{email_text.strip()}>?",
+            "contact_create",
+            {"name": flow["name"], "email": email_text.strip()},
+        )
+
+    async def _confirm_flow(
+        self,
+        user_id: int,
+        text: str,
+        action: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """One-shot confirmation UI for persistent/destructive changes."""
+        token = secrets.token_urlsafe(8)
+        self._pending_flows[user_id] = {
+            "flow": "confirm",
+            "confirm_token": token,
+            "action": action,
+            "payload": payload,
+        }
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Sí", callback_data=f"confyes:{token}"),
+                    InlineKeyboardButton("No", callback_data=f"confno:{token}"),
+                ]
+            ]
+        )
+        await self._ensure_sender().send_message(
+            self._allowed_chat_id,
+            text,
+            reply_markup=keyboard,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+
+    # ── public UI helpers (used by the assistant) ───────────────────────────
+
+    async def prompt_compose_recipient(self, user_id: int) -> None:
+        self._pending_flows[user_id] = {"flow": "compose_recipient"}
+        await self._send("¿A quién le escribo? (nombre, alias o correo)")
+
+    async def choose_candidate(
+        self,
+        user_id: int,
+        question: str,
+        candidates: list[dict[str, Any]],
+        *,
+        flow: str = "compose",
+    ) -> None:
+        lines = []
+        for index, candidate in enumerate(candidates, start=1):
+            aliases = self._contacts.aliases_of(int(candidate["id"])) if self._contacts else []
+            suffix = f" (alias: {', '.join(aliases[:2])})" if aliases else ""
+            lines.append(f"{index}. {candidate['display_name']} <{candidate['email']}>{suffix}")
+        self._pending_flows[user_id] = {
+            "flow": "choose_candidate",
+            "candidates": candidates,
+            "target_flow": flow,
+        }
+        await self._send(question + "\n" + "\n".join(lines))
+
+    async def ask_unknown_recipient(
+        self, user_id: int, phrase: str, prefix: str
+    ) -> None:
+        self._pending_flows[user_id] = {
+            "flow": "ask_unknown_recipient",
+            "phrase": phrase,
+        }
+        await self._send(
+            f"{prefix} «{phrase}». ¿Me das su correo? "
+            "(o dime «escribe a otro nombre»)"
+        )
+
+    async def show_contacts_panel(self) -> None:
+        contacts = self._contacts.list_contacts() if self._contacts else []
+        if not contacts:
+            await self._send("No tienes contactos guardados todavía.")
+            return
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    c["display_name"], callback_data=f"contact:{c['id']}"
+                )
+            ]
+            for c in contacts[:10]
+        ]
+        buttons.append(
+            [
+                InlineKeyboardButton("➕ Añadir contacto", callback_data="cnew"),
+                InlineKeyboardButton("✖️ Cerrar", callback_data="close"),
+            ]
+        )
+        await self._send(
+            "👥 Contactos",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    async def show_contact_detail(self, contact_id: int) -> None:
+        contact = self._contacts.get(contact_id) if self._contacts else None
+        if contact is None:
+            await self._send("Ese contacto ya no existe.")
+            return
+        aliases = self._contacts.aliases_of(contact_id) if self._contacts else []
+        alias_text = ", ".join(f"«{a}»" for a in aliases) or "(ninguno)"
+        buttons = [
+            [InlineKeyboardButton("✉️ Cambiar correo", callback_data=f"cemail:{contact_id}")],
+            [InlineKeyboardButton("➕ Añadir alias", callback_data=f"caliasadd:{contact_id}")],
+            [InlineKeyboardButton("➖ Quitar alias", callback_data=f"caliasdel:{contact_id}")],
+            [InlineKeyboardButton("✏️ Renombrar", callback_data=f"crename:{contact_id}")],
+            [InlineKeyboardButton("🗑 Borrar contacto", callback_data=f"cdel:{contact_id}")],
+            [InlineKeyboardButton("↩️ Volver", callback_data="contacts")],
+        ]
+        await self._send(
+            f"👤 {contact['display_name']}\n📧 {contact['email']}\nAlias: {alias_text}",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    async def show_menu(self) -> None:
+        """Discoverability menu — buttons, no slash commands required."""
+        buttons = [
+            [
+                InlineKeyboardButton("✉️ Nuevo correo", callback_data="nuevo"),
+                InlineKeyboardButton("👥 Contactos", callback_data="contacts"),
+            ],
+            [
+                InlineKeyboardButton("⏰ Recordatorios", callback_data="reminders"),
+                InlineKeyboardButton("❓ Ayuda", callback_data="help"),
+            ],
+            [InlineKeyboardButton("✖️ Cerrar", callback_data="close")],
+        ]
+        await self._send(
+            "¿Qué quieres hacer?",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    async def show_reminders(self, user_id: int) -> None:
+        rows = self._reminders.list_pending(user_id) if self._reminders else []
+        if not rows:
+            await self._send("No tienes recordatorios pendientes.")
+            return
+        from ..reminders import format_due
+
+        lines = []
+        buttons = []
+        for row in rows[:10]:
+            lines.append(f"⏰ #{row['id']} — {format_due(float(row['due_at']))}")
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"Cancelar #{row['id']}", callback_data=f"rcancel:{row['id']}"
+                    )
+                ]
+            )
+        buttons.append([InlineKeyboardButton("✖️ Cerrar", callback_data="close")])
+        await self._send(
+            "⏰ Recordatorios\n" + "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    async def show_help(self) -> None:
+        await self._send(
+            "Puedo ayudarte con el correo. Algunos ejemplos:\n\n"
+            "• «respóndele que el viernes sí puedo» (respondiendo a un resumen)\n"
+            "• «hazlo más corto» / «más formal» (mientras hay un borrador)\n"
+            "• «envíalo» / «cancela el borrador»\n"
+            "• «escribe a Roman y dile que mañana llego a las seis»\n"
+            "• «reenvíaselo a Daniel»\n"
+            "• «mándame el pdf» / «archívalo» / «márcalo como leído»\n"
+            "• «recuérdamelo mañana» / «¿qué recordatorios tengo?»\n"
+            "• «¿qué contactos tengo?» / «cuando diga Roman usa femo@femo.ch»\n\n"
+            "Botones: ✉️ nuevo correo · 👥 contactos · ⏰ recordatorios · ❓ ayuda"
+        )
+
+    # ── voice (experimental) ────────────────────────────────────────────────
+
+    async def _handle_voice(self, message: Message, user_id: int) -> None:
+        voice = message.voice
+        if voice is None or self._action_callback is None:
+            return
+        if not self._settings.ai_audio_enabled:
+            await self._send(
+                "Las notas de voz aún no están activadas en esta instalación. "
+                "Escríbeme la instrucción por texto, por favor."
+            )
+            return
+        duration = voice.duration or 0
+        size = voice.file_size or 0
+        if duration > self._settings.ai_audio_max_seconds:
+            max_secs = self._settings.ai_audio_max_seconds
+            await self._send(f"La nota es muy larga (máximo {max_secs}s).")
+            return
+        if size > self._settings.ai_audio_max_bytes:
+            await self._send("La nota es demasiado grande.")
+            return
+        try:
+            file = await self._ensure_sender().get_file(voice.file_id)
+            target = self._outgoing_tmp_path(f"voice_{voice.file_unique_id}.ogg")
+            await asyncio.to_thread(file.download, target)  # type: ignore[attr-defined]
+        except Exception:
+            logger.exception("voice download failed")
+            await self._send("No pude descargar la nota de voz.")
+            return
+        try:
+            await self._send("Escuchando… (experimental)")
+            data = target.read_bytes()
+            transcript = await self._ai_audio(mime="audio/ogg", data=data)
+        except Exception:
+            logger.exception("voice transcription failed")
+            await self._send(
+                "No pude entender la nota de voz (transcripción no disponible). "
+                "Escríbeme la instrucción por texto, por favor."
+            )
+            return
+        finally:
+            _remove_file(str(target))
+        await self._dispatch_intent(
+            transcript, thread_id="", tg_message_id=0, user_id=user_id
+        )
+
+    async def _ai_audio(self, mime: str, data: bytes) -> str:
+        """Transcription via the assistant's AI service (experimental)."""
+        if self._assistant is None:
+            raise RuntimeError("no assistant wired")
+        result = await self._assistant.transcribe_audio(mime, data)
+        return str(result)
 
     async def _collect_outgoing_attachments(
         self, message: Message
@@ -669,36 +1306,288 @@ class TelegramBot(TelegramNotifier):
         if match is None:
             return
         action, token = match.group(1), match.group(2)
+        sender = self._ensure_sender()
+
+        # Generic one-shot confirmations (contacts, destructive changes).
+        if action == "confyes":
+            await self._confirm_yes(query, token)
+            return
+        if action == "confno":
+            await self._confirm_no(query, token)
+            return
+        if action == "close":
+            await sender.answer_callback_query(query.id, "Cerrado.")
+            return
+
+        # Menu / panels.
+        if action == "menu":
+            await sender.answer_callback_query(query.id)
+            await self.show_menu()
+            return
+        if action == "help":
+            await sender.answer_callback_query(query.id)
+            await self.show_help()
+            return
+        if action == "nuevo":
+            await sender.answer_callback_query(query.id)
+            await self.prompt_compose_recipient(query.from_user.id)
+            return
+        if action == "contacts":
+            await sender.answer_callback_query(query.id)
+            await self.show_contacts_panel()
+            return
+        if action == "cnew":
+            await sender.answer_callback_query(query.id)
+            self._pending_flows[query.from_user.id] = {"flow": "contact_new_name"}
+            await self._send("¿Cómo se llama el contacto?")
+            return
+        if action == "reminders":
+            await sender.answer_callback_query(query.id)
+            await self.show_reminders(query.from_user.id)
+            return
+        if action == "rcancel":
+            await self._reminder_cancel(query, token)
+            return
+        if action == "question":
+            await self._handle_question_callback(query, token)
+            return
+        if action == "att":
+            await self._handle_attachment_callback(query, token)
+            return
+
+        # Contact management (detail + ops).
+        if action == "contact":
+            await sender.answer_callback_query(query.id)
+            await self._contact_id_or_panel(query, token)
+            return
+        if action == "cemail":
+            await self._contact_flow_start(
+                query, token, "contact_email_wait", "¿Cuál es el nuevo correo?"
+            )
+            return
+        if action == "caliasadd":
+            await self._contact_flow_start(
+                query, token, "contact_alias_wait", "¿Qué alias añado?"
+            )
+            return
+        if action == "caliasdel":
+            await self._contact_flow_start(
+                query, token, "contact_aliasdel_wait", "¿Qué alias elimino?"
+            )
+            return
+        if action == "crename":
+            await self._contact_flow_start(
+                query, token, "contact_rename_wait", "¿Cuál es el nuevo nombre?"
+            )
+            return
+        if action == "cdel":
+            await self._contact_delete_confirm(query, token)
+            return
+
+        # Reply button (Responder).
         if action == "reply":
             await self._handle_reply_callback(query, token)
             return
+        # View original.
         if action in ("view", "hide"):
             await self._handle_view_callback(query, action, token)
             return
         if action == "resend":
             await self._handle_resend_callback(query, token)
             return
+
+        # Draft two-step confirmation flow.
+        if action in ("sendyes", "cancelyes", "edit"):
+            await self._draft_second_step(query, action, token)
+            return
+        if action == "sendback":
+            await self._draft_back(query, token, "Envío cancelado, el borrador sigue pendiente.")
+            return
+        if action == "cancelback":
+            await self._draft_back(query, token, "El borrador sigue pendiente.")
+            return
+        if action == "editback":
+            await self._draft_back(query, token, "No se ha modificado nada.")
+            return
+
+        # First tap on SEND / CANCEL / EDIT: confirmation UI, no action yet.
         pending = self._pending_drafts.get(token)
         if pending is None:
-            await self._ensure_sender().answer_callback_query(
+            await sender.answer_callback_query(
                 query.id, "Este borrador ya no está disponible."
             )
             return
         # Group isolation: only the member who requested the draft may
         # confirm/cancel it (owner 0 = no owner recorded → fail closed).
         if not pending.user_id or query.from_user.id != pending.user_id:
+            await sender.answer_callback_query(
+                query.id, "Ese borrador lo está gestionando otro miembro."
+            )
+            return
+        if action == "confirm":
+            await self._show_send_confirm(query, pending)
+            return
+        if action == "cancel":
+            await self._show_cancel_confirm(query, pending)
+            return
+        await sender.answer_callback_query(query.id, "Acción no reconocida.")
+
+    # ── generic confirmation ────────────────────────────────────────────────
+
+    async def _confirm_yes(self, query: CallbackQuery, token: str) -> None:
+        flow = self._pop_flow_by_token(token)
+        if flow is None:
+            await self._ensure_sender().answer_callback_query(
+                query.id, "Esa confirmación ya no está disponible."
+            )
+            return
+        await self._ensure_sender().answer_callback_query(query.id, "Hecho ✓")
+        if self._action_callback is not None:
+            await self._action_callback(str(flow["action"]), dict(flow["payload"]))
+
+    async def _confirm_no(self, query: CallbackQuery, token: str) -> None:
+        self._pop_flow_by_token(token)
+        await self._ensure_sender().answer_callback_query(query.id, "Cancelado.")
+
+    def _pop_flow_by_token(self, token: str) -> dict[str, Any] | None:
+        for user_id, flow in list(self._pending_flows.items()):
+            if flow.get("confirm_token") == token:
+                self._pending_flows.pop(user_id, None)
+                return flow
+        return None
+
+    # ── draft two-step confirmations ────────────────────────────────────────
+
+    async def _show_send_confirm(self, query: CallbackQuery, pending: _PendingDraft) -> None:
+        """SEND tap → ask "are you sure?" (no send yet)."""
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Sí, enviar", callback_data=f"sendyes:{pending.token}"),
+                    InlineKeyboardButton("Volver", callback_data=f"sendback:{pending.token}"),
+                ]
+            ]
+        )
+        await self._ensure_sender().answer_callback_query(query.id)
+        await self._ensure_sender().send_message(
+            self._allowed_chat_id,
+            "¿Seguro que quieres enviar este correo?",
+            reply_markup=keyboard,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+
+    async def _show_cancel_confirm(self, query: CallbackQuery, pending: _PendingDraft) -> None:
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Sí, cancelar",
+                        callback_data=f"cancelyes:{pending.token}",
+                    ),
+                    InlineKeyboardButton("Volver", callback_data=f"cancelback:{pending.token}"),
+                ]
+            ]
+        )
+        await self._ensure_sender().answer_callback_query(query.id)
+        await self._ensure_sender().send_message(
+            self._allowed_chat_id,
+            "¿Cancelar este borrador?",
+            reply_markup=keyboard,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+
+    async def _draft_second_step(self, query: CallbackQuery, action: str, token: str) -> None:
+        pending = self._pending_drafts.get(token)
+        if pending is None:
+            await self._ensure_sender().answer_callback_query(
+                query.id, "Este borrador ya no está disponible."
+            )
+            return
+        if not pending.user_id or query.from_user.id != pending.user_id:
             await self._ensure_sender().answer_callback_query(
                 query.id, "Ese borrador lo está gestionando otro miembro."
             )
             return
-        confirmed = action == "confirm"
-        pending.resolve(confirmed)
         sender = self._ensure_sender()
-        await sender.answer_callback_query(query.id, "Enviando…" if confirmed else "Cancelado.")
-        await sender.edit_message_text(
-            "Confirmado ✓" if confirmed else "Cancelado.",
-            chat_id=message.chat.id,
-            message_id=message.message_id,
+        if action == "sendyes":
+            if pending.preview_version != pending.draft_version:
+                await sender.answer_callback_query(
+                    query.id, "El borrador cambió; revisa la vista previa actualizada."
+                )
+                return
+            self._pending_drafts.pop(token, None)
+            pending.resolve(True)
+            await sender.answer_callback_query(query.id, "Enviando…")
+            return
+        if action == "cancelyes":
+            self._pending_drafts.pop(token, None)
+            pending.resolve(False)
+            await sender.answer_callback_query(query.id, "Cancelado.")
+            return
+        if action == "edit":
+            await sender.answer_callback_query(query.id)
+            await self._send(
+                "Dime qué cambio: «hazlo más corto», «más formal», "
+                "«cambia las 18:00 por las 19:00»…"
+            )
+
+    async def _draft_back(self, query: CallbackQuery, token: str, notice: str) -> None:
+        pending = self._pending_drafts.get(token)
+        if pending is None:
+            await self._ensure_sender().answer_callback_query(
+                query.id, "Este borrador ya no está disponible."
+            )
+            return
+        await self._ensure_sender().answer_callback_query(query.id, notice)
+
+    # ── contact UI helpers ──────────────────────────────────────────────────
+
+    async def _contact_id_or_panel(self, query: CallbackQuery, token: str) -> None:
+        try:
+            contact_id = int(token)
+        except ValueError:
+            await self.show_contacts_panel()
+            return
+        await self.show_contact_detail(contact_id)
+
+    async def _contact_flow_start(
+        self, query: CallbackQuery, token: str, flow_name: str, prompt: str
+    ) -> None:
+        try:
+            contact_id = int(token)
+        except ValueError:
+            return
+        self._pending_flows[query.from_user.id] = {
+            "flow": flow_name,
+            "contact_id": contact_id,
+        }
+        await self._ensure_sender().answer_callback_query(query.id)
+        await self._send(prompt)
+
+    async def _contact_delete_confirm(self, query: CallbackQuery, token: str) -> None:
+        try:
+            contact_id = int(token)
+        except ValueError:
+            return
+        await self._ensure_sender().answer_callback_query(query.id)
+        await self._confirm_flow(
+            query.from_user.id,
+            "¿Borro este contacto y sus alias?",
+            "contact_delete",
+            {"contact_id": contact_id},
+        )
+
+    async def _reminder_cancel(self, query: CallbackQuery, token: str) -> None:
+        try:
+            reminder_id = int(token)
+        except ValueError:
+            return
+        if self._action_callback is None:
+            return
+        await self._ensure_sender().answer_callback_query(query.id, "Cancelando…")
+        await self._action_callback(
+            "cancel_reminder",
+            {"reminder_id": reminder_id, "user_id": query.from_user.id},
         )
 
     # ── "Responder" button ─────────────────────────────────────────────────
@@ -706,6 +1595,15 @@ class TelegramBot(TelegramNotifier):
     async def _handle_reply_callback(self, query: CallbackQuery, token: str) -> None:
         """User pressed "Responder": remember the target thread and ask for
         their intent; their next plain message becomes the reply instruction."""
+        await self._set_reply_mode(query, token, mode="reply")
+
+    async def _handle_question_callback(self, query: CallbackQuery, token: str) -> None:
+        """User pressed "Preguntar": next message is a question about the email."""
+        await self._set_reply_mode(query, token, mode="question")
+
+    async def _set_reply_mode(
+        self, query: CallbackQuery, token: str, *, mode: str
+    ) -> None:
         try:
             tg_message_id = int(token)
         except ValueError:
@@ -717,11 +1615,66 @@ class TelegramBot(TelegramNotifier):
             await self._send("No puedo asociar eso a ningún hilo.")
             return
         sender_name = self._storage.get_meta(f"{_TG_SENDER_PREFIX}{tg_message_id}") or ""
-        self._pending_replies[query.from_user.id] = (tg_message_id, thread_id)
-        if sender_name:
+        self._pending_replies[query.from_user.id] = (tg_message_id, thread_id, mode)
+        if mode == "question":
+            await self._send("¿Qué quieres saber sobre este correo?")
+        elif sender_name:
             await self._send(f"¿Qué quieres decirle a {sender_name}?")
         else:
             await self._send("¿Qué quieres decirle?")
+
+    # ── attachments panel (Gmail → Telegram) ────────────────────────────────
+
+    async def _handle_attachment_callback(self, query: CallbackQuery, token: str) -> None:
+        """Token format "<tg_message_id>-<index>"; index -1 lists the panel."""
+        parts = token.split("-", maxsplit=1)
+        try:
+            tg_message_id = int(parts[0])
+            index = int(parts[1]) if len(parts) > 1 else -1
+        except ValueError:
+            return
+        await self._ensure_sender().answer_callback_query(query.id, "Preparando…")
+        if self._action_callback is None:
+            return
+        await self._action_callback(
+            "get_attachment",
+            {"tg_message_id": tg_message_id, "index": index, "user_id": query.from_user.id},
+        )
+
+    async def show_attachments_panel(self, tg_message_id: int, email: ParsedEmail) -> None:
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    f"📎 {a.filename} ({_format_size(a.size_bytes)})",
+                    callback_data=f"att:{tg_message_id}-{index}",
+                )
+            ]
+            for index, a in enumerate(email.attachments[:MAX_ATTACHMENTS_PANEL])
+        ]
+        buttons.append([InlineKeyboardButton("✖️ Cerrar", callback_data="close")])
+        await self._send(
+            f"Adjuntos de «{email.subject}»:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    async def send_document_file(self, path: str, filename: str) -> None:
+        """Send a temp file to the group; the caller removes it afterwards."""
+        data = await asyncio.to_thread(Path(path).read_bytes)
+        await self._ensure_sender().send_document(
+            self._allowed_chat_id,
+            data,
+            filename=filename,
+        )
+
+    def write_temp_file(self, filename: str, data: bytes) -> str:
+        """Safe temp file for attachment delivery (random token prefix)."""
+        base = Path(self._settings.tmp_dir) / "delivery"
+        base.mkdir(parents=True, exist_ok=True)
+        safe = sanitize_filename(filename)
+        token = secrets.token_hex(6)
+        target = base / f"{token}_{safe}"
+        target.write_bytes(data)
+        return str(target)
 
     # ── "Reintentar envío" button ──────────────────────────────────────────
 
@@ -885,9 +1838,17 @@ class TelegramBot(TelegramNotifier):
                         "Ver original", callback_data=f"view:{message.message_id}"
                     ),
                     InlineKeyboardButton(
+                        "Preguntar", callback_data=f"question:{message.message_id}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
                         "Responder", callback_data=f"reply:{message.message_id}"
                     ),
-                ]
+                    InlineKeyboardButton(
+                        "📎 Adjuntos", callback_data=f"att:{message.message_id}"
+                    ),
+                ],
             ]
         )
         await sender.edit_message_text(
@@ -907,19 +1868,45 @@ class TelegramBot(TelegramNotifier):
     async def send_draft_for_confirmation(
         self, draft: DraftReply, *, user_id: int = 0, draft_id: int = 0
     ) -> int:
-        token = secrets.token_urlsafe(8)
-        to_line = (
-            ", ".join(str(address) for address in draft.to) if draft.to else "(sin destinatario)"
+        """Show the COMPLETE final draft (recipients, subject, attachments,
+        type) with SEND/EDIT/CANCEL buttons. SEND/CANCEL need a second tap.
+
+        The preview is versioned: any edit re-renders it and bumps the preview
+        version — a stale preview can never authorize a send.
+        """
+        pending = _PendingDraft(
+            token=secrets.token_urlsafe(8),
+            draft=draft,
+            message_id=0,
+            draft_id=draft_id,
+            user_id=user_id,
         )
+        message_id = await self._post_draft_preview(pending)
+        pending.message_id = message_id
+        self._pending_drafts[pending.token] = pending
+        return message_id
+
+    async def _post_draft_preview(self, pending: _PendingDraft) -> int:
+        """Post (or re-post) the draft preview; returns the new message id."""
+        draft = pending.draft
+        to_line = (
+            ", ".join(str(address) for address in draft.to)
+            if draft.to
+            else "(sin destinatario)"
+        )
+        cc_line = ""
+        if draft.cc:
+            cc_line = f"\nCC: {', '.join(str(a) for a in draft.cc)}"
         attachments_line = ""
         if draft.attachments:
             names = "\n".join(
                 f"- {a.filename} ({_format_size(a.size_bytes)})" for a in draft.attachments
             )
             attachments_line = f"\nAdjuntos:\n{names}"
+        kind = "Nuevo correo" if not draft.thread_id else "Respuesta"
         text = (
-            f"Borrador de respuesta\n"
-            f"Para: {to_line}\n"
+            f"Borrador ({kind})\n"
+            f"Para: {to_line}{cc_line}\n"
             f"Asunto: {draft.subject}\n"
             f"{attachments_line}\n\n"
             f"{neutralize_links(draft.body)}"
@@ -927,8 +1914,9 @@ class TelegramBot(TelegramNotifier):
         keyboard = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("Enviar", callback_data=f"confirm:{token}"),
-                    InlineKeyboardButton("Cancelar", callback_data=f"cancel:{token}"),
+                    InlineKeyboardButton("Enviar", callback_data=f"confirm:{pending.token}"),
+                    InlineKeyboardButton("Editar", callback_data=f"edit:{pending.token}"),
+                    InlineKeyboardButton("Cancelar", callback_data=f"cancel:{pending.token}"),
                 ]
             ]
         )
@@ -938,13 +1926,59 @@ class TelegramBot(TelegramNotifier):
             reply_markup=keyboard,
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
-        self._pending_drafts[token] = _PendingDraft(
-            token=token,
-            draft=draft,
-            message_id=message.message_id,
-            user_id=user_id,
-        )
         return message.message_id
+
+    async def apply_draft_edit(self, draft_id: int, new_draft: DraftReply) -> None:
+        """Coordinator hook: replace the pending draft, bump versions, and
+        RE-RENDER the complete preview (old token invalidated → replay-safe)."""
+        pending = next(
+            (p for p in self._pending_drafts.values() if p.draft_id == draft_id), None
+        )
+        if pending is None:
+            return
+        old_token = pending.token
+        old_message_id = pending.message_id
+        pending.draft = new_draft
+        pending.draft_version += 1
+        pending.token = secrets.token_urlsafe(8)
+        new_message_id = await self._post_draft_preview(pending)
+        pending.message_id = new_message_id
+        pending.preview_version = pending.draft_version
+        # Invalidate the old preview + buttons (replay of old callbacks is a no-op).
+        self._pending_drafts.pop(old_token, None)
+        self._pending_drafts[pending.token] = pending
+        with contextlib.suppress(Exception):
+            await self._ensure_sender().delete_message(
+                self._allowed_chat_id, old_message_id
+            )
+
+    async def wait_for_confirmation(
+        self, draft_id: int, timeout_seconds: float = _CONFIRM_TIMEOUT_SECONDS
+    ) -> bool:
+        """Wait for the user's send/cancel decision on a draft (by draft id).
+
+        The coordinator calls this right after ``send_draft_for_confirmation``
+        and persists the draft only if True. Edits re-render the preview
+        without disturbing the pending future. Returns False on cancel,
+        timeout, or an unknown draft id.
+        """
+        pending = next(
+            (p for p in self._pending_drafts.values() if p.draft_id == draft_id), None
+        )
+        if pending is None:
+            return False
+        if pending.decided is not None:
+            self._pending_drafts.pop(pending.token, None)
+            return pending.decided
+        if pending.future is None:
+            pending.future = asyncio.get_running_loop().create_future()
+        try:
+            result = await asyncio.wait_for(pending.future, timeout=timeout_seconds)
+        except TimeoutError:
+            self._pending_drafts.pop(pending.token, None)
+            return False
+        self._pending_drafts.pop(pending.token, None)
+        return result
 
     async def offer_resend(self, draft_id: int, user_id: int = 0) -> int:
         """Post the controlled-retry button for a failed/uncertain send.
@@ -972,33 +2006,6 @@ class TelegramBot(TelegramNotifier):
         )
         return message.message_id
 
-    async def wait_for_confirmation(
-        self, message_id: int, timeout_seconds: float = _CONFIRM_TIMEOUT_SECONDS
-    ) -> bool:
-        """Wait for the user's confirm/cancel decision on a draft message.
-
-        The coordinator calls this right after ``send_draft_for_confirmation``
-        and persists the draft (``db.Storage.create_draft``) only if True.
-        Returns False on cancel, timeout, or an unknown message_id.
-        """
-        pending = next(
-            (p for p in self._pending_drafts.values() if p.message_id == message_id), None
-        )
-        if pending is None:
-            return False
-        if pending.decided is not None:
-            self._pending_drafts.pop(pending.token, None)
-            return pending.decided
-        if pending.future is None:
-            pending.future = asyncio.get_running_loop().create_future()
-        try:
-            result = await asyncio.wait_for(pending.future, timeout=timeout_seconds)
-        except TimeoutError:
-            self._pending_drafts.pop(pending.token, None)
-            return False
-        self._pending_drafts.pop(pending.token, None)
-        return result
-
     # ── events consumed by the coordinator's responder ─────────────────────
 
     async def reply_requests(self) -> AsyncIterator[ReplyRequest]:
@@ -1008,12 +2015,19 @@ class TelegramBot(TelegramNotifier):
 
     # ── helpers ────────────────────────────────────────────────────────────
 
-    async def _send(self, text: str, *, reply_to: int | None = None) -> int:
+    async def _send(
+        self,
+        text: str,
+        *,
+        reply_to: int | None = None,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> int:
         sender = self._ensure_sender()
         message = await sender.send_message(
             self._allowed_chat_id,
             text,
             link_preview_options=LinkPreviewOptions(is_disabled=True),
             reply_parameters=ReplyParameters(message_id=reply_to) if reply_to is not None else None,
+            reply_markup=reply_markup,
         )
         return message.message_id

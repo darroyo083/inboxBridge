@@ -16,17 +16,21 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .assistant import EmailAssistant
 from .config import Settings, get_settings
+from .contacts import ContactService
 from .db import Storage
 from .gmail.auth import get_credentials
 from .gmail.client import GmailClient
 from .gmail.history import HistoryDelta, HistoryProcessor
 from .gmail.pubsub import PubSubConsumer
 from .gmail.watcher import WatchManager
+from .llm.ai_service import AIService
 from .llm.openai_compat import OpenAICompatLLM
 from .logging_setup import configure_logging
 from .models import PubSubEvent
 from .pipeline import InboundPipeline, RetryScheduler
+from .reminders import ReminderScheduler
 from .responder import ReconciliationSweep, ReplyCoordinator, ReplyWorker
 from .status import build_status_text
 from .telegram.bot import TelegramBot
@@ -45,6 +49,8 @@ class Services:
     history: HistoryProcessor
     llm: OpenAICompatLLM
     bot: TelegramBot
+    ai: AIService
+    assistant: EmailAssistant
 
     @classmethod
     def build(cls) -> Services:
@@ -57,8 +63,16 @@ class Services:
         watcher = WatchManager(settings, service, storage)
         history = HistoryProcessor(settings, service, storage)
         llm = OpenAICompatLLM(settings)
+        ai = AIService(settings)
         bot = TelegramBot(settings, storage, original_fetcher=gmail.fetch_message)
         bot._status_provider = _status_provider_factory(settings, storage)  # private by design
+        contacts = ContactService(storage)
+        from .reminders import ReminderService
+
+        reminders = ReminderService(storage)
+        assistant = EmailAssistant(
+            settings, storage, gmail, ai, bot, contacts, reminders
+        )
         return cls(
             settings=settings,
             storage=storage,
@@ -67,6 +81,8 @@ class Services:
             history=history,
             llm=llm,
             bot=bot,
+            ai=ai,
+            assistant=assistant,
         )
 
     def close(self) -> None:
@@ -130,6 +146,7 @@ class App:
         self._watch_renewer: WatchRenewer | None = None
         self._reply_worker: ReplyWorker | None = None
         self._reconcile_sweep: ReconciliationSweep | None = None
+        self._reminder_scheduler: ReminderScheduler | None = None
 
     async def run(self) -> None:
         services = Services.build()
@@ -181,6 +198,24 @@ class App:
         reconcile_sweep.start()
         self._reconcile_sweep = reconcile_sweep
 
+        # V1.1 wiring: assistant (contacts/reminders/QA/actions) + intent
+        # routing + reminder scheduler. The assistant reuses the coordinator's
+        # verified-delivery pipeline for new drafts (compose/forward/edits).
+        from .intents import IntentClassifier
+
+        assistant: EmailAssistant = services.assistant
+        assistant.set_draft_presenter(reply_coordinator.present_draft)
+        bot = services.bot
+        bot.register_action_callback(assistant.handle)
+        bot.register_assistant(assistant)
+        bot.set_intent_classifier(IntentClassifier(services.ai))
+
+        reminder_scheduler = ReminderScheduler(
+            services.storage, services.bot, interval_seconds=30.0
+        )
+        reminder_scheduler.start()
+        self._reminder_scheduler = reminder_scheduler
+
         await services.bot.start()
 
         # Reconcile drafts left in-flight by a previous process. Never resends:
@@ -206,10 +241,13 @@ class App:
             await self._retry_scheduler.stop()
         if self._watch_renewer is not None:
             await self._watch_renewer.stop()
+        if self._reminder_scheduler is not None:
+            await self._reminder_scheduler.stop()
         services = self._services
         if services is not None:
             await services.bot.stop()
             await services.llm.close()
+            await services.ai.close()
             services.close()
         logger.info("shutdown complete")
 

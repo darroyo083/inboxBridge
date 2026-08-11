@@ -129,10 +129,10 @@ class ReplyCoordinator:
         # Claim freshly-downloaded files into tmp/draft-<id>/ so the whole
         # attachment lifecycle is per-draft (sweepable, resendable).
         draft = self._claim_attachments(draft_id, draft)
-        message_id = await self._bot.send_draft_for_confirmation(
+        await self._bot.send_draft_for_confirmation(
             draft, draft_id=draft_id, user_id=user_id
         )
-        confirmed = await self._bot.wait_for_confirmation(message_id)
+        confirmed = await self._bot.wait_for_confirmation(draft_id)
         if not confirmed:
             logger.info(
                 "draft %d for thread %s not confirmed; discarding",
@@ -592,6 +592,11 @@ class ReplyCoordinator:
         the kill switch is active.
         """
         return await self._gmail.send_reply(draft)
+
+    async def present_draft(self, draft: DraftReply, *, user_id: int = 0) -> None:
+        """V1.1 hook: present ANY draft (reply/compose/forward) through the
+        shared verified-delivery confirmation path."""
+        await self._present_draft(draft, user_id=user_id)
 
 
 class ReconciliationSweep:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from datetime import UTC, datetime
 
 import pytest
@@ -83,11 +82,11 @@ class TestReminderService:
             message_id="m1", thread_id="t1", telegram_user_id=7,
             instruction="recuérdamelo en una hora",
         )
-        rows = service.list(7)
+        rows = service.list_pending(7)
         assert [r["id"] for r in rows] == [created.reminder_id]
         assert rows[0]["thread_id"] == "t1"
         assert service.cancel(created.reminder_id, 7)
-        assert service.list(7) == []
+        assert service.list_pending(7) == []
 
     def test_cancel_scoped_to_owner(self, service: ReminderService) -> None:
         created = service.create(
@@ -95,7 +94,7 @@ class TestReminderService:
             instruction="en dos horas",
         )
         assert not service.cancel(created.reminder_id, 8)  # other user
-        assert service.list(7)  # still pending
+        assert service.list_pending(7)  # still pending
         assert service.cancel(created.reminder_id, 7)
 
     def test_due_and_atomic_claim(self, service: ReminderService) -> None:
@@ -123,7 +122,7 @@ class TestReminderService:
         storage = Storage(str(tmp_path) + "/reminders.db")
         storage.connect()
         restarted = ReminderService(storage, clock=lambda: FIXED_NOW)
-        assert [r["id"] for r in restarted.list(7)] == [created.reminder_id]
+        assert [r["id"] for r in restarted.list_pending(7)] == [created.reminder_id]
 
     def test_never_stores_body(self, service: ReminderService) -> None:
         created = service.create(

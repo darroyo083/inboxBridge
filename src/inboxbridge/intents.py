@@ -346,7 +346,8 @@ def _rule_classify(text: str) -> _RuleResult:
 
 def _llm_classify_messages(text: str, context: str) -> list[dict[str, str]]:
     """Prompt for structured classification when rules do not match."""
-    actions = ", ".join(f'"{a.value}"' for a in IntentAction if a not in (IntentAction.UNKNOWN, IntentAction.CLARIFY))
+    excluded = (IntentAction.UNKNOWN, IntentAction.CLARIFY)
+    actions = ", ".join(f'"{a.value}"' for a in IntentAction if a not in excluded)
     return [
         {
             "role": "system",
@@ -354,7 +355,8 @@ def _llm_classify_messages(text: str, context: str) -> list[dict[str, str]]:
                 "Clasificas la intención del usuario en un asistente de correo "
                 "controlado por Telegram. El usuario escribe en español, informal y "
                 "natural. Devuelve SOLO JSON: "
-                '{"action": "<una de las acciones>", "recipient": "<persona o correo mencionada, si existe>", '
+                '{"action": "<una de las acciones>", '
+                '"recipient": "<persona o correo mencionada, si existe>", '
                 '"instruction": "<la instrucción completa textual del usuario>", '
                 '"needs_clarification": true|false}\n'
                 f"Acciones válidas: {actions}.\n"

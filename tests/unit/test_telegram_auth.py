@@ -254,8 +254,8 @@ async def test_ignores_other_group_even_with_command(make_env: Any) -> None:
 
 async def test_ignores_other_group_callback(make_env: Any) -> None:
     bot, sender, storage = make_env()
-    draft_message_id = await bot.send_draft_for_confirmation(_draft())
-    task = asyncio.create_task(bot.wait_for_confirmation(draft_message_id))
+    await bot.send_draft_for_confirmation(_draft(), user_id=7, draft_id=1)
+    task = asyncio.create_task(bot.wait_for_confirmation(1))
     await asyncio.sleep(0)
     await bot.process_update(_callback_update(-777, "cancel:whatever"))
     await asyncio.sleep(0.02)
@@ -304,7 +304,9 @@ async def test_reply_to_bot_message_without_mapping_has_empty_thread(make_env: A
 
 async def test_reply_to_draft_message_is_ignored(make_env: Any) -> None:
     bot, sender, storage = make_env()
-    draft_message_id = await bot.send_draft_for_confirmation(_draft())
+    draft_message_id = await bot.send_draft_for_confirmation(
+        _draft(), user_id=7, draft_id=1
+    )
     draft_message = _message(draft_message_id, CHAT_ID, "Borrador", BOT_ID, is_bot=True)
     message = _message(99, CHAT_ID, "confirmo por texto", 7, reply_to=draft_message)
     await bot.process_update(_update(message))
@@ -536,42 +538,65 @@ def _button_data(markup: InlineKeyboardMarkup, row: int, col: int) -> str:
     return cast(str, markup.inline_keyboard[row][col].callback_data or "")
 
 
-# ── draft confirmation buttons ────────────────────────────────────────────
+# ── draft confirmation buttons (two-step) ──────────────────────────────────
 
 
-async def test_confirm_button_resolves_draft(make_env: Any) -> None:
+async def test_send_tap_requires_second_confirmation(make_env: Any) -> None:
+    """Button misclick protection: SEND tap shows a confirm dialog; the draft
+    is only resolved after 'Sí, enviar'."""
     bot, sender, storage = make_env()
-    draft_message_id = await bot.send_draft_for_confirmation(_draft(), user_id=7)
+    await bot.send_draft_for_confirmation(_draft(), user_id=7, draft_id=1)
     markup = sender.messages[-1].reply_markup
     assert isinstance(markup, InlineKeyboardMarkup)
     token = _button_data(markup, 0, 0).split(":", 1)[1]
-    task = asyncio.create_task(bot.wait_for_confirmation(draft_message_id))
+    task = asyncio.create_task(bot.wait_for_confirmation(1))
     await asyncio.sleep(0)
-    await bot.process_update(_callback_update(CHAT_ID, f"confirm:{token}"))
+    # First tap: confirmation UI only, NO resolution.
+    await bot.process_update(_callback_update(CHAT_ID, f"confirm:{token}", from_user_id=7))
+    await asyncio.sleep(0.02)
+    assert not task.done()
+    assert any("Seguro" in (m.text or "") for m in sender.messages)
+    # Second tap (the actual confirmation): resolve True.
+    await bot.process_update(_callback_update(CHAT_ID, f"sendyes:{token}", from_user_id=7))
     assert await task is True
-    assert sender.answered[-1] == "Enviando…"
-    assert sender.edited[-1][1] == "Confirmado ✓"
 
 
-async def test_cancel_button_resolves_draft_false(make_env: Any) -> None:
+async def test_send_back_keeps_draft_pending(make_env: Any) -> None:
     bot, sender, storage = make_env()
-    draft_message_id = await bot.send_draft_for_confirmation(_draft(), user_id=7)
+    await bot.send_draft_for_confirmation(_draft(), user_id=7, draft_id=1)
+    markup = sender.messages[-1].reply_markup
+    token = _button_data(markup, 0, 0).split(":", 1)[1]
+    task = asyncio.create_task(bot.wait_for_confirmation(1))
+    await asyncio.sleep(0)
+    await bot.process_update(_callback_update(CHAT_ID, f"confirm:{token}", from_user_id=7))
+    await bot.process_update(_callback_update(CHAT_ID, f"sendback:{token}", from_user_id=7))
+    await asyncio.sleep(0.02)
+    assert not task.done()  # still pending
+    task.cancel()
+
+
+async def test_cancel_tap_requires_second_confirmation(make_env: Any) -> None:
+    bot, sender, storage = make_env()
+    await bot.send_draft_for_confirmation(_draft(), user_id=7, draft_id=1)
     markup = sender.messages[-1].reply_markup
     assert isinstance(markup, InlineKeyboardMarkup)
-    token = _button_data(markup, 0, 1).split(":", 1)[1]
-    task = asyncio.create_task(bot.wait_for_confirmation(draft_message_id))
+    token = _button_data(markup, 0, 2).split(":", 1)[1]
+    task = asyncio.create_task(bot.wait_for_confirmation(1))
     await asyncio.sleep(0)
-    await bot.process_update(_callback_update(CHAT_ID, f"cancel:{token}"))
+    await bot.process_update(_callback_update(CHAT_ID, f"cancel:{token}", from_user_id=7))
+    await asyncio.sleep(0.02)
+    assert not task.done()  # first tap does not cancel
+    await bot.process_update(_callback_update(CHAT_ID, f"cancelyes:{token}", from_user_id=7))
     assert await task is False
 
 
 async def test_ownerless_draft_confirm_is_fail_closed(make_env: Any) -> None:
     """A draft with no recorded owner can never be confirmed (fail closed)."""
     bot, sender, storage = make_env()
-    draft_message_id = await bot.send_draft_for_confirmation(_draft())  # user_id=0
+    await bot.send_draft_for_confirmation(_draft(), draft_id=1)  # user_id=0
     markup = sender.messages[-1].reply_markup
     token = _button_data(markup, 0, 0).split(":", 1)[1]
-    task = asyncio.create_task(bot.wait_for_confirmation(draft_message_id))
+    task = asyncio.create_task(bot.wait_for_confirmation(1))
     await asyncio.sleep(0)
     await bot.process_update(_callback_update(CHAT_ID, f"confirm:{token}"))
     assert "otro miembro" in sender.answered[-1]
@@ -585,15 +610,15 @@ async def test_stale_callback_is_answered_and_ignored(make_env: Any) -> None:
     assert "ya no está disponible" in sender.answered[-1]
 
 
-async def test_wait_for_confirmation_unknown_message_returns_false(make_env: Any) -> None:
+async def test_wait_for_confirmation_unknown_draft_returns_false(make_env: Any) -> None:
     bot, sender, storage = make_env()
     assert await bot.wait_for_confirmation(99999) is False
 
 
 async def test_wait_for_confirmation_timeout(make_env: Any) -> None:
     bot, sender, storage = make_env()
-    draft_message_id = await bot.send_draft_for_confirmation(_draft())
-    assert await bot.wait_for_confirmation(draft_message_id, timeout_seconds=0.05) is False
+    await bot.send_draft_for_confirmation(_draft(), user_id=7, draft_id=1)
+    assert await bot.wait_for_confirmation(1, timeout_seconds=0.05) is False
 
 
 # ── notifier methods ──────────────────────────────────────────────────────
@@ -694,20 +719,20 @@ async def test_send_typing_sends_chat_action(make_env: Any) -> None:
 async def test_send_draft_for_confirmation_posts_buttons(make_env: Any) -> None:
     bot, sender, storage = make_env()
     draft = _draft()
-    message_id = await bot.send_draft_for_confirmation(draft)
+    message_id = await bot.send_draft_for_confirmation(draft, draft_id=1)
     assert message_id == 1
     text = sender.messages[0].text
-    assert "Borrador de respuesta" in text
+    assert "Borrador (Respuesta)" in text  # type labeled; new emails say "Nuevo correo"
     assert "Para: Ana <ana@example.com>" in text
     assert "Re: Proyecto" in text
     assert draft.body in text
     markup = sender.messages[0].reply_markup
     assert isinstance(markup, InlineKeyboardMarkup)
     assert _button_data(markup, 0, 0).startswith("confirm:")
-    assert _button_data(markup, 0, 1).startswith("cancel:")
+    assert _button_data(markup, 0, 1).startswith("edit:")
+    assert _button_data(markup, 0, 2).startswith("cancel:")
     buttons = markup.inline_keyboard[0]
-    assert buttons[0].text == "Enviar"
-    assert buttons[1].text == "Cancelar"
+    assert [b.text for b in buttons] == ["Enviar", "Editar", "Cancelar"]
 
 
 def test_reply_requests_is_async_generator(make_env: Any) -> None:
@@ -777,9 +802,13 @@ async def test_send_summary_has_action_buttons(make_env: Any) -> None:
     markup = sender.edited[-1][2]
     assert isinstance(markup, InlineKeyboardMarkup)
     row = markup.inline_keyboard[0]
-    assert [b.text for b in row] == ["Ver original", "Responder"]
+    assert [b.text for b in row] == ["Ver original", "Preguntar"]
+    row2 = markup.inline_keyboard[1]
+    assert [b.text for b in row2] == ["Responder", "📎 Adjuntos"]
     assert _button_data(markup, 0, 0) == f"view:{message_id}"
-    assert _button_data(markup, 0, 1) == f"reply:{message_id}"
+    assert _button_data(markup, 0, 1) == f"question:{message_id}"
+    assert _button_data(markup, 1, 0) == f"reply:{message_id}"
+    assert _button_data(markup, 1, 1) == f"att:{message_id}"
     # Mapping persisted: tg -> thread, tgm -> gmail message id, tgs -> sender.
     assert storage.get_meta(f"tg:{message_id}") == "t1"
     assert storage.get_meta(f"tgm:{message_id}") == "gm-orig-1"
@@ -930,12 +959,15 @@ async def test_view_callback_unauthorized_chat_ignored(make_env: Any) -> None:
 
 async def test_draft_confirmation_callbacks_still_work_with_view_regex(make_env: Any) -> None:
     bot, sender, storage = make_env()
-    await bot.send_draft_for_confirmation(_draft(), user_id=7)
+    await bot.send_draft_for_confirmation(_draft(), user_id=7, draft_id=1)
     markup = sender.messages[0].reply_markup
     assert isinstance(markup, InlineKeyboardMarkup)
     token = _button_data(markup, 0, 0).split(":", 1)[1]
+    task = asyncio.create_task(bot.wait_for_confirmation(1))
+    await asyncio.sleep(0)
     await bot.process_update(_callback_update(CHAT_ID, f"confirm:{token}"))
-    assert sender.edited[-1][1] == "Confirmado ✓"
+    await bot.process_update(_callback_update(CHAT_ID, f"sendyes:{token}"))
+    assert await task is True
 
 
 # ── "Responder" button ─────────────────────────────────────────────────────
@@ -996,26 +1028,28 @@ async def test_responder_callback_unauthorized_chat_ignored(make_env: Any) -> No
 async def test_responder_draft_owned_by_requesting_user(make_env: Any) -> None:
     """Another member pressing Enviar on someone else's draft is rejected."""
     bot, sender, storage = make_env()
-    await bot.send_draft_for_confirmation(_draft(), user_id=7)
+    await bot.send_draft_for_confirmation(_draft(), user_id=7, draft_id=1)
     markup = sender.messages[0].reply_markup
     assert isinstance(markup, InlineKeyboardMarkup)
     token = _button_data(markup, 0, 0).split(":", 1)[1]
 
-    # User 8 tries to confirm user 7's draft.
+    # User 8 tries to confirm user 7's draft (first tap: confirm dialog).
     update8 = _callback_update(CHAT_ID, f"confirm:{token}", from_user_id=8)
     await bot.process_update(update8)
     assert "otro miembro" in sender.answered[-1]
-    assert sender.edited == []  # draft not confirmed
 
-    # User 7 confirms their own draft.
+    # User 7 proceeds: confirm tap then "Sí, enviar".
     update7 = _callback_update(CHAT_ID, f"confirm:{token}")
     await bot.process_update(update7)
-    assert sender.edited[-1][1] == "Confirmado ✓"
+    task = asyncio.create_task(bot.wait_for_confirmation(1))
+    await asyncio.sleep(0)
+    await bot.process_update(_callback_update(CHAT_ID, f"sendyes:{token}"))
+    assert await task is True
 
 
 async def test_responder_flow_end_to_end_with_kill_switch(make_env: Any) -> None:
     """Full loop contract: button -> intent -> ReplyRequest with thread +
-    instructions + owner; the draft confirmation shows Enviar/Cancelar
+    instructions + owner; the draft confirmation shows Enviar/Editar/Cancelar
     (actual sending is guarded by SEND_EMAILS=false in GmailClient)."""
     bot, sender, storage = make_env()
     summary_id = await bot.send_summary(_view_summary_email(), EmailSummary(subject_es="A"))
@@ -1029,16 +1063,22 @@ async def test_responder_flow_end_to_end_with_kill_switch(make_env: Any) -> None
     assert requests[0].user_instructions == "Dile que confirmo el viernes."
     assert requests[0].user_id == 7
 
-    # Draft confirmation message shows recipients and Enviar/Cancelar buttons
+    # Draft confirmation message shows recipients and Enviar/Editar/Cancelar
     # (responder.py calls send_draft_for_confirmation with the owner user_id).
-    await bot.send_draft_for_confirmation(_draft(), user_id=7)
+    await bot.send_draft_for_confirmation(_draft(), user_id=7, draft_id=1)
     draft_msg = sender.messages[-1]
     assert "Para: Ana <ana@example.com>" in (draft_msg.text or "")
     markup = draft_msg.reply_markup
     assert isinstance(markup, InlineKeyboardMarkup)
-    assert [b.text for b in markup.inline_keyboard[0]] == ["Enviar", "Cancelar"]
-    token = _button_data(markup, 0, 0).split(":", 1)[1]
+    assert [b.text for b in markup.inline_keyboard[0]] == ["Enviar", "Editar", "Cancelar"]
+    token = _button_data(markup, 0, 2).split(":", 1)[1]
+    # Cancel requires the second tap.
+    task = asyncio.create_task(bot.wait_for_confirmation(1))
+    await asyncio.sleep(0)
     await bot.process_update(_callback_update(CHAT_ID, f"cancel:{token}", from_user_id=7))
+    assert not task.done()
+    await bot.process_update(_callback_update(CHAT_ID, f"cancelyes:{token}", from_user_id=7))
+    assert await task is False
     assert "Cancelado." in sender.answered
 
 
@@ -1293,13 +1333,15 @@ async def test_resend_callback_ignored_from_unauthorized_chat(make_env: Any) -> 
 
 async def test_double_confirm_click_resolves_once(make_env: Any) -> None:
     bot, sender, storage = make_env()
-    message_id = await bot.send_draft_for_confirmation(_draft(), user_id=7)
+    await bot.send_draft_for_confirmation(_draft(), user_id=7, draft_id=1)
     markup = sender.messages[-1].reply_markup
     token = _button_data(markup, 0, 0).split(":", 1)[1]
 
-    task = asyncio.create_task(bot.wait_for_confirmation(message_id))
+    task = asyncio.create_task(bot.wait_for_confirmation(1))
     await asyncio.sleep(0)
-    await bot.process_update(_callback_update(CHAT_ID, f"confirm:{token}", from_user_id=7))
-    await bot.process_update(_callback_update(CHAT_ID, f"confirm:{token}", from_user_id=7))
+    # Two "Sí, enviar" taps: the first resolves and pops; the second is
+    # refused as unavailable. Exactly one decision.
+    await bot.process_update(_callback_update(CHAT_ID, f"sendyes:{token}", from_user_id=7))
+    await bot.process_update(_callback_update(CHAT_ID, f"sendyes:{token}", from_user_id=7))
     result = await asyncio.wait_for(task, timeout=2)
     assert result is True  # exactly one decision; no double-send downstream

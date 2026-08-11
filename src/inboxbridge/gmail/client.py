@@ -198,6 +198,50 @@ class GmailClient:
         )
         return str(resp.get("id") or "")
 
+    async def modify_labels(
+        self,
+        message_id: str,
+        *,
+        add_labels: list[str] | None = None,
+        remove_labels: list[str] | None = None,
+    ) -> None:
+        """Deterministic Gmail label mutation (mark read, archive, ...).
+
+        Uses the existing gmail.modify scope — no broader permissions.
+        """
+        await self._run(
+            self._service.users().messages().modify(
+                userId=self._user_id,
+                id=message_id,
+                body={
+                    "addLabelIds": add_labels or [],
+                    "removeLabelIds": remove_labels or [],
+                },
+            )
+        )
+
+    async def fetch_attachment_bytes(
+        self, message_id: str, attachment_index: int
+    ) -> bytes | None:
+        """Return the raw bytes of the N-th attachment of a message.
+
+        Fetches format=raw and re-parses locally (bounded: attachment limits
+        are enforced by the caller). Returns None when unavailable.
+        """
+        resp: dict[str, Any] = await self._run(
+            self._service.users().messages().get(
+                userId=self._user_id, id=message_id, format="raw"
+            )
+        )
+        raw = resp.get("raw")
+        if not raw:
+            return None
+        parsed = parse_rfc822(_b64url_decode(str(raw)))
+        attachments = parsed.attachments
+        if attachment_index < 0 or attachment_index >= len(attachments):
+            return None
+        return attachments[attachment_index].content
+
     async def verify_delivery(
         self,
         draft: DraftReply,

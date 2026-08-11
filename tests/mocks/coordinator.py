@@ -172,13 +172,13 @@ class FakeReplyBot:
         self, draft: DraftReply, *, user_id: int = 0, draft_id: int = 0
     ) -> int:
         self.drafts_shown.append(draft)
-        message_id = self._next_message_id
-        self._next_message_id += 1
-        self.confirmations[message_id] = self.default_confirmation
-        return message_id
+        self.confirmations[draft_id] = self.default_confirmation
+        return draft_id
 
-    async def wait_for_confirmation(self, message_id: int) -> bool:
-        return self.confirmations.get(message_id, False)
+    async def wait_for_confirmation(
+        self, draft_id: int, timeout_seconds: float = 900.0
+    ) -> bool:
+        return self.confirmations.get(draft_id, False)
 
     async def send_notice(self, text: str) -> int:
         self.notices.append(text)

@@ -10,11 +10,14 @@ timestamp, status. Email bodies are NEVER stored. Firing is atomic
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Callable
+from typing import Any
 
 from .db import Storage
 
@@ -41,7 +44,10 @@ _HOURS_RE = re.compile(
     r"en (una?|dos|tres|cuatro|cinco|seis|siete|ocho|diez|doce|\d+) hora(?:s)?",
     re.IGNORECASE,
 )
-_MINUTES_RE = re.compile(r"en (\d+|quince|veinte|treinta|cuarenta|cincuenta) minuto(?:s)?", re.IGNORECASE)
+_MINUTES_RE = re.compile(
+    r"en (\d+|quince|veinte|treinta|cuarenta|cincuenta) minuto(?:s)?",
+    re.IGNORECASE,
+)
 _MEDIA_HORA_RE = re.compile(r"media hora", re.IGNORECASE)
 _DAYS_RE = re.compile(
     r"en (una?|dos|tres|cuatro|cinco|\d+) d[ií]a(?:s)?", re.IGNORECASE
@@ -147,6 +153,66 @@ class ReminderCreate:
     due_at: float
 
 
+class ReminderScheduler:
+    """Periodic loop: fire due reminders once each (atomic claim per tick).
+
+    Restart-safe: pending rows survive restarts and fire late but exactly
+    once; ``claim`` prevents duplicate ticks from overlapping sweeps.
+    """
+
+    def __init__(
+        self,
+        storage: Storage,
+        bot: Any,
+        *,
+        interval_seconds: float = 30.0,
+        service: ReminderService | None = None,
+    ) -> None:
+        self._storage = storage
+        self._bot = bot
+        self._interval = interval_seconds
+        self._service = service or ReminderService(storage)
+        self._task: asyncio.Task[None] | None = None
+
+    async def run(self) -> None:
+        while True:
+            try:
+                await self.tick()
+            except Exception:
+                logger.exception("reminder sweep failed")
+            await asyncio.sleep(self._interval)
+
+    async def tick(self) -> None:
+        for row in self._service.due(limit=20):
+            reminder_id = int(row["id"])
+            if not self._service.claim(reminder_id):
+                continue  # another tick already fired it
+            await self._fire(row)
+
+    async def _fire(self, row: dict[str, Any]) -> None:
+        from .telegram.bot import TelegramBot
+
+        bot: TelegramBot = self._bot
+        note = str(row.get("note") or "")
+        thread_id = str(row.get("thread_id") or "")
+        text = f"⏰ Recordatorio: {note or 'tenías algo pendiente'}"
+        if thread_id:
+            text += f"\n(Hilo: {thread_id})"
+        try:
+            await bot.send_notice(text)
+        except Exception:
+            logger.exception("reminder %s notice failed", row.get("id"))
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self.run(), name="reminder-scheduler")
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+
+
 def _now() -> float:
     return datetime.now(UTC).timestamp()
 
@@ -181,7 +247,7 @@ class ReminderService:
         )
         return ReminderCreate(reminder_id=reminder_id, due_at=due_at)
 
-    def list(self, telegram_user_id: int) -> list[dict[str, Any]]:
+    def list_pending(self, telegram_user_id: int) -> list[dict[str, Any]]:
         return self._storage.list_reminders(telegram_user_id)
 
     def cancel(self, reminder_id: int, telegram_user_id: int) -> bool:

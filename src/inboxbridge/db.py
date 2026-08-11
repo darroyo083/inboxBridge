@@ -308,6 +308,18 @@ class Storage:
         )
         self._conn.commit()
 
+    def set_draft_body(self, draft_id: int, body: str) -> None:
+        """Update the persisted draft body after an edit (retry coherence)."""
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        self._conn.execute(
+            "UPDATE drafts SET body = ?, updated_at = ? WHERE id = ?",
+            (body, now, draft_id),
+        )
+        self._conn.commit()
+
     def set_draft_send_started(self, draft_id: int, started_at_ms: int) -> None:
         """Record when the send attempt began (epoch ms, Gmail internalDate scale)."""
         assert self._conn is not None
