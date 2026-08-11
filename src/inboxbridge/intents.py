@@ -97,7 +97,8 @@ class Intent:
 # ── deterministic rules ──────────────────────────────────────────────────────
 
 _YES_ONLY = re.compile(
-    r"^(ok|oka?y|vale|s[ií]|perfecto|bien|de acuerdo|entendido|listo|d[aá]le|adelante|confirmo|confirmado)[\s.!?]*$",
+    r"^(ok|oka?y|vale|s[ií]|perfecto|bien|de acuerdo|entendido|listo|"
+    r"d[aá]le|adelante|confirmo|confirmado)[\s.!?]*$",
     re.IGNORECASE,
 )
 
@@ -142,7 +143,8 @@ _ATTACHMENT = re.compile(
     r"ens[eé][nñ]ame los adjuntos|m[aá]ndame el adjunto|"
     r"(p[aá]same|dame|quiero) el (pdf|adjunto)|dime qu[eé] adjuntos tiene)\b",
     re.IGNORECASE,
-)_MARK_READ = re.compile(
+)
+_MARK_READ = re.compile(
     r"\b(m[aá]rcalo como le[ií]do|m[aá]rcalo le[ií]do|m[aá]rcame como le[ií]do|"
     r"marca como le[ií]do|m[aá]rcarlo como le[ií]do)\b",
     re.IGNORECASE,
@@ -331,7 +333,9 @@ def _rule_classify(text: str) -> _RuleResult:
     if _REGENERATE.search(stripped):
         return _RuleResult(IntentAction.REGENERATE_DRAFT, explicit=False)
     if _EDIT.search(stripped):
-        return _RuleResult(IntentAction.MODIFY_DRAFT, explicit=False, payload={"instruction": stripped})
+        return _RuleResult(
+            IntentAction.MODIFY_DRAFT, explicit=False, payload={"instruction": stripped}
+        )
     if _HELP.match(stripped):
         return _RuleResult(IntentAction.HELP, explicit=False)
     return _RuleResult(None)
