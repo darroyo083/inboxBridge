@@ -149,7 +149,10 @@ class TestLlmFallback:
         assert not intent.explicit
 
     def test_llm_unknown_action_rejected(self) -> None:
-        ai = FakeAi('{"action": "send_all_emails_now", "instruction": "x", "needs_clarification": false}')
+        ai = FakeAi(
+            '{"action": "send_all_emails_now", "instruction": "x", '
+            '"needs_clarification": false}'
+        )
         intent = run(IntentClassifier(ai).classify("haz algo", context=""))
         assert intent.action == IntentAction.UNKNOWN
 
@@ -169,7 +172,10 @@ class TestLlmFallback:
         assert intent.action == IntentAction.UNKNOWN
 
     def test_ambiguous_llm_result_becomes_clarify(self) -> None:
-        ai = FakeAi('{"action": "reply_to_email", "recipient": "", "instruction": "dile que sí", "needs_clarification": true}')
+        ai = FakeAi(
+            '{"action": "reply_to_email", "recipient": "", "instruction": '
+            '"dile que sí", "needs_clarification": true}'
+        )
         intent = run(IntentClassifier(ai).classify("dile que sí", context=""))
         assert intent.action == IntentAction.CLARIFY
 
