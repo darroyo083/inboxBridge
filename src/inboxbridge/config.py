@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr = Field(default=SecretStr(""), alias="TELEGRAM_BOT_TOKEN")
     telegram_allowed_chat_id: int = Field(default=0, alias="TELEGRAM_ALLOWED_CHAT_ID")
 
-    # LLM (OpenAI-compatible)
+    # LLM (OpenAI-compatible) — text
     llm_base_url: str = Field(default="", alias="LLM_BASE_URL")
     llm_api_key: SecretStr = Field(default=SecretStr(""), alias="LLM_API_KEY")
     llm_model: str = "deepseek-v4-flash"
@@ -31,6 +31,23 @@ class Settings(BaseSettings):
     llm_max_tokens_draft: int = 1000
     llm_temperature: float = 0.4
     llm_max_retries: int = 3
+
+    # AI routing (V1.1): text vs vision vs audio, configuration-driven.
+    # Model IDs come from the environment; business logic never hardcodes them.
+    ai_text_model: str = Field(default="", alias="AI_TEXT_MODEL")
+    ai_vision_model: str = Field(default="", alias="AI_VISION_MODEL")
+    ai_vision_fallback_model: str = Field(default="", alias="AI_VISION_FALLBACK_MODEL")
+    ai_audio_enabled: bool = Field(default=False, alias="AI_AUDIO_ENABLED")
+    #: Bounded scanned-PDF analysis: max pages rendered and max pixel dimension.
+    ai_vision_max_pages: int = 5
+    ai_vision_max_dimension: int = 2000
+    #: Bounded audio: max seconds and max bytes for experimental voice notes.
+    ai_audio_max_seconds: int = 120
+    ai_audio_max_bytes: int = 8 * 1024 * 1024
+
+    @property
+    def effective_text_model(self) -> str:
+        return self.ai_text_model or self.llm_model
 
     # Gmail / Google
     google_client_secret_file: str = "credentials/client_secret.json"

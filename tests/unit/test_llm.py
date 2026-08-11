@@ -29,6 +29,7 @@ def _settings(monkeypatch: pytest.MonkeyPatch, **overrides: object) -> Settings:
         "LLM_API_KEY": "test-key",
         "LLM_BASE_URL": "https://api.test/v1",
         "LLM_MODEL": "test-model",
+        "AI_TEXT_MODEL": "test-model",
         "LLM_MAX_RETRIES": "1",
         "TELEGRAM_BOT_TOKEN": "test-token",
     }

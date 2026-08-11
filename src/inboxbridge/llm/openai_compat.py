@@ -11,6 +11,7 @@ original subject) — the inbound pipeline never fails because of it.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -36,7 +37,14 @@ from openai.types.chat import ChatCompletionMessageParam
 from ..config import Settings, get_settings
 from ..models import DraftReply, DraftRequest, EmailSummary, ParsedEmail, ThreadContext
 from . import prompts
-from .base import LLMEmptyResponse, LLMError, LLMRateLimited, LLMUnavailable, call_with_retry
+from .base import (
+    LLMEmptyResponse,
+    LLMError,
+    LLMRateLimited,
+    LLMUnavailable,
+    LLMUnsupportedModality,
+    call_with_retry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +61,11 @@ _PERMANENT = (
     PermissionDeniedError,
     NotFoundError,
     ConflictError,
-    UnprocessableEntityError,
-    BadRequestError,
     APIResponseValidationError,
 )
+
+#: Provider-side audio container extensions by mime subtype (experimental).
+_AUDIO_EXT = {"ogg": "ogg", "mp3": "mp3", "mpeg": "mp3", "wav": "wav", "webm": "webm", "m4a": "m4a"}
 
 
 class OpenAICompatLLM:
@@ -65,13 +74,18 @@ class OpenAICompatLLM:
     The SDK's built-in retries are disabled (``max_retries=0``) because
     retries are handled by :func:`call_with_retry` with jitter — otherwise
     transient errors would be retried twice.
+
+    A single instance talks to ONE model (``model`` overrides the configured
+    text model); the :class:`AIService` facade owns routing between text /
+    vision / audio models.
     """
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(self, settings: Settings | None = None, *, model: str | None = None) -> None:
         self._settings = settings or get_settings()
         api_key = self._settings.llm_api_key.get_secret_value()
         if not api_key:
             raise ValueError("LLM_API_KEY is not configured")
+        self._model = model or self._settings.effective_text_model
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=self._settings.llm_base_url or None,
@@ -112,9 +126,15 @@ class OpenAICompatLLM:
         )
 
     async def _complete(self, messages: list[ChatCompletionMessageParam], max_tokens: int) -> str:
+        return await self.complete(messages, max_tokens=max_tokens)
+
+    async def complete(
+        self, messages: list[ChatCompletionMessageParam], *, max_tokens: int
+    ) -> str:
+        """One chat completion against THIS instance's model."""
         try:
             response = await self._client.chat.completions.create(
-                model=self._settings.llm_model,
+                model=self._model,
                 messages=messages,
                 temperature=self._settings.llm_temperature,
                 max_tokens=max_tokens,
@@ -123,6 +143,10 @@ class OpenAICompatLLM:
             if isinstance(exc, RateLimitError):
                 raise LLMRateLimited(f"LLM rate limited: {exc}") from exc
             raise LLMUnavailable(f"LLM unavailable: {exc}") from exc
+        except (BadRequestError, UnprocessableEntityError) as exc:
+            # Modality/format rejection (e.g. vision model refusing an image):
+            # a technical, potentially fallback-worthy failure.
+            raise LLMUnsupportedModality(f"LLM rejected the request: {exc}") from exc
         except _PERMANENT as exc:
             raise LLMError(f"LLM request rejected: {exc}") from exc
         except APIError as exc:
@@ -130,6 +154,54 @@ class OpenAICompatLLM:
         if not response.choices or not response.choices[0].message.content:
             raise LLMEmptyResponse("LLM returned an empty response")
         return response.choices[0].message.content.strip()
+
+    async def complete_vision(
+        self,
+        prompt: str,
+        images: list[tuple[str, bytes]],
+        *,
+        max_tokens: int,
+    ) -> str:
+        """Chat completion with inline images (data URLs) against THIS model.
+
+        ``images`` is a list of (mime_type, bytes); mime must be an
+        image/* type the provider can inline.
+        """
+        content: list[dict[str, object]] = [{"type": "text", "text": prompt}]
+        for mime, data in images:
+            encoded = base64.b64encode(data).decode("ascii")
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{encoded}"},
+                }
+            )
+        messages: list[ChatCompletionMessageParam] = [
+            {"role": "user", "content": content}  # type: ignore[list-item, misc]
+        ]
+        return await self.complete(messages, max_tokens=max_tokens)
+
+    async def transcribe_audio(self, mime: str, data: bytes) -> str:
+        """Experimental: transcribe audio via the provider's transcriptions API.
+
+        Raises :class:`LLMError` on any failure (the caller falls back to
+        asking the user to type). Uses the configured audio-capable model id;
+        the feature is gated by ``ai_audio_enabled`` at the router level.
+        """
+        import io
+
+        try:
+            ext = _AUDIO_EXT.get(mime.split("/")[-1].lower(), "ogg")
+            response = await self._client.audio.transcriptions.create(
+                model=self._model,
+                file=("voice." + ext, io.BytesIO(data), mime),
+            )
+        except Exception as exc:
+            raise LLMError(f"audio transcription failed: {type(exc).__name__}") from exc
+        text = getattr(response, "text", "")
+        if not text or not text.strip():
+            raise LLMEmptyResponse("audio transcription returned empty text")
+        return text.strip()
 
     async def close(self) -> None:
         await self._client.close()

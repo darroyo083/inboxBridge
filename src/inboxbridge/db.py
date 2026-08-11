@@ -90,6 +90,38 @@ class Storage:
                 UNIQUE(telegram_user_id, key)
             );
             CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(telegram_user_id);
+
+            CREATE TABLE IF NOT EXISTS contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                display_name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_contacts_email ON contacts(email);
+
+            CREATE TABLE IF NOT EXISTS contact_aliases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+                alias TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(alias)
+            );
+            CREATE INDEX IF NOT EXISTS idx_contact_aliases_alias ON contact_aliases(alias);
+
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id TEXT NOT NULL DEFAULT '',
+                thread_id TEXT NOT NULL DEFAULT '',
+                telegram_user_id INTEGER NOT NULL DEFAULT 0,
+                due_at REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                note TEXT NOT NULL DEFAULT '',
+                telegram_message_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(status, due_at);
             """
         )
         self._conn.commit()
@@ -411,3 +443,215 @@ class Storage:
     def _escape_like(text: str) -> str:
         """Escape LIKE wildcards so user queries match literally."""
         return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    # ── contacts + aliases (explicit user-configured application data) ──────
+    def create_contact(self, display_name: str, email: str) -> int:
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        cur = self._conn.execute(
+            "INSERT INTO contacts(display_name, email, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?)",
+            (display_name, email, now, now),
+        )
+        self._conn.commit()
+        lastrowid = cur.lastrowid
+        if lastrowid is None:
+            raise RuntimeError("SQLite did not return a row id for the contact insert")
+        return int(lastrowid)
+
+    def get_contact(self, contact_id: int) -> dict[str, Any] | None:
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT * FROM contacts WHERE id = ?", (contact_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def find_contact_by_email(self, email: str) -> dict[str, Any] | None:
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT * FROM contacts WHERE email = ? COLLATE NOCASE LIMIT 1", (email,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def find_contacts_by_email(self, email: str) -> list[dict[str, Any]]:
+        """All contacts using this address (shared mailboxes are supported)."""
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT * FROM contacts WHERE email = ? COLLATE NOCASE ORDER BY id",
+            (email,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_contact_email(self, contact_id: int, email: str) -> None:
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        self._conn.execute(
+            "UPDATE contacts SET email = ?, updated_at = ? WHERE id = ?",
+            (email, now, contact_id),
+        )
+        self._conn.commit()
+
+    def rename_contact(self, contact_id: int, display_name: str) -> None:
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        self._conn.execute(
+            "UPDATE contacts SET display_name = ?, updated_at = ? WHERE id = ?",
+            (display_name, now, contact_id),
+        )
+        self._conn.commit()
+
+    def delete_contact(self, contact_id: int) -> None:
+        """Delete a contact; aliases cascade (foreign_keys=ON)."""
+        assert self._conn is not None
+        self._conn.execute("DELETE FROM contacts WHERE id = ?", (contact_id,))
+        self._conn.commit()
+
+    def list_contacts(self) -> list[dict[str, Any]]:
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT * FROM contacts ORDER BY display_name COLLATE NOCASE"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_alias(self, contact_id: int, alias: str) -> bool:
+        """Create an alias; returns False on normalized-alias collision."""
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        try:
+            self._conn.execute(
+                "INSERT INTO contact_aliases(contact_id, alias, created_at) "
+                "VALUES(?, ?, ?)",
+                (contact_id, alias, now),
+            )
+            self._conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def remove_alias(self, alias: str) -> int:
+        assert self._conn is not None
+        cur = self._conn.execute("DELETE FROM contact_aliases WHERE alias = ?", (alias,))
+        self._conn.commit()
+        return cur.rowcount
+
+    def remove_alias_by_id(self, alias_id: int) -> int:
+        assert self._conn is not None
+        cur = self._conn.execute(
+            "DELETE FROM contact_aliases WHERE id = ?", (alias_id,)
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def find_alias(self, alias: str) -> dict[str, Any] | None:
+        """Alias row with its contact joined (for resolution)."""
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT a.id AS alias_id, a.alias, c.id AS contact_id, "
+            "c.display_name, c.email "
+            "FROM contact_aliases a JOIN contacts c ON c.id = a.contact_id "
+            "WHERE a.alias = ?",
+            (alias,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_aliases(self, contact_id: int) -> list[dict[str, Any]]:
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT id, alias FROM contact_aliases WHERE contact_id = ? ORDER BY alias",
+            (contact_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── reminders (minimal workflow metadata, never email bodies) ───────────
+    def create_reminder(
+        self,
+        *,
+        message_id: str,
+        thread_id: str,
+        telegram_user_id: int,
+        due_at: float,
+        note: str = "",
+    ) -> int:
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        cur = self._conn.execute(
+            "INSERT INTO reminders(message_id, thread_id, telegram_user_id, due_at, "
+            "status, note, created_at, updated_at) VALUES(?, ?, ?, ?, 'pending', ?, ?, ?)",
+            (message_id, thread_id, telegram_user_id, due_at, note, now, now),
+        )
+        self._conn.commit()
+        lastrowid = cur.lastrowid
+        if lastrowid is None:
+            raise RuntimeError("SQLite did not return a row id for the reminder insert")
+        return int(lastrowid)
+
+    def get_reminder(self, reminder_id: int) -> dict[str, Any] | None:
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT * FROM reminders WHERE id = ?", (reminder_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def due_reminders(self, before_ts: float, limit: int = 50) -> list[dict[str, Any]]:
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT * FROM reminders WHERE status = 'pending' AND due_at <= ? "
+            "ORDER BY due_at LIMIT ?",
+            (before_ts, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_reminders(
+        self, telegram_user_id: int | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        assert self._conn is not None
+        if telegram_user_id is None:
+            rows = self._conn.execute(
+                "SELECT * FROM reminders WHERE status = 'pending' "
+                "ORDER BY due_at LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM reminders WHERE status = 'pending' "
+                "AND telegram_user_id = ? ORDER BY due_at LIMIT ?",
+                (telegram_user_id, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def claim_reminder(self, reminder_id: int) -> bool:
+        """Atomically mark a reminder fired (prevents duplicate ticks)."""
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        cur = self._conn.execute(
+            "UPDATE reminders SET status = 'fired', updated_at = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (now, reminder_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def cancel_reminder(self, reminder_id: int, telegram_user_id: int) -> bool:
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        cur = self._conn.execute(
+            "UPDATE reminders SET status = 'cancelled', updated_at = ? "
+            "WHERE id = ? AND telegram_user_id = ? AND status = 'pending'",
+            (now, reminder_id, telegram_user_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0

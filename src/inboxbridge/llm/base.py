@@ -46,6 +46,11 @@ class LLMEmptyResponse(LLMInvalidResponse):
     """
 
 
+class LLMUnsupportedModality(LLMError):
+    """Provider rejected the request on technical grounds (unsupported
+    modality, bad format). Fallback-worthy: a different model may accept it."""
+
+
 def _default_retryable(exc: BaseException) -> bool:
     return isinstance(exc, LLMRateLimited | LLMUnavailable | LLMEmptyResponse)
 
