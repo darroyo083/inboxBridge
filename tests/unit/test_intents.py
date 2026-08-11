@@ -5,8 +5,6 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-import pytest
-
 from inboxbridge.intents import Intent, IntentAction, IntentClassifier
 
 
@@ -62,12 +60,29 @@ class TestRuleBasics:
     def test_contacts(self) -> None:
         assert classify_rule("¿qué contactos tengo?").action == IntentAction.LIST_CONTACTS
         assert classify_rule("muéstrame mis contactos").action == IntentAction.LIST_CONTACTS
-        assert classify_rule("cuando diga roman usa femo@femo.ch").action == IntentAction.CREATE_CONTACT
-        assert classify_rule("guarda a Manuela como manuela@example.ch").action == IntentAction.CREATE_CONTACT
-        assert classify_rule("cambia el correo de roman a x@y.ch").action == IntentAction.UPDATE_CONTACT
-        assert classify_rule("borra el contacto roman").action == IntentAction.DELETE_CONTACT
-        assert classify_rule("añade 'mi jefe' como alias de roman").action == IntentAction.ADD_ALIAS
-        assert classify_rule("quita el alias 'mi jefe' de roman").action == IntentAction.REMOVE_ALIAS
+        assert (
+            classify_rule("cuando diga roman usa femo@femo.ch").action
+            == IntentAction.CREATE_CONTACT
+        )
+        assert (
+            classify_rule("guarda a Manuela como manuela@example.ch").action
+            == IntentAction.CREATE_CONTACT
+        )
+        assert (
+            classify_rule("cambia el correo de roman a x@y.ch").action
+            == IntentAction.UPDATE_CONTACT
+        )
+        assert (
+            classify_rule("borra el contacto roman").action == IntentAction.DELETE_CONTACT
+        )
+        assert (
+            classify_rule("añade 'mi jefe' como alias de roman").action
+            == IntentAction.ADD_ALIAS
+        )
+        assert (
+            classify_rule("quita el alias 'mi jefe' de roman").action
+            == IntentAction.REMOVE_ALIAS
+        )
 
     def test_compose_and_forward(self) -> None:
         intent = classify_rule("escribe a Roman y dile que mañana llego a las seis")
@@ -106,8 +121,13 @@ def run(coro: Any) -> Any:
 
 class TestLlmFallback:
     def test_llm_classification_is_validated(self) -> None:
-        ai = FakeAi('{"action": "summarize_thread", "recipient": "", "instruction": "resume el hilo", "needs_clarification": false}')
-        intent = run(IntentClassifier(ai).classify("resume el hilo", context="resumen de correo"))
+        ai = FakeAi(
+            '{"action": "summarize_thread", "recipient": "", "instruction": '
+            '"resume el hilo", "needs_clarification": false}'
+        )
+        intent = run(
+            IntentClassifier(ai).classify("resume el hilo", context="resumen de correo")
+        )
         assert intent.action == IntentAction.SUMMARIZE_THREAD
         assert not intent.explicit  # LLM can never be explicit
 
@@ -116,8 +136,15 @@ class TestLlmFallback:
         # so the LLM classifies it. The LLM vocabulary EXCLUDES send/cancel
         # entirely: even if the model returns "send_draft", the result is
         # rejected (UNKNOWN) — the model can never authorize a send.
-        ai = FakeAi('{"action": "send_draft", "recipient": "", "instruction": "procede con el envío", "needs_clarification": false}')
-        intent = run(IntentClassifier(ai).classify("procede con el envío", context="borrador activo"))
+        ai = FakeAi(
+            '{"action": "send_draft", "recipient": "", "instruction": '
+            '"procede con el envío", "needs_clarification": false}'
+        )
+        intent = run(
+            IntentClassifier(ai).classify(
+                "procede con el envío", context="borrador activo"
+            )
+        )
         assert intent.action == IntentAction.UNKNOWN
         assert not intent.explicit
 
