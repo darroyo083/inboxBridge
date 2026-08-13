@@ -230,6 +230,38 @@ class TestSendReply:
         assert mime["To"] == "Alice <alice@example.com>"
         assert mime.get("Cc") is None
 
+    async def test_new_email_keeps_subject_without_re_prefix(self) -> None:
+        """A threadless draft (compose/forward) must NOT get a 'Re:' prefix."""
+        routes: dict[Route, object] = {
+            ("users", "messages", "send"): {"id": "m3"},
+        }
+        client = GmailClient(make_settings(), service=FakeGmailService(routes))
+        draft = DraftReply(
+            thread_id="", subject="Presupuesto", to=[EmailAddress("R", "r@b.c")], cc=[], body="ok"
+        )
+        await client.send_reply(draft)
+        mime = send_call_mime(client)
+        assert mime["Subject"] == "Presupuesto"
+        assert mime.get("In-Reply-To") is None
+        send_call = next(c for c in client._service.calls if c[0] == ("users", "messages", "send"))
+        assert "threadId" not in send_call[1]["body"]
+
+    async def test_forward_keeps_fwd_prefix(self) -> None:
+        routes: dict[Route, object] = {
+            ("users", "messages", "send"): {"id": "m3"},
+        }
+        client = GmailClient(make_settings(), service=FakeGmailService(routes))
+        draft = DraftReply(
+            thread_id="",
+            subject="Fwd: Presupuesto",
+            to=[EmailAddress("R", "r@b.c")],
+            cc=[],
+            body="ok",
+        )
+        await client.send_reply(draft)
+        mime = send_call_mime(client)
+        assert mime["Subject"] == "Fwd: Presupuesto"
+
     async def test_subject_gets_re_prefix(self) -> None:
         routes: dict[Route, object] = {
             ("users", "threads", "get"): thread_response(

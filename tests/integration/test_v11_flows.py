@@ -543,6 +543,39 @@ async def test_flow_k_attachment_delivery(stack: Stack, tmp_path: Path) -> None:
     assert leftovers == []
 
 
+async def test_flow_k2_docx_attachment_delivery(stack: Stack, tmp_path: Path) -> None:
+    """DOCX attachments (OpenXML mime) are deliverable to Telegram, not rejected
+    as unsupported — matching the documented attachment types."""
+    from dataclasses import replace
+
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    docx_email = replace(
+        make_email(message_id="m1", subject="Informe DOCX"),
+        attachments=[
+            AttachmentMeta(
+                filename="informe.docx",
+                mime_type=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+                size_bytes=1024,
+                extracted_text="",
+            )
+        ],
+    )
+    stack.gmail.messages["m1"] = docx_email
+    stack.gmail.attachment_bytes[("m1", 0)] = b"PK\x03\x04 fake docx content"
+    summary_id = await stack.bot.send_summary(docx_email, EmailSummary(subject_es="Asunto"))
+    await stack.assistant.handle(
+        "get_attachment", {"tg_message_id": summary_id, "index": 0, "user_id": 7}
+    )
+    await asyncio.sleep(0.05)
+    assert stack.sender.files_delivered
+    filename, data = stack.sender.files_delivered[-1]
+    assert filename == "informe.docx"
+    assert data == b"PK\x03\x04 fake docx content"
+
+
 # ── M. VISION FALLBACK (real AIService boundary) ─────────────────────────────
 
 

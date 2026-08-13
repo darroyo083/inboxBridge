@@ -194,10 +194,6 @@ class App:
         reply_worker.start()
         self._reply_worker = reply_worker
 
-        reconcile_sweep = ReconciliationSweep(reply_coordinator)
-        reconcile_sweep.start()
-        self._reconcile_sweep = reconcile_sweep
-
         # V1.1 wiring: assistant (contacts/reminders/QA/actions) + intent
         # routing + reminder scheduler. The assistant reuses the coordinator's
         # verified-delivery pipeline for new drafts (compose/forward/edits).
@@ -218,9 +214,16 @@ class App:
 
         await services.bot.start()
 
-        # Reconcile drafts left in-flight by a previous process. Never resends:
-        # verifies against Gmail and resolves sent_unverified/sending states.
+        # Reconcile drafts left in-flight by a previous process FIRST. Never
+        # resends: verifies against Gmail and resolves sent_unverified/sending
+        # states. The periodic sweep (which may terminal-ify exhausted drafts
+        # via the watchdog) starts only AFTER this, so a draft that actually
+        # reached Gmail is verified rather than reported as unverifiable.
         await reply_coordinator.reconcile_on_startup()
+
+        reconcile_sweep = ReconciliationSweep(reply_coordinator)
+        reconcile_sweep.start()
+        self._reconcile_sweep = reconcile_sweep
 
         logger.info("InboxBridge started (SEND_EMAILS=%s)", services.settings.send_emails)
         try:

@@ -242,6 +242,10 @@ class ReplyCoordinator:
                 expected_message_id=expected_message_id,
                 since_ms=started_ms,
             )
+            logger.info(
+                "reconcile draft=%d attempt=%d/%d outcome=%s",
+                draft_id, attempts, max_attempts, result.category,
+            )
             if result.verified:
                 self._storage.set_draft_sent_message(
                     draft_id, result.message_id or expected_message_id
@@ -358,17 +362,56 @@ class ReplyCoordinator:
             await self._reconcile_row(row, draft, startup=True)
 
     async def sweep_unverified(self) -> None:
-        """Periodic: re-verify drafts stuck in sent_unverified (bounded)."""
+        """Periodic: re-verify drafts stuck in sent_unverified (bounded).
+
+        Drafts whose reconciliation budget is exhausted are handed to the
+        watchdog, which surfaces a definitive one-shot "could not verify"
+        outcome (never a resend).
+        """
         for row in self._storage.drafts_in_statuses([DraftStatus.SENT_UNVERIFIED]):
             draft_id = int(row["id"])
             if draft_id in self._active_reconciles:
                 continue  # a send/verify flow already owns this draft
             attempts = int(row["verification_attempts"])
             if attempts >= self._settings.send_verification_max_attempts:
+                await self._notify_exhausted(row)
                 continue
             draft = self._draft_from_row(row)
             await self._reconcile_row(row, draft, startup=False)
         self.cleanup_orphan_tmp()
+
+    async def _notify_exhausted(self, row: dict[str, Any]) -> None:
+        """Definitive, one-shot 'could not verify' for an exhausted draft.
+
+        The draft has used up its reconciliation budget while still
+        inconclusive (Gmail could not be queried within it). The watchdog NEVER
+        resends: it transitions ``sent_unverified → verification_failed`` and
+        posts a single explanatory notice. The atomic status transition makes
+        the notice one-shot across sweeps and restarts (a second pass sees the
+        draft is no longer ``sent_unverified``).
+        """
+        draft_id = int(row["id"])
+        attempts = int(row["verification_attempts"] or 0)
+        async with self._lock_for(draft_id):
+            current = self._storage.get_draft(draft_id)
+            if current is None or current["status"] != DraftStatus.SENT_UNVERIFIED.value:
+                return  # already resolved by another flow
+            attempts = int(current["verification_attempts"] or 0)
+            if attempts < self._settings.send_verification_max_attempts:
+                return  # resolved below the threshold in the meantime
+            self._storage.set_draft_status(draft_id, DraftStatus.VERIFICATION_FAILED)
+        subject = str(row.get("subject") or "")
+        subject_hint = f" (asunto «{subject[:60]}»)" if subject else ""
+        await self._bot.send_notice(
+            "No pude confirmar si Gmail aceptó este envío"
+            f"{subject_hint} y ya agoté las comprobaciones automáticas. "
+            "No lo he reenviado para evitar duplicados. Revisa Gmail directamente: "
+            "si el correo no llegó a salir, escríbelo de nuevo."
+        )
+        logger.info(
+            "watchdog exhausted draft=%d status=verification_failed attempts=%d",
+            draft_id, attempts,
+        )
 
     async def _reconcile_row(
         self, row: dict[str, Any], draft: DraftReply, *, startup: bool
@@ -410,6 +453,10 @@ class ReplyCoordinator:
                     await self._bot.offer_resend(
                         draft_id, user_id=int(row["telegram_user_id"] or 0)
                     )
+                logger.info(
+                    "reconcile sweep draft=%d startup=%s outcome=%s",
+                    draft_id, startup, result.category,
+                )
         finally:
             self._active_reconciles.discard(draft_id)
 
@@ -508,6 +555,7 @@ class ReplyCoordinator:
             if status in (
                 DraftStatus.SENT_VERIFIED.value,
                 DraftStatus.SEND_FAILED.value,
+                DraftStatus.VERIFICATION_FAILED.value,
                 DraftStatus.CANCELLED.value,
                 DraftStatus.REJECTED.value,
             ):

@@ -34,6 +34,9 @@ class DraftStatus(StrEnum):
       expected thread with the expected recipients/attachments.
     - ``SEND_FAILED``: a definitive failure; safe to report and offer a
       controlled retry.
+    - ``VERIFICATION_FAILED``: reconciliation was exhausted while still
+      inconclusive (Gmail could not be queried within budget) — the outcome is
+      unknown; never resend automatically.
     """
 
     PENDING = "pending"
@@ -42,6 +45,7 @@ class DraftStatus(StrEnum):
     SENT_UNVERIFIED = "sent_unverified"
     SENT_VERIFIED = "sent_verified"
     SEND_FAILED = "send_failed"
+    VERIFICATION_FAILED = "verification_failed"
     CANCELLED = "cancelled"
     REJECTED = "rejected"
 
@@ -152,6 +156,21 @@ class SendVerification:
             and self.attachments_match
             and self.subject_match
         )
+
+    @property
+    def category(self) -> str:
+        """Operational outcome category (for logs/observability, never control flow).
+
+        One of: ``verified``, ``inconclusive`` (Gmail unreachable), ``partial_match``
+        (found but not fully matching), ``not_found`` (Gmail queried, message absent).
+        """
+        if self.verified:
+            return "verified"
+        if not self.checked_ok:
+            return "inconclusive"
+        if self.found:
+            return "partial_match"
+        return "not_found"
 
 
 @dataclass(frozen=True)

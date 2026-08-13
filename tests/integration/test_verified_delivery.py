@@ -343,7 +343,9 @@ class TestRestartRecovery:
         assert storage.get_draft(draft_id)["status"] == DraftStatus.SENT_VERIFIED.value
         assert gmail.sent == []
 
-    def test_sweep_respects_attempt_cap(self, tmp_path: Path) -> None:
+    def test_sweep_exhausted_draft_watchdog_marks_terminal_without_resend(
+        self, tmp_path: Path
+    ) -> None:
         gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
         storage = make_storage(tmp_path)
         draft = DraftReply(
@@ -362,8 +364,135 @@ class TestRestartRecovery:
             make_settings(tmp_dir=str(tmp_path / "tmp")), gmail, MockLLM(), bot, storage
         )
         asyncio.run(coordinator.sweep_unverified())
+        assert storage.get_draft(draft_id)["status"] == DraftStatus.VERIFICATION_FAILED.value
+        assert gmail.sent == []  # never resent
+        assert any("duplicados" in n for n in bot.notices)  # one definitive notice
+
+
+class TestWatchdog:
+    """sent_unverified watchdog: exhaustion → definitive one-shot 'could not
+    verify', never a resend."""
+
+    @staticmethod
+    def _draft() -> DraftReply:
+        return DraftReply(
+            thread_id="t1",
+            subject="Re: Projektbericht",
+            to=[EmailAddress("Anna Muster", "anna@example.com")],
+            cc=[],
+            body="Danke!",
+        )
+
+    @staticmethod
+    def _seed(
+        storage: Storage,
+        *,
+        attempts: int,
+        started: bool = True,
+        user_id: int = 7,
+    ) -> int:
+        draft_id = storage.create_draft("t1", None, TestWatchdog._draft(), telegram_user_id=user_id)
+        storage.set_draft_status(draft_id, DraftStatus.SENT_UNVERIFIED)
+        if started:
+            storage.set_draft_send_started(draft_id, int(time.time() * 1000))
+        for _ in range(attempts):
+            storage.bump_verification_attempts(draft_id)
+        return draft_id
+
+    @staticmethod
+    def _coordinator(
+        tmp_path: Path, gmail: FakeGmail, bot: FakeReplyBot, storage: Storage
+    ) -> ReplyCoordinator:
+        return ReplyCoordinator(
+            make_settings(
+                tmp_dir=str(tmp_path / "tmp"), send_verification_max_attempts=3
+            ),
+            gmail,
+            MockLLM(),
+            bot,
+            storage,
+        )
+
+    def test_below_threshold_is_not_terminal(self, tmp_path: Path) -> None:
+        gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
+        gmail.verify_error = True  # inconclusive → stays sent_unverified
+        storage = make_storage(tmp_path)
+        draft_id = self._seed(storage, attempts=0)
+        bot = FakeReplyBot()
+        coordinator = self._coordinator(tmp_path, gmail, bot, storage)
+        asyncio.run(coordinator.sweep_unverified())
         assert storage.get_draft(draft_id)["status"] == DraftStatus.SENT_UNVERIFIED.value
+        assert not any("duplicados" in n for n in bot.notices)  # no terminal warning yet
+
+    def test_exhausted_reaches_threshold_one_shot_warning(self, tmp_path: Path) -> None:
+        gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
+        gmail.verify_error = True
+        storage = make_storage(tmp_path)
+        draft_id = self._seed(storage, attempts=3)  # >= max
+        bot = FakeReplyBot()
+        coordinator = self._coordinator(tmp_path, gmail, bot, storage)
+
+        asyncio.run(coordinator.sweep_unverified())
+        assert storage.get_draft(draft_id)["status"] == DraftStatus.VERIFICATION_FAILED.value
+        assert gmail.sent == []  # never resent
+        assert sum("duplicados" in n for n in bot.notices) == 1
+
+        # A second sweep must not re-notify (draft is no longer sent_unverified).
+        asyncio.run(coordinator.sweep_unverified())
+        assert sum("duplicados" in n for n in bot.notices) == 1
+
+    def test_verifies_before_threshold_no_warning(self, tmp_path: Path) -> None:
+        gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
+        storage = make_storage(tmp_path)
+        draft_id = self._seed(storage, attempts=0)
+        gmail.sent_store.append(gmail.accept(self._draft()))  # Gmail has it after all
+        bot = FakeReplyBot()
+        coordinator = self._coordinator(tmp_path, gmail, bot, storage)
+        asyncio.run(coordinator.sweep_unverified())
+        assert storage.get_draft(draft_id)["status"] == DraftStatus.SENT_VERIFIED.value
+        assert not any("duplicados" in n for n in bot.notices)
+
+    def test_restart_recovery_same_safe_behavior(self, tmp_path: Path) -> None:
+        gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
+        gmail.verify_error = True
+        storage = make_storage(tmp_path)
+        draft_id = self._seed(storage, attempts=3)
+        # Simulated restart: a fresh coordinator over the same store.
+        bot = FakeReplyBot()
+        coordinator = self._coordinator(tmp_path, gmail, bot, storage)
+        asyncio.run(coordinator.reconcile_on_startup())  # re-verifies (inconclusive)
+        assert storage.get_draft(draft_id)["status"] == DraftStatus.SENT_UNVERIFIED.value
+        asyncio.run(coordinator.sweep_unverified())  # watchdog → terminal
+        assert storage.get_draft(draft_id)["status"] == DraftStatus.VERIFICATION_FAILED.value
         assert gmail.sent == []
+        assert sum("duplicados" in n for n in bot.notices) == 1
+
+    def test_legacy_row_without_send_time_is_not_terminal(self, tmp_path: Path) -> None:
+        gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
+        gmail.verify_error = True
+        storage = make_storage(tmp_path)
+        draft_id = self._seed(storage, attempts=0, started=False)  # no send_started_at
+        bot = FakeReplyBot()
+        coordinator = self._coordinator(tmp_path, gmail, bot, storage)
+        asyncio.run(coordinator.sweep_unverified())
+        # Below threshold → reconciled (inconclusive), NOT immediately terminal.
+        assert storage.get_draft(draft_id)["status"] == DraftStatus.SENT_UNVERIFIED.value
+        assert not any("duplicados" in n for n in bot.notices)
+
+    def test_multiple_exhausted_drafts_handled_independently(self, tmp_path: Path) -> None:
+        gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
+        gmail.verify_error = True
+        storage = make_storage(tmp_path)
+        first = self._seed(storage, attempts=3, user_id=7)
+        second = self._seed(storage, attempts=3, user_id=8)
+        bot = FakeReplyBot()
+        coordinator = self._coordinator(tmp_path, gmail, bot, storage)
+        asyncio.run(coordinator.sweep_unverified())
+        assert storage.get_draft(first)["status"] == DraftStatus.VERIFICATION_FAILED.value
+        assert storage.get_draft(second)["status"] == DraftStatus.VERIFICATION_FAILED.value
+        assert storage.get_draft(first)["telegram_user_id"] == 7  # owner preserved
+        assert storage.get_draft(second)["telegram_user_id"] == 8
+        assert sum("duplicados" in n for n in bot.notices) == 2
 
 
 class TestAttachmentLifecycle:
@@ -478,6 +607,77 @@ class TestAttachmentLifecycle:
         os.utime(stale, (old, old))
         coordinator.cleanup_orphan_tmp()
         assert not stale.exists()
+
+
+class TestThreadlessReconciliation:
+    """Compose/forward (threadless) ambiguous sends: reconciled via sent-mail
+    search, never blind-resent."""
+
+    def _threadless_draft(self) -> DraftReply:
+        return DraftReply(
+            thread_id="",
+            subject="Presupuesto",
+            to=[EmailAddress("Roman", "roman@example.com")],
+            cc=[],
+            body="Sehr geehrte Damen und Herren, vielen Dank.",
+        )
+
+    def _seed_unverified(self, tmp_path: Path, draft: DraftReply) -> tuple[Storage, int]:
+        storage = make_storage(tmp_path)
+        draft_id = storage.create_draft("", None, draft, telegram_user_id=7)
+        storage.set_draft_status(draft_id, DraftStatus.SENT_UNVERIFIED)
+        storage.set_draft_send_started(draft_id, int(time.time() * 1000))
+        return storage, draft_id
+
+    def test_threadless_ambiguous_found_in_sent_mail_verified_without_resend(
+        self, tmp_path: Path
+    ) -> None:
+        gmail = FakeGmail(send_ok=True)
+        draft = self._threadless_draft()
+        storage, draft_id = self._seed_unverified(tmp_path, draft)
+        # Gmail actually accepted the ambiguous send (we just lost the response).
+        gmail.sent_store.append(gmail.accept(draft))
+
+        bot = FakeReplyBot()
+        coordinator = ReplyCoordinator(
+            make_settings(tmp_dir=str(tmp_path / "tmp")), gmail, MockLLM(), bot, storage
+        )
+        asyncio.run(coordinator.sweep_unverified())
+        assert storage.get_draft(draft_id)["status"] == DraftStatus.SENT_VERIFIED.value
+        assert gmail.sent == []  # nothing resent
+        assert any("verificado" in n or "confirmado" in n for n in bot.notices)
+
+    def test_threadless_ambiguous_not_found_offers_controlled_retry(
+        self, tmp_path: Path
+    ) -> None:
+        gmail = FakeGmail(send_ok=True)
+        draft = self._threadless_draft()
+        storage, draft_id = self._seed_unverified(tmp_path, draft)
+        # Gmail never received the message.
+        bot = FakeReplyBot()
+        coordinator = ReplyCoordinator(
+            make_settings(tmp_dir=str(tmp_path / "tmp")), gmail, MockLLM(), bot, storage
+        )
+        asyncio.run(coordinator.sweep_unverified())
+        assert storage.get_draft(draft_id)["status"] == DraftStatus.SEND_FAILED.value
+        assert gmail.sent == []
+        assert bot.resend_offers == [draft_id]  # controlled retry offered
+
+        # User presses retry → re-verify (still not found) → one evidence-based send.
+        asyncio.run(coordinator.resend_draft(draft_id))
+        assert storage.get_draft(draft_id)["status"] == DraftStatus.SENT_VERIFIED.value
+        assert len(gmail.sent) == 1
+
+    def test_threadless_send_gets_fresh_thread_id_and_preserves_subject(self) -> None:
+        """Fidelity: the fake mirrors real Gmail — a threadless send is assigned a
+        fresh thread id and keeps its subject (no Re: prefix)."""
+        gmail = FakeGmail(send_ok=True)
+        asyncio.run(gmail.send_reply(self._threadless_draft()))
+        assert len(gmail.sent_store) == 1
+        record = gmail.sent_store[0]
+        assert record.thread_id != ""
+        assert record.thread_id.startswith("new-thread-")
+        assert record.subject == "Presupuesto"
 
 
 class MockLLM:

@@ -39,8 +39,16 @@ logger = logging.getLogger(__name__)
 #: Temp delivery of Gmail attachments: bounded count and bytes.
 MAX_ATTACHMENT_DELIVERY_BYTES = 10 * 1024 * 1024
 MAX_ATTACHMENT_DELIVERY_COUNT = 5
-#: Supported types for attachment delivery to Telegram.
-_DELIVERABLE_TYPES = ("application/pdf", "application/msword", "text/plain", "text/csv", "image/")
+#: Supported types for attachment delivery to Telegram (docs claim DOCX works;
+#: modern .docx uses the OpenXML mime, older .doc uses application/msword).
+_DELIVERABLE_TYPES = (
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "text/plain",
+    "text/csv",
+    "image/",
+)
 
 
 class AssistantError(RuntimeError):
@@ -209,7 +217,11 @@ class EmailAssistant:
 
     async def _act_get_attachment(self, payload: dict[str, Any]) -> None:
         tg_message_id = int(payload.get("tg_message_id") or 0)
-        index = int(payload.get("index") or -1)  # -1 → list panel
+        # Distinguish "no index" (→ list panel) from attachment #0, which is a
+        # real, deliverable index. ``payload.get("index") or -1`` would wrongly
+        # treat 0 as "no index" and re-show the panel forever.
+        raw_index = payload.get("index")
+        index = -1 if raw_index is None else int(raw_index)
         message_id = self._storage.get_meta(f"tgm:{tg_message_id}") or ""
         if not message_id:
             await self._bot.send_notice("No puedo asociar eso a ningún correo.")

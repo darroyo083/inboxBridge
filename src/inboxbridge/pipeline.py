@@ -63,10 +63,13 @@ class InboundPipeline:
         results: list[PipelineResult] = []
         for message_id in delta.message_ids:
             results.append(await self.process_message(message_id))
-        if delta.message_ids:
-            ok = all(r.status != MessageStatus.FAILED for r in results)
-            if ok:
-                self._advance_baseline(max(delta.history_id, event.history_id))
+        ok = all(r.status != MessageStatus.FAILED for r in results)
+        # The baseline advances only when every candidate was resolved
+        # (no UNKNOWN Primary status) AND every Primary message processed
+        # cleanly. An unknown candidate must be re-examined on the next push —
+        # advancing past it could silently lose a real Primary email.
+        if ok and delta.unknown_count == 0:
+            self._advance_baseline(max(delta.history_id, event.history_id))
         return (
             results[-1]
             if results

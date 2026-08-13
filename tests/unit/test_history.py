@@ -93,7 +93,9 @@ class TestNewMessageIds:
         }
         storage.set_meta(META_HISTORY_ID, "69")
         processor = HistoryProcessor(make_settings(), FakeGmailService(routes), storage)
-        assert processor.new_message_ids(event_history_id=70).message_ids == []
+        delta = processor.new_message_ids(event_history_id=70)
+        assert delta.message_ids == []
+        assert delta.unknown_count == 0  # NOT_PRIMARY is not UNKNOWN
 
     def test_dedup_against_db_and_within_batch(self, storage: Storage) -> None:
         routes: dict[Route, object] = {
@@ -142,8 +144,10 @@ class TestNewMessageIds:
         processor.new_message_ids(event_history_id=1)
         assert service.calls[0][1]["labelId"] == "INBOX"
 
-    def test_fetch_failure_skips_message(self, storage: Storage) -> None:
-        def _explode(**kwargs: object) -> None:
+    def test_fetch_failure_marks_unknown(self, storage: Storage) -> None:
+        """A label-lookup failure is UNKNOWN (not NOT_PRIMARY): the message must
+        not be processed, but the baseline must not advance past it either."""
+        def _explode(kwargs: object) -> None:
             raise AssertionError("message gone")
 
         routes: dict[Route, object] = {
@@ -152,7 +156,52 @@ class TestNewMessageIds:
         }
         storage.set_meta(META_HISTORY_ID, "0")
         processor = HistoryProcessor(make_settings(), FakeGmailService(routes), storage)
-        assert processor.new_message_ids(event_history_id=1).message_ids == []
+        delta = processor.new_message_ids(event_history_id=1)
+        assert delta.message_ids == []
+        assert delta.unknown_count == 1  # not silently skipped; must be retried
+
+    def test_404_message_deleted_is_not_primary(self, storage: Storage) -> None:
+        """A deleted message (404) is safely NOT_PRIMARY — nothing to process and
+        the baseline may advance past it."""
+        from googleapiclient.errors import HttpError
+
+        def not_found(kwargs: object) -> None:
+            class _Resp:
+                status = 404
+                reason = "Not Found"
+
+            raise HttpError(_Resp(), b"not found", uri="https://gmail.googleapis.com")
+
+        routes: dict[Route, object] = {
+            ("users", "history", "list"): history_page(history_record(2, "m1")),
+            ("users", "messages", "get"): not_found,
+        }
+        storage.set_meta(META_HISTORY_ID, "1")
+        processor = HistoryProcessor(make_settings(), FakeGmailService(routes), storage)
+        delta = processor.new_message_ids(event_history_id=2)
+        assert delta.message_ids == []
+        assert delta.unknown_count == 0
+
+    def test_transient_error_is_unknown(self, storage: Storage) -> None:
+        """A non-404 Gmail error (e.g. 500) is UNKNOWN, distinct from NOT_PRIMARY."""
+        from googleapiclient.errors import HttpError
+
+        def server_error(kwargs: object) -> None:
+            class _Resp:
+                status = 500
+                reason = "Internal Server Error"
+
+            raise HttpError(_Resp(), b"boom", uri="https://gmail.googleapis.com")
+
+        routes: dict[Route, object] = {
+            ("users", "history", "list"): history_page(history_record(3, "m1")),
+            ("users", "messages", "get"): server_error,
+        }
+        storage.set_meta(META_HISTORY_ID, "2")
+        processor = HistoryProcessor(make_settings(), FakeGmailService(routes), storage)
+        delta = processor.new_message_ids(event_history_id=3)
+        assert delta.message_ids == []
+        assert delta.unknown_count == 1
 
 
 class TestPersist:

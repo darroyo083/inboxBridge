@@ -159,6 +159,37 @@ async def test_no_new_messages_is_noop(tmp_path: object) -> None:
     assert telegram.sent == []
 
 
+async def test_baseline_advances_past_non_primary_only_delta(tmp_path: object) -> None:
+    """A delta with only definitively non-Primary history (no new messages, no
+    unknowns) advances the baseline — repeated re-scanning is avoided."""
+    settings = make_settings()
+    storage = make_storage(tmp_path)
+    storage.set_meta("last_history_id", "10")
+
+    pipeline = InboundPipeline(
+        settings, FakeGmail(), FakeLLM(), FakeTelegram(), storage,
+        history_provider=_delta_full_provider(history_id=30, message_ids=[]),
+    )
+    result = await pipeline.process_event(make_event(history_id=30))
+    assert result.status == MessageStatus.SENT_TELEGRAM
+    assert storage.get_meta("last_history_id") == "30"
+
+
+async def test_baseline_does_not_advance_on_unknown_candidate(tmp_path: object) -> None:
+    """A delta with a candidate of UNKNOWN Primary status must not advance the
+    baseline — advancing could silently lose a real Primary email."""
+    settings = make_settings()
+    storage = make_storage(tmp_path)
+    storage.set_meta("last_history_id", "10")
+
+    pipeline = InboundPipeline(
+        settings, FakeGmail(), FakeLLM(), FakeTelegram(), storage,
+        history_provider=_delta_full_provider(history_id=30, message_ids=[], unknown_count=1),
+    )
+    await pipeline.process_event(make_event(history_id=30))
+    assert storage.get_meta("last_history_id") == "10"  # unchanged → retried next push
+
+
 async def test_llm_failure_marks_failed_and_retry_recovers(tmp_path: object) -> None:
     settings = make_settings()
     storage = make_storage(tmp_path)
@@ -257,6 +288,17 @@ def _delta_provider(message_ids: list[str]):
 
 async def _empty_delta(event: PubSubEvent) -> HistoryDelta:
     return HistoryDelta(history_id=event.history_id, message_ids=[])
+
+
+def _delta_full_provider(
+    *, history_id: int, message_ids: list[str], unknown_count: int = 0
+):
+    async def provider(event: PubSubEvent) -> HistoryDelta:
+        return HistoryDelta(
+            history_id=history_id, message_ids=message_ids, unknown_count=unknown_count
+        )
+
+    return provider
 
 
 class FailingLLM(FakeLLM):
