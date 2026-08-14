@@ -104,6 +104,16 @@ _FLOW_CANCEL = re.compile(
     re.IGNORECASE,
 )
 
+#: Intent actions that create a NEW draft. With an active draft these must ask
+#: for explicit cancellation instead of silently replacing/mutating it.
+_NEW_DRAFT_ACTIONS = frozenset(
+    {
+        IntentAction.COMPOSE_NEW_EMAIL,
+        IntentAction.FORWARD_EMAIL,
+        IntentAction.REPLY_TO_EMAIL,
+    }
+)
+
 #: Telegram hard limit is 4096 chars per message; stay safely below.
 _MAX_MSG_CHARS = 3900
 #: Cap on temporary "original" messages to avoid flooding the group.
@@ -693,6 +703,15 @@ class TelegramBot(TelegramNotifier):
             payload.setdefault(
                 "message_id", self._storage.get_meta(f"{_TG_GMAIL_PREFIX}{tg_message_id}") or ""
             )
+
+        # An active unsent draft must never be silently replaced by a NEW
+        # compose/reply/forward flow. Require explicit cancellation first.
+        if has_draft and action in _NEW_DRAFT_ACTIONS:
+            await self._send(
+                "Tienes un borrador pendiente. Cáncelo antes de empezar otro: "
+                "«cancela el borrador»."
+            )
+            return
 
         if action in (IntentAction.CLARIFY, IntentAction.UNKNOWN):
             if fallback_to_reply:

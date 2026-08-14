@@ -260,6 +260,8 @@ class Stack:
     async def cleanup(self) -> None:
         for task in self.background_tasks:
             task.cancel()
+        for task in list(self.coordinator._presentation_tasks):
+            task.cancel()
         await asyncio.sleep(0)
 
     def bot_message(self, message_id: int, text: str = "Resumen") -> Message:
@@ -474,6 +476,7 @@ async def test_flow_e_new_email_through_alias(stack: Stack) -> None:
     assert "femo@femo.ch" in previews[-1]  # REAL address shown, not just the name
 
     await stack.send("envíalo")
+    await stack.wait_for_send()  # compose presents in a background task
     await stack.join_background()
     assert len(stack.gmail.sent) == 1
     assert stack.gmail.sent[0].to[0].email == "femo@femo.ch"
@@ -743,6 +746,7 @@ async def test_flow_s_forward(stack: Stack) -> None:
     assert "daniel@forward.ch" in previews[-1]  # real address visible
     assert "presupuesto.pdf" in previews[-1]  # original attachment represented
     await stack.send("envíalo")
+    await stack.wait_for_send()  # forward presents in a background task
     await stack.join_background()
     assert len(stack.gmail.sent) == 1
     assert stack.gmail.sent[0].to[0].email == "daniel@forward.ch"
@@ -838,6 +842,94 @@ async def test_flow_v_compose_cancel(stack: Stack) -> None:
     await asyncio.sleep(0.05)
     assert any("Cancelado" in (m.text or "") for m in stack.sender.messages)
     assert stack.storage.get_draft(1) is None
+
+
+# ── W. COMPOSE DRAFT BUTTONS (EDIT/CANCEL/SEND + owner + guard) ──────────────
+
+
+async def _compose_draft_token(stack: Stack) -> str:
+    stack.contacts.create_contact("Roman", "femo@femo.ch")
+    await stack.send_bg("escribe a Roman y dile que hola")
+    await asyncio.sleep(0.05)
+    draft_messages = [
+        m for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert draft_messages
+    markup = draft_messages[-1].reply_markup
+    assert isinstance(markup, InlineKeyboardMarkup)
+    return _button_data(markup, 0, 0).split(":", 1)[1]
+
+
+async def test_flow_w_compose_edit_prompt(stack: Stack) -> None:
+    token = await _compose_draft_token(stack)
+    await stack.tap(CHAT_ID, f"edit:{token}", user_id=7)
+    assert any("Dime qué cambio" in (m.text or "") for m in stack.sender.messages)
+    assert stack.gmail.sent == []
+    assert stack.draft_row(1)["status"] == DraftStatus.PENDING.value
+
+
+async def test_flow_w_compose_cancel_confirm_and_terminate(stack: Stack) -> None:
+    token = await _compose_draft_token(stack)
+    # First CANCEL tap → confirmation UI, draft NOT cancelled.
+    await stack.tap(CHAT_ID, f"cancel:{token}", user_id=7)
+    assert any("¿Cancelar este borrador?" in (m.text or "") for m in stack.sender.messages)
+    assert stack.draft_row(1)["status"] == DraftStatus.PENDING.value
+    # "Volver" → draft stays pending.
+    await stack.tap(CHAT_ID, f"cancelback:{token}", user_id=7)
+    assert stack.draft_row(1)["status"] == DraftStatus.PENDING.value
+    # "Sí, cancelar" → cancelled, no send.
+    await stack.tap(CHAT_ID, f"cancel:{token}", user_id=7)
+    await stack.tap(CHAT_ID, f"cancelyes:{token}", user_id=7)
+    await asyncio.sleep(0.05)
+    assert stack.draft_row(1)["status"] == DraftStatus.CANCELLED.value
+    assert stack.gmail.sent == []
+
+
+async def test_flow_w_compose_send_two_step_exactly_once(stack: Stack) -> None:
+    token = await _compose_draft_token(stack)
+    # First SEND tap → confirmation, NO send.
+    await stack.tap(CHAT_ID, f"confirm:{token}", user_id=7)
+    assert stack.gmail.sent == []
+    assert any("¿Seguro que quieres enviar" in (m.text or "") for m in stack.sender.messages)
+    # Second confirmation → send exactly once.
+    await stack.tap(CHAT_ID, f"sendyes:{token}", user_id=7)
+    await stack.wait_for_send()
+    assert len(stack.gmail.sent) == 1
+
+
+async def test_flow_w_compose_owner_isolation(stack: Stack) -> None:
+    token = await _compose_draft_token(stack)
+    # Non-owner (user 8) presses EDIT/CANCEL/SEND → rejected, draft unchanged.
+    await stack.tap(CHAT_ID, f"edit:{token}", user_id=8)
+    await stack.tap(CHAT_ID, f"cancel:{token}", user_id=8)
+    await stack.tap(CHAT_ID, f"confirm:{token}", user_id=8)
+    assert stack.draft_row(1)["status"] == DraftStatus.PENDING.value
+    assert stack.gmail.sent == []
+    assert not any("Dime qué cambio" in (m.text or "") for m in stack.sender.messages)
+
+
+async def test_flow_w_compose_edit_regenerates_bilingual(stack: Stack) -> None:
+    token = await _compose_draft_token(stack)
+    await stack.tap(CHAT_ID, f"edit:{token}", user_id=7)
+    await asyncio.sleep(0.05)
+    await stack.send("hazlo más corto")
+    await asyncio.sleep(0.05)
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews
+    assert "kurz und klar" in previews[-1]  # new German
+    assert "[ES]" in previews[-1]  # new Spanish translation
+
+
+async def test_flow_w_active_draft_new_compose_asks_cancel(stack: Stack) -> None:
+    await _compose_draft_token(stack)
+    await stack.send("envía un correo a otro@example.com")
+    await asyncio.sleep(0.05)
+    assert any(
+        "borrador pendiente" in (m.text or "").lower() for m in stack.sender.messages
+    )
+    assert stack.storage.get_draft(2) is None  # no second draft created
 
 
 # ── T. VOICE (EXPERIMENTAL) ──────────────────────────────────────────────────

@@ -30,7 +30,7 @@ from .gmail.client import GmailClient
 from .llm import prompts
 from .llm.ai_service import AIService
 from .llm.base import LLMError
-from .models import DraftReply, EmailAddress, OutgoingAttachment, ParsedEmail
+from .models import DraftReply, EmailAddress, OutgoingAttachment, ParsedEmail, ThreadContext
 from .reminders import ReminderParseError, ReminderService
 from .telegram.bot import TelegramBot
 
@@ -146,7 +146,14 @@ class EmailAssistant:
             await self._bot.send_notice("Ese borrador ya no está activo.")
             return
         try:
-            thread = await self._gmail.fetch_thread_context(pending.draft.thread_id)
+            if pending.draft.thread_id:
+                thread = await self._gmail.fetch_thread_context(pending.draft.thread_id)
+            else:
+                # Compose/forward drafts have no thread; the edit prompt just
+                # omits thread context rather than failing on an empty id.
+                thread = ThreadContext(
+                    thread_id="", subject=pending.draft.subject, messages=[], history_id=0
+                )
             await self._bot.send_typing()
             messages = prompts.edit_draft_messages(pending.draft.body, instruction, thread)
             new_body = await self._ai.text(

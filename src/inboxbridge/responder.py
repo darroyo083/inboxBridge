@@ -78,6 +78,9 @@ class ReplyCoordinator:
         self._draft_locks: dict[int, asyncio.Lock] = {}
         #: Draft ids currently being reconciled (sweep skips them).
         self._active_reconciles: set[int] = set()
+        #: Background presentation tasks (compose/forward) so their blocking
+        #: confirmation wait never stalls the Telegram message handler.
+        self._presentation_tasks: set[asyncio.Task[None]] = set()
         bot.register_resend_callback(self.resend_draft)
 
     def _lock_for(self, draft_id: int) -> asyncio.Lock:
@@ -666,8 +669,25 @@ class ReplyCoordinator:
 
     async def present_draft(self, draft: DraftReply, *, user_id: int = 0) -> None:
         """V1.1 hook: present ANY draft (reply/compose/forward) through the
-        shared verified-delivery confirmation path."""
-        await self._present_draft(draft, user_id=user_id)
+        shared verified-delivery confirmation path.
+
+        Runs in a background task so the Telegram message handler returns
+        immediately. The preview's SEND/EDIT/CANCEL buttons are callback queries
+        that PTB processes sequentially; blocking here (in ``wait_for_confirmation``)
+        would deadlock them — the compose/forward flow used to hit exactly that.
+        """
+        async def _run() -> None:
+            try:
+                await self._present_draft(draft, user_id=user_id)
+            except Exception:
+                logger.exception("draft presentation failed for thread %s", draft.thread_id)
+                await self._bot.send_notice(
+                    "No pude preparar el borrador; inténtalo de nuevo."
+                )
+
+        task = asyncio.create_task(_run())
+        self._presentation_tasks.add(task)
+        task.add_done_callback(self._presentation_tasks.discard)
 
 
 class ReconciliationSweep:
