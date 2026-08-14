@@ -51,7 +51,10 @@ class Settings(BaseSettings):
 
     # Gmail / Google
     google_client_secret_file: str = "credentials/client_secret.json"
-    google_token_file: str = "credentials/token.json"
+    # The OAuth refresh token is WRITTEN on every access-token refresh, so it
+    # lives in the persistent, writable data volume (never under the read-only
+    # ``credentials`` bind mount that holds the static secrets).
+    google_token_file: str = "data/token.json"
     # Service account key used to consume the Pub/Sub subscription (StreamingPull).
     # Empty → falls back to Application Default Credentials.
     google_application_credentials: str = Field(

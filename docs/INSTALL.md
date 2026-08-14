@@ -35,13 +35,17 @@ cp .env.example .env
 
 mkdir -p credentials
 # copy credentials/client_secret.json into credentials/
-# (do this ONCE on your dev machine with a browser available:)
+# (do this ONCE with a browser available:)
 docker compose run --rm inboxbridge python -m inboxbridge.oauth_bootstrap
 ```
 
 `oauth_bootstrap` opens the local OAuth flow: you authorize in a browser, and
-the refresh token is saved to `credentials/token.json`. Copy that file to the
-VPS (same path). Refresh tokens from installed-app flows do not expire.
+the refresh token is saved to `data/token.json` — i.e. inside the persistent
+`inboxbridge-data` Docker volume, NOT the read-only `credentials/` mount. Run
+this on the VPS (SSH port-forward the local server URL it prints) so the token
+lands in the volume directly. Refresh tokens from installed-app flows do not
+expire; the access token still expires and is refreshed + saved back to
+`data/token.json` on every expiry, which is why that path must stay writable.
 
 ## 4. Run
 

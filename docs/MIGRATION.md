@@ -5,12 +5,14 @@ The whole state is small and portable by design. Moving takes minutes.
 ## What to copy
 
 1. **`.env`** — all configuration (secrets stay here, never in git).
-2. **`credentials/`** — `client_secret.json` + `token.json` (the OAuth refresh
-   token; from installed-app flows it does not expire, so the new VPS keeps
-   working without re-authorization).
-3. **The Docker volume** `inboxbridge-data` (SQLite + nothing else). It holds
-   dedup ids, statuses, the historyId baseline and the watch expiry — copying
-   it means no duplicate summaries and no gap in processing.
+2. **`credentials/`** — the static secrets `client_secret.json` and
+   `service_account_pubsub.json` (read-only at runtime). The OAuth refresh
+   token is NOT here — it lives in the data volume (see below).
+3. **The Docker volume** `inboxbridge-data` — SQLite state plus
+   `token.json` (the OAuth refresh token; from installed-app flows it does not
+   expire, so the new VPS keeps working without re-authorization). It also
+   holds dedup ids, statuses, the historyId baseline and the watch expiry —
+   copying it means no duplicate summaries and no gap in processing.
 
 ## Procedure
 
@@ -42,8 +44,8 @@ Verify with `/status` and a test email.
 
 ## Notes
 
-- No email bodies or attachment contents are ever stored — nothing sensitive
-  travels in the backup beyond the OAuth refresh token.
+- No email bodies or attachment contents are ever stored — the only sensitive
+  thing in the volume backup is the OAuth refresh token (`token.json`).
 - The Pub/Sub subscription is Pull/StreamingPull: on the new VPS, the same
   subscription streams again; because messages are acked only after successful
   processing, events that arrived while the service was down are redelivered
