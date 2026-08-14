@@ -160,13 +160,26 @@ _FORWARD = re.compile(
     re.IGNORECASE,
 )
 _COMPOSE = re.compile(
-    r"\b(escr[ií]be a |escr[ií]bele a |manda un correo a |m[aá]ndale un correo a |"
-    r"nuevo correo (para|a) |redacta un correo a |escr[ií]be un correo a |"
-    r"manda un mail a |escr[ií]be un mail a )",
+    r"\b("
+    # verb + [un/el] + object (correo/email/mail), optional "a <recipient>"
+    r"(?:env[ií]a|manda|escr[ií]be|redacta) (?:un |el )?(?:correo|email|mail)(?: a )?"
+    # verb + "a <recipient>" (no object)
+    r"|(?:env[ií]a|manda|escr[ií]be|redacta) a "
+    # existing object forms
+    r"|m[aá]ndale un (?:correo|mail) a |escr[ií]bele a "
+    r"|nuevo correo (?:para|a) "
+    r")",
     re.IGNORECASE,
 )
 _REPLY = re.compile(
-    r"\b(resp[oó]ndele|respondele|cont[eé]stale|contestale|dile que)\b",
+    r"\b(resp[oó]ndele|respondele|resp[oó]nde|responde|"
+    r"cont[eé]stale|contestale|cont[eé]sta|contesta|dile que)\b",
+    re.IGNORECASE,
+)
+#: References to "the latest incoming email" (a slot value, not an intent).
+_LATEST = re.compile(
+    r"\b(al (?:último|ultimo)(?: correo| email| mensaje)?(?: recibido| entrante)?"
+    r"|al correo m[aá]s reciente)\b",
     re.IGNORECASE,
 )
 _REMINDER = re.compile(
@@ -239,9 +252,29 @@ def _extract_after(text: str, pattern: re.Pattern[str]) -> str:
     end = match.end()
     rest = text[end:].strip()
     # Trim trailing punctuation/connectors that are not part of the target.
-    connectors = r"\b(y dile|y cu[eé]ntale|y dile que|que| por favor| gracias| pls)\b"
+    connectors = (
+        r"\b(y dile|y cu[eé]ntale|y dile que|dici[eé]ndole que|diciendo que|"
+        r"dici[eé]ndole|diciendo|que| por favor| gracias| pls)\b"
+    )
     rest = re.split(connectors, rest, maxsplit=1)[0]
     return rest.strip(" .,;:!?¿¡")
+
+
+def has_latest_reference(text: str) -> bool:
+    """Whether the phrase references "the latest incoming email"."""
+    return _LATEST.search(text) is not None
+
+
+def strip_latest_reference(text: str) -> str:
+    """Remove the "latest email" reference from a reply instruction.
+
+    Returns the instruction with the target reference (and any dangling "al")
+    removed, so the reply instruction passed to the draft flow describes only
+    the reply content — never a dynamic target.
+    """
+    stripped = _LATEST.sub(" ", text)
+    stripped = re.sub(r"\bal\b", " ", stripped, flags=re.IGNORECASE)
+    return " ".join(stripped.split()).strip(" .,;:!?¿¡")
 
 
 def _rule_classify(text: str) -> _RuleResult:

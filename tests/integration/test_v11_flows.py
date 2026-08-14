@@ -28,6 +28,7 @@ from inboxbridge.models import (
     DraftReply,
     EmailAddress,
     EmailSummary,
+    MessageStatus,
     ParsedEmail,
     ThreadContext,
 )
@@ -748,6 +749,95 @@ async def test_flow_s_forward(stack: Stack) -> None:
     assert stack.gmail.sent[0].subject.startswith("Fwd:")
     assert stack.gmail.sent[0].attachments[0].filename == "presupuesto.pdf"
     assert stack.draft_row(1)["status"] == DraftStatus.SENT_VERIFIED.value
+
+
+# ── V. NATURAL-LANGUAGE SLOT FILLING (latest email + compose) ────────────────
+
+
+def _seed_incoming(stack: Stack, message_id: str, thread_id: str, history_id: int) -> None:
+    stack.storage.upsert_message(message_id, thread_id, history_id, MessageStatus.SENT_TELEGRAM)
+
+
+async def test_flow_v_reply_latest_two_turn(stack: Stack) -> None:
+    stack.gmail.threads["t-a"] = make_thread("t-a")
+    _seed_incoming(stack, "m-a", "t-a", 100)
+    await stack.send("respóndele que muchas gracias")
+    await asyncio.sleep(0.05)
+    assert any("¿A qué correo" in (m.text or "") for m in stack.sender.messages)
+
+    await stack.send("al último")
+    await stack.pump()
+    await asyncio.sleep(0.15)
+    assert stack.draft_row(1)["thread_id"] == "t-a"  # frozen concrete target
+
+
+async def test_flow_v_reply_latest_one_turn(stack: Stack) -> None:
+    stack.gmail.threads["t-a"] = make_thread("t-a")
+    _seed_incoming(stack, "m-a", "t-a", 100)
+    await stack.send("respóndele que muchas gracias al último correo recibido")
+    await stack.pump()
+    await asyncio.sleep(0.15)
+    assert stack.draft_row(1)["thread_id"] == "t-a"
+
+
+async def test_flow_v_reply_latest_no_recent_email(stack: Stack) -> None:
+    await stack.send("responde al último")
+    await asyncio.sleep(0.05)
+    assert any("reciente" in (m.text or "") for m in stack.sender.messages)
+    assert stack.storage.get_draft(1) is None  # no draft, no send
+
+
+async def test_flow_v_reply_latest_ignores_own_sent_and_freezes(stack: Stack) -> None:
+    """'al último' selects the latest INCOMING message (never our own SENT), and
+    the draft is frozen to it even if a newer incoming email arrives later."""
+    stack.gmail.threads["t-a"] = make_thread("t-a")
+    stack.gmail.threads["t-b"] = make_thread("t-b")
+    _seed_incoming(stack, "m-a", "t-a", 100)
+    _seed_incoming(stack, "m-b", "t-b", 101)  # newer incoming B
+    await stack.send("respóndele que gracias al último")
+    await stack.pump()
+    await asyncio.sleep(0.15)
+    # Latest incoming is B (t-b), NOT our own sent message (which is a draft row).
+    assert stack.draft_row(1)["thread_id"] == "t-b"
+    # A newer incoming C arrives AFTER resolution → draft stays bound to t-b.
+    _seed_incoming(stack, "m-c", "t-c", 102)
+    await asyncio.sleep(0.05)
+    assert stack.draft_row(1)["thread_id"] == "t-b"
+
+
+async def test_flow_v_compose_multi_turn(stack: Stack) -> None:
+    await stack.send("envía un correo")
+    await asyncio.sleep(0.05)
+    assert any("¿A quién" in (m.text or "") for m in stack.sender.messages)
+
+    await stack.send("a user@example.com")
+    await asyncio.sleep(0.05)
+    assert any("¿Qué le digo?" in (m.text or "") for m in stack.sender.messages)
+
+    await stack.send_bg("dile que mañana llegaré media hora tarde")
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews and "user@example.com" in previews[-1]
+
+
+async def test_flow_v_compose_one_turn_diciendo(stack: Stack) -> None:
+    await stack.send_bg(
+        "envía un correo a user@example.com diciendo que mañana llego tarde"
+    )
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews and "user@example.com" in previews[-1]
+
+
+async def test_flow_v_compose_cancel(stack: Stack) -> None:
+    await stack.send("envía un correo")
+    await asyncio.sleep(0.05)
+    await stack.send("cancela")
+    await asyncio.sleep(0.05)
+    assert any("Cancelado" in (m.text or "") for m in stack.sender.messages)
+    assert stack.storage.get_draft(1) is None
 
 
 # ── T. VOICE (EXPERIMENTAL) ──────────────────────────────────────────────────

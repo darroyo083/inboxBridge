@@ -5,7 +5,13 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from inboxbridge.intents import Intent, IntentAction, IntentClassifier
+from inboxbridge.intents import (
+    Intent,
+    IntentAction,
+    IntentClassifier,
+    has_latest_reference,
+    strip_latest_reference,
+)
 
 
 def classify_rule(text: str) -> Intent:
@@ -93,6 +99,43 @@ class TestRuleBasics:
         intent = classify_rule("reenvíaselo a Daniel")
         assert intent.action == IntentAction.FORWARD_EMAIL
         assert intent.payload.get("recipient", "").lower() == "daniel"
+
+    def test_compose_verbs_rules_first(self) -> None:
+        for phrase in (
+            "envía un correo",
+            "manda un correo",
+            "escribe un correo",
+            "envía un email",
+            "manda un email",
+            "escribe un email",
+        ):
+            intent = classify_rule(phrase)
+            assert intent.action == IntentAction.COMPOSE_NEW_EMAIL, phrase
+
+    def test_compose_with_recipient_and_instruction(self) -> None:
+        intent = classify_rule("envía un correo a user@example.com")
+        assert intent.action == IntentAction.COMPOSE_NEW_EMAIL
+        assert intent.payload.get("recipient", "").lower() == "user@example.com"
+
+        intent = classify_rule(
+            "envía un correo a user@example.com diciendo que mañana llego tarde"
+        )
+        assert intent.action == IntentAction.COMPOSE_NEW_EMAIL
+        assert intent.payload.get("recipient", "").lower() == "user@example.com"
+
+    def test_latest_reference_detection(self) -> None:
+        for phrase in ("al último", "al último correo", "al último correo recibido",
+                       "al último email", "al correo más reciente"):
+            assert has_latest_reference(phrase), phrase
+        assert not has_latest_reference("respóndele que gracias")
+
+    def test_strip_latest_reference(self) -> None:
+        assert strip_latest_reference(
+            "respóndele que gracias al último correo recibido"
+        ) == "respóndele que gracias"
+        assert strip_latest_reference(
+            "respóndele al último correo que muchas gracias"
+        ) == "respóndele que muchas gracias"
 
     def test_reply_intent_is_rule_based(self) -> None:
         # "respóndele…" / "dile que…" resolve deterministically (rules-first),

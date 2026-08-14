@@ -55,6 +55,7 @@ import logging
 import mimetypes
 import re
 import secrets
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,7 +80,7 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes, Messag
 from ..config import Settings
 from ..contracts import TelegramNotifier
 from ..db import Storage
-from ..intents import IntentAction, IntentClassifier
+from ..intents import IntentAction, IntentClassifier, has_latest_reference, strip_latest_reference
 from ..models import DraftReply, EmailSummary, OutgoingAttachment, ParsedEmail
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,17 @@ _TG_GMAIL_PREFIX = "tgm:"  # tg message_id -> gmail message_id (IDs only)
 _TG_SENDER_PREFIX = "tgs:"  # tg message_id -> sender display name
 _TG_ORIG_PREFIX = "tgo:"  # tg message_id -> JSON list of temporary original message ids
 _CONFIRM_TIMEOUT_SECONDS = 900.0
+
+#: Bounded pending conversational slot-filling (reply target / compose) expires
+#: after this many seconds. In-memory only (intentionally not persisted): a
+#: restart clears it, which is safe — the user just re-issues the command.
+_FLOW_TTL_SECONDS = 900.0
+
+#: Explicit cancellation phrases that clear a pending conversational flow.
+_FLOW_CANCEL = re.compile(
+    r"^(cancela|cancelar|anula|anular|olv[ií]dalo|d[eé]jalo|nada|nada m[aá]s)$",
+    re.IGNORECASE,
+)
 
 #: Telegram hard limit is 4096 chars per message; stay safely below.
 _MAX_MSG_CHARS = 3900
@@ -496,6 +508,8 @@ class TelegramBot(TelegramNotifier):
             pending.resolve(False)
             cancelled += 1
             self._pending_drafts.pop(pending.token, None)
+        # Also clear any pending conversational slot-fill flow for this member.
+        self._pending_flows.pop(user_id, None)
         text = "Nada que cancelar." if cancelled == 0 else f"Borradores cancelados: {cancelled}."
         await self._send(text, reply_to=message.message_id)
 
@@ -727,31 +741,40 @@ class TelegramBot(TelegramNotifier):
             return
 
         # Reply intent (rules-first, but the LLM may still classify it): the
-        # classic reply flow when bound to a thread, otherwise ask for context.
+        # classic reply flow when bound to a thread; otherwise resolve "al
+        # último" directly or start a bounded reply-target slot fill.
         if action == IntentAction.REPLY_TO_EMAIL:
             if fallback_to_reply:
-                attachments = (
-                    await self._collect_outgoing_attachments(message)
-                    if message is not None
-                    else ()
-                )
-                memory = tuple(m["value"] for m in self._storage.list_memories(user_id))
-                self._queue.put_nowait(
-                    ReplyRequest(
-                        thread_id=thread_id,
-                        user_instructions=text,
-                        source_message_id=(
-                            message.message_id if message is not None else tg_message_id
-                        ),
-                        memory=memory,
-                        user_id=user_id,
-                        attachments=attachments,
-                    )
+                await self._queue_reply(
+                    user_id, text, thread_id, message=message, tg_message_id=tg_message_id
                 )
                 return
+            if has_latest_reference(text):
+                latest = self._latest_reply_target()
+                if latest is None:
+                    await self._send(
+                        "No tengo ningún correo recibido reciente al que responder."
+                    )
+                    return
+                await self._queue_reply(
+                    user_id,
+                    strip_latest_reference(text) or text,
+                    latest["thread_id"],
+                    message=message,
+                    tg_message_id=tg_message_id,
+                )
+                return
+            # No target yet: remember the instruction and ask for the target.
+            self._pending_flows[user_id] = {
+                "flow": "reply_target",
+                "instruction": text,
+                "user_id": user_id,
+                "ts": time.time(),
+            }
             await self._send(
-                "¿A qué correo quieres responder? Responde directamente a un "
-                "resumen de InboxBridge y escribe ahí tu respuesta."
+                "¿A qué correo quieres responder? Di «al último» para el correo "
+                "recibido más reciente, o responde directamente a un resumen de "
+                "InboxBridge."
             )
             return
 
@@ -759,6 +782,52 @@ class TelegramBot(TelegramNotifier):
             await self._send("No puedo hacer eso ahora mismo.")
             return
         await self._action_callback(action.value, payload)
+
+    # ── reply target resolution ("al último") ────────────────────────────────
+
+    def _latest_reply_target(self) -> dict[str, Any] | None:
+        """Resolve "the latest incoming email" to a concrete thread target.
+
+        Frozen at resolution time: the returned ``thread_id``/``message_id`` are
+        immutable, so a draft bound to them can never silently switch to a newer
+        email that arrives later.
+        """
+        row = self._storage.latest_incoming_message()
+        if row is None or not str(row.get("thread_id") or "").strip():
+            return None
+        return {
+            "thread_id": str(row["thread_id"]),
+            "message_id": str(row.get("message_id") or ""),
+        }
+
+    async def _queue_reply(
+        self,
+        user_id: int,
+        instruction: str,
+        thread_id: str,
+        *,
+        message: Message | None = None,
+        tg_message_id: int = 0,
+    ) -> None:
+        """Put a ReplyRequest on the coordinator queue (classic reply flow)."""
+        attachments = (
+            await self._collect_outgoing_attachments(message)
+            if message is not None
+            else ()
+        )
+        memory = tuple(m["value"] for m in self._storage.list_memories(user_id))
+        self._queue.put_nowait(
+            ReplyRequest(
+                thread_id=thread_id,
+                user_instructions=instruction,
+                source_message_id=(
+                    message.message_id if message is not None else tg_message_id
+                ),
+                memory=memory,
+                user_id=user_id,
+                attachments=attachments,
+            )
+        )
 
     # ── text draft actions (explicit only; never on "ok"/"sí") ─────────────
 
@@ -824,6 +893,23 @@ class TelegramBot(TelegramNotifier):
         self, message: Message, user_id: int, flow: dict[str, Any], text: str
     ) -> bool:
         flow_name = str(flow.get("flow") or "")
+
+        # Bounded: stale pending flows expire (in-memory only, no persistence).
+        ts = flow.get("ts")
+        if isinstance(ts, int | float) and (time.time() - ts) > _FLOW_TTL_SECONDS:
+            self._pending_flows.pop(user_id, None)
+            await self._send("Se acabó el tiempo de esta petición; empieza de nuevo.")
+            return True
+
+        # Explicit cancellation clears the pending flow (never a send).
+        if _FLOW_CANCEL.match(text.strip()):
+            self._pending_flows.pop(user_id, None)
+            await self._send("Cancelado.")
+            return True
+
+        if flow_name == "reply_target":
+            await self._reply_target_step(user_id, flow, text)
+            return True
         if flow_name == "compose_recipient":
             await self._compose_recipient_step(user_id, text)
             return True
@@ -885,12 +971,34 @@ class TelegramBot(TelegramNotifier):
             return True
         return False
 
+    async def _reply_target_step(
+        self, user_id: int, flow: dict[str, Any], text: str
+    ) -> None:
+        """Fill the missing reply target slot ("al último" → latest email)."""
+        if has_latest_reference(text):
+            latest = self._latest_reply_target()
+            if latest is None:
+                await self._send(
+                    "No tengo ningún correo recibido reciente al que responder."
+                )
+                return
+            self._pending_flows.pop(user_id, None)
+            instruction = str(flow.get("instruction") or "")
+            await self._queue_reply(user_id, instruction, latest["thread_id"])
+            return
+        await self._send(
+            "Dime «al último» para responder al correo recibido más reciente, "
+            "o responde directamente a un resumen de InboxBridge."
+        )
+
     async def _compose_recipient_step(
         self, user_id: int, text: str, instruction_hint: str | None = None
     ) -> None:
         from ..contacts import validate_email
 
-        phrase = text.strip().strip(".,;:!?¿¡")
+        # Allow "a <recipient>" / "para <recipient>" as a natural slot fill.
+        phrase = re.sub(r"^(a |para )", "", text.strip(), flags=re.IGNORECASE)
+        phrase = phrase.strip(" .,;:!?¿¡")
         if validate_email(phrase):
             self._pending_flows[user_id] = {
                 "flow": "compose_instruction",

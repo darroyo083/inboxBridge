@@ -250,6 +250,23 @@ class Storage:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def latest_incoming_message(self) -> dict[str, Any] | None:
+        """The most recent INCOMING message fully processed by InboxBridge.
+
+        Only messages that were successfully summarized and posted to Telegram
+        (status ``sent_telegram``) are eligible — this excludes our own sent
+        messages (those live in ``drafts``, never ``messages``), failed rows
+        and never-processed history. Used to resolve "al último correo" to a
+        concrete, immutable thread target.
+        """
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT * FROM messages WHERE status = ? "
+            "ORDER BY created_at DESC, history_id DESC LIMIT 1",
+            (MessageStatus.SENT_TELEGRAM.value,),
+        ).fetchone()
+        return dict(row) if row else None
+
     # ── drafts ──────────────────────────────────────────────────────────────
     def create_draft(
         self,
