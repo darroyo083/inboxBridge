@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from openai.types.chat import ChatCompletionMessageParam
 
 from ..config import Settings, get_settings
+from . import prompts
 from .base import (
     LLMEmptyResponse,
     LLMError,
@@ -124,6 +125,14 @@ class AIService:
             record.success = False
             self._finish(record, started, error=exc)
             raise
+
+    async def translate_to_spanish(self, body: str) -> str:
+        """Translate a German draft body to Spanish (display-only, never sent)."""
+        return await self.text(
+            prompts.translate_to_spanish_messages(body),
+            max_tokens=self._settings.llm_max_tokens_draft,
+            task="translate",
+        )
 
     # ── vision ──────────────────────────────────────────────────────────────
 

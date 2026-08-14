@@ -157,6 +157,13 @@ class EmailAssistant:
         except LLMError:
             await self._bot.send_notice("No pude editar el borrador ahora; inténtalo otra vez.")
             return
+        # Regenerate the display-only Spanish translation from the NEW German
+        # body, so the preview never shows a stale translation.
+        try:
+            new_body_es = (await self._ai.translate_to_spanish(new_body)).strip()
+        except Exception:
+            logger.warning("draft translation failed; showing German-only preview")
+            new_body_es = ""
         updated = DraftReply(
             thread_id=pending.draft.thread_id,
             subject=pending.draft.subject,
@@ -166,6 +173,7 @@ class EmailAssistant:
             in_reply_to=pending.draft.in_reply_to,
             references=pending.draft.references,
             attachments=pending.draft.attachments,
+            body_es=new_body_es,
         )
         await self._bot.apply_draft_edit(pending.draft_id, updated)
         # Persisted draft row keeps the latest body (retry coherence).

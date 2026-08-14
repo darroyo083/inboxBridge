@@ -262,6 +262,28 @@ class TestSendReply:
         mime = send_call_mime(client)
         assert mime["Subject"] == "Fwd: Presupuesto"
 
+    async def test_spanish_translation_never_sent(self) -> None:
+        """The display-only Spanish translation must never enter the sent MIME."""
+        routes: dict[Route, object] = {
+            ("users", "threads", "get"): thread_response(
+                thread_message("m2", "200", message_id_header="<m2@x>"), thread_id="t1"
+            ),
+            ("users", "messages", "send"): {"id": "m3"},
+        }
+        client = GmailClient(make_settings(), service=FakeGmailService(routes))
+        draft = DraftReply(
+            thread_id="t1",
+            subject="Tema",
+            to=[EmailAddress("A", "a@b.c")],
+            cc=[],
+            body="Sehr geehrte Frau Muster, vielen Dank für Ihre Nachricht.",
+            body_es="Estimada señora Muster, muchas gracias por su mensaje.",
+        )
+        await client.send_reply(draft)
+        mime = send_call_mime(client)
+        assert "vielen Dank" in mime.get_payload()
+        assert "muchas gracias" not in mime.get_payload()
+
     async def test_subject_gets_re_prefix(self) -> None:
         routes: dict[Route, object] = {
             ("users", "threads", "get"): thread_response(

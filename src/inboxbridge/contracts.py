@@ -71,6 +71,12 @@ class LLMProvider(Protocol):
         """Draft a professional German reply using thread context."""
         ...
 
+    async def translate_to_spanish(self, body: str) -> str:
+        """Translate a German draft body to Spanish for the Telegram preview.
+
+        Display-only: the Spanish text is never sent to Gmail."""
+        ...
+
 
 class TelegramNotifier(Protocol):
     """Telegram side. Only the configured group chat is ever touched."""

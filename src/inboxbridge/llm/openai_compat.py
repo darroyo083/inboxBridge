@@ -128,6 +128,13 @@ class OpenAICompatLLM:
     async def _complete(self, messages: list[ChatCompletionMessageParam], max_tokens: int) -> str:
         return await self.complete(messages, max_tokens=max_tokens)
 
+    async def translate_to_spanish(self, body: str) -> str:
+        """Translate a German draft body to Spanish (display-only, never sent)."""
+        return await self.complete(
+            prompts.translate_to_spanish_messages(body),
+            max_tokens=self._settings.llm_max_tokens_draft,
+        )
+
     async def complete(
         self, messages: list[ChatCompletionMessageParam], *, max_tokens: int
     ) -> str:

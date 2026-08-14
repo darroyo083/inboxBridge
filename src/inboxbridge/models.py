@@ -192,6 +192,9 @@ class DraftReply:
     ``attachments`` are Telegram-supplied files attached AFTER generation
     (the LLM never decides what to attach); they travel in memory and in a
     temp directory, never in SQLite.
+
+    ``body_es`` is a display-only Spanish translation of ``body`` for the
+    Telegram preview. It is NEVER sent to Gmail and is never persisted.
     """
 
     thread_id: str
@@ -202,6 +205,7 @@ class DraftReply:
     in_reply_to: str = ""
     references: str = ""
     attachments: tuple[OutgoingAttachment, ...] = ()
+    body_es: str = ""
 
 
 @dataclass(frozen=True)

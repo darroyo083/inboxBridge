@@ -136,6 +136,30 @@ def test_unknown_thread_notifies_user(tmp_path: object) -> None:
     assert any("hilo" in n for n in bot.notices)
 
 
+def test_preview_includes_spanish_translation(tmp_path: object) -> None:
+    """The presented draft carries a display-only Spanish translation of the
+    exact German body (derived from the body, never sent)."""
+    settings = make_settings(SEND_EMAILS=True)
+    storage = make_storage(tmp_path)
+    gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
+    llm = MockLLM()
+    bot = FakeReplyBot()
+
+    coordinator = ReplyCoordinator(settings, gmail, llm, bot, storage)
+    _run_request(
+        coordinator,
+        ReplyRequest(thread_id="t1", user_instructions="Danke", source_message_id=5),
+    )
+
+    shown = bot.drafts_shown[0]
+    assert shown.body.startswith("Sehr geehrte Frau Muster")
+    assert shown.body_es == "[ES] " + shown.body  # translation derived from the body
+    # The Spanish translation is display-only: it is not persisted on the row.
+    row = storage.get_draft(1)
+    assert "body_es" not in row
+    assert row["body"].startswith("Sehr geehrte")
+
+
 class MockLLM:
     """Deterministic LLMProvider double for the responder tests."""
 
@@ -160,3 +184,6 @@ class MockLLM:
             in_reply_to=thread_ctx.messages[-1].message_id if thread_ctx.messages else "",
             references="",
         )
+
+    async def translate_to_spanish(self, body: str) -> str:
+        return "[ES] " + body

@@ -701,3 +701,6 @@ class MockLLM:
             in_reply_to=thread_ctx.messages[-1].message_id if thread_ctx.messages else "",
             references="",
         )
+
+    async def translate_to_spanish(self, body: str) -> str:
+        return "[ES] " + body

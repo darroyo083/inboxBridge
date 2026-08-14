@@ -1955,12 +1955,18 @@ class TelegramBot(TelegramNotifier):
             )
             attachments_line = f"\nAdjuntos:\n{names}"
         kind = "Nuevo correo" if not draft.thread_id else "Respuesta"
+        spanish_block = ""
+        if draft.body_es:
+            spanish_block = (
+                f"\n\n🇪🇸 Español · traducción\n{neutralize_links(draft.body_es)}"
+            )
         text = (
             f"Borrador ({kind})\n"
             f"Para: {to_line}{cc_line}\n"
             f"Asunto: {draft.subject}\n"
             f"{attachments_line}\n\n"
-            f"{neutralize_links(draft.body)}"
+            f"🇩🇪 Alemán · se enviará\n{neutralize_links(draft.body)}"
+            f"{spanish_block}"
         )
         keyboard = InlineKeyboardMarkup(
             [

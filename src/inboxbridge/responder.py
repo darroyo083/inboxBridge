@@ -129,6 +129,7 @@ class ReplyCoordinator:
         # Claim freshly-downloaded files into tmp/draft-<id>/ so the whole
         # attachment lifecycle is per-draft (sweepable, resendable).
         draft = self._claim_attachments(draft_id, draft)
+        draft = await self._translate_for_preview(draft)
         await self._bot.send_draft_for_confirmation(
             draft, draft_id=draft_id, user_id=user_id
         )
@@ -144,6 +145,24 @@ class ReplyCoordinator:
             return
         self._storage.set_draft_status(draft_id, DraftStatus.CONFIRMED)
         await self._send_confirmed(draft_id, draft)
+
+    async def _translate_for_preview(self, draft: DraftReply) -> DraftReply:
+        """Attach a best-effort Spanish translation of the German body.
+
+        The translation is a display-only aid for the Telegram preview and is
+        derived from the EXACT body that will be sent (never generated
+        independently from the instruction). It is never persisted and never
+        included in the Gmail message; any failure just omits it.
+        """
+        if draft.body_es or not draft.body.strip():
+            return draft
+        try:
+            translated = (await self._llm.translate_to_spanish(draft.body)).strip()
+            if translated:
+                return replace(draft, body_es=translated)
+        except Exception:
+            logger.warning("draft translation failed; showing German-only preview")
+        return draft
 
     async def _send_confirmed(self, draft_id: int, draft: DraftReply) -> None:
         """Drive one send attempt: sending → (verified | unverified | failed).

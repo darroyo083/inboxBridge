@@ -102,6 +102,9 @@ class FakeAi:
             return "Sehr geehrte Frau Muster,\n\nkurz und klar.\n\nMit freundlichen Grüßen"
         return self.default_text
 
+    async def translate_to_spanish(self, body: str) -> str:
+        return "[ES] " + body
+
     async def vision(
         self,
         prompt: str,
@@ -164,6 +167,9 @@ class FakeCoordinatorLLM:
             in_reply_to=thread.messages[-1].message_id if thread.messages else "",
             references="",
         )
+
+    async def translate_to_spanish(self, body: str) -> str:
+        return "[ES] " + body
 
 
 class Stack:
@@ -327,6 +333,34 @@ async def _cleanup_stack(stack: Stack) -> Any:
 
 
 # ── A. REPLY + EDIT + SEND ───────────────────────────────────────────────────
+
+
+async def test_flow_spanish_preview_reply_and_edit(stack: Stack) -> None:
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("respóndele que el viernes sí puedo", reply_to=stack.bot_message(summary_id))
+    await stack.pump()
+    await asyncio.sleep(0.15)
+
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews
+    preview = previews[-1]
+    assert "🇩🇪 Alemán · se enviará" in preview
+    assert "Sehr geehrte Frau Muster" in preview  # German body (exact)
+    assert "🇪🇸 Español · traducción" in preview
+    assert "[ES] Sehr geehrte Frau Muster" in preview  # Spanish translation
+
+    # Edit regenerates BOTH the German body and its Spanish translation.
+    await stack.send("hazlo más corto")
+    await asyncio.sleep(0.05)
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews
+    edited = previews[-1]
+    assert "kurz und klar" in edited  # new German
+    assert "[ES] Sehr geehrte Frau Muster,\n\nkurz und klar" in edited  # new Spanish
 
 
 async def test_flow_a_reply_edit_send(stack: Stack) -> None:
