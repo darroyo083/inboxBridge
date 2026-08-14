@@ -94,6 +94,19 @@ class TestRuleBasics:
         assert intent.action == IntentAction.FORWARD_EMAIL
         assert intent.payload.get("recipient", "").lower() == "daniel"
 
+    def test_reply_intent_is_rule_based(self) -> None:
+        # "respóndele…" / "dile que…" resolve deterministically (rules-first),
+        # so a transient empty LLM response can never break this UX.
+        for phrase in (
+            "respóndele que sí",
+            "respóndele que el viernes sí puedo",
+            "dile que mañana estaré allí a las 14:30",
+            "contéstale que sí",
+        ):
+            intent = classify_rule(phrase)
+            assert intent.action == IntentAction.REPLY_TO_EMAIL
+            assert not intent.explicit  # generates a draft, never a blind send
+
     def test_help_and_unknown(self) -> None:
         assert classify_rule("ayuda").action == IntentAction.HELP
         assert classify_rule("hola que tal").action == IntentAction.UNKNOWN
@@ -174,9 +187,9 @@ class TestLlmFallback:
     def test_ambiguous_llm_result_becomes_clarify(self) -> None:
         ai = FakeAi(
             '{"action": "reply_to_email", "recipient": "", "instruction": '
-            '"dile que sí", "needs_clarification": true}'
+            '"dile algo", "needs_clarification": true}'
         )
-        intent = run(IntentClassifier(ai).classify("dile que sí", context=""))
+        intent = run(IntentClassifier(ai).classify("dile algo", context=""))
         assert intent.action == IntentAction.CLARIFY
 
     def test_rules_win_over_llm(self) -> None:

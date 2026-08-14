@@ -726,25 +726,32 @@ class TelegramBot(TelegramNotifier):
             await self._edit_draft_via_text(user_id, text, action)
             return
 
-        # LLM-classified "reply to email": the classic reply flow.
-        if action == IntentAction.REPLY_TO_EMAIL and fallback_to_reply:
-            attachments = (
-                await self._collect_outgoing_attachments(message)
-                if message is not None
-                else ()
-            )
-            memory = tuple(m["value"] for m in self._storage.list_memories(user_id))
-            self._queue.put_nowait(
-                ReplyRequest(
-                    thread_id=thread_id,
-                    user_instructions=text,
-                    source_message_id=(
-                        message.message_id if message is not None else tg_message_id
-                    ),
-                    memory=memory,
-                    user_id=user_id,
-                    attachments=attachments,
+        # Reply intent (rules-first, but the LLM may still classify it): the
+        # classic reply flow when bound to a thread, otherwise ask for context.
+        if action == IntentAction.REPLY_TO_EMAIL:
+            if fallback_to_reply:
+                attachments = (
+                    await self._collect_outgoing_attachments(message)
+                    if message is not None
+                    else ()
                 )
+                memory = tuple(m["value"] for m in self._storage.list_memories(user_id))
+                self._queue.put_nowait(
+                    ReplyRequest(
+                        thread_id=thread_id,
+                        user_instructions=text,
+                        source_message_id=(
+                            message.message_id if message is not None else tg_message_id
+                        ),
+                        memory=memory,
+                        user_id=user_id,
+                        attachments=attachments,
+                    )
+                )
+                return
+            await self._send(
+                "¿A qué correo quieres responder? Responde directamente a un "
+                "resumen de InboxBridge y escribe ahí tu respuesta."
             )
             return
 

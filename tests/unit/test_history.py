@@ -65,7 +65,9 @@ class TestNewMessageIds:
             ),
             ("users", "messages", "get"): lambda kwargs: labels_response(
                 kwargs["id"],
-                ["CATEGORY_PERSONAL"] if kwargs["id"] in ("m1", "m3") else ["CATEGORY_SOCIAL"],
+                ["INBOX", "CATEGORY_PERSONAL"]
+                if kwargs["id"] in ("m1", "m3")
+                else ["INBOX", "CATEGORY_SOCIAL"],
             ),
         }
         storage.set_meta(META_HISTORY_ID, "49")
@@ -75,9 +77,10 @@ class TestNewMessageIds:
         assert delta.history_id == 50
 
     def test_unlabeled_messages_are_primary(self, storage: Storage) -> None:
+        # Tabs disabled: inbox messages have only INBOX (+UNREAD), no CATEGORY_*.
         routes: dict[Route, object] = {
             ("users", "history", "list"): history_page(history_record(60, "m1", "m2")),
-            ("users", "messages", "get"): lambda kwargs: labels_response(kwargs["id"], []),
+            ("users", "messages", "get"): lambda kwargs: labels_response(kwargs["id"], ["INBOX"]),
         }
         storage.set_meta(META_HISTORY_ID, "59")
         processor = HistoryProcessor(make_settings(), FakeGmailService(routes), storage)
@@ -88,7 +91,7 @@ class TestNewMessageIds:
         routes: dict[Route, object] = {
             ("users", "history", "list"): history_page(history_record(70, "m1")),
             ("users", "messages", "get"): labels_response(
-                "m1", ["CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL"]
+                "m1", ["INBOX", "CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL"]
             ),
         }
         storage.set_meta(META_HISTORY_ID, "69")
@@ -97,12 +100,52 @@ class TestNewMessageIds:
         assert delta.message_ids == []
         assert delta.unknown_count == 0  # NOT_PRIMARY is not UNKNOWN
 
+    def test_sent_message_is_not_primary(self, storage: Storage) -> None:
+        """Our own outgoing reply/new-mail/forward (SENT) must never be processed
+        as incoming — even if Gmail's INBOX history surfaced it."""
+        routes: dict[Route, object] = {
+            ("users", "history", "list"): history_page(history_record(71, "sent-1")),
+            ("users", "messages", "get"): labels_response("sent-1", ["SENT"]),
+        }
+        storage.set_meta(META_HISTORY_ID, "70")
+        processor = HistoryProcessor(make_settings(), FakeGmailService(routes), storage)
+        delta = processor.new_message_ids(event_history_id=71)
+        assert delta.message_ids == []
+        assert delta.unknown_count == 0  # safely skippable, baseline advances
+
+    def test_sent_message_with_category_still_not_primary(self, storage: Storage) -> None:
+        """SENT wins even if Gmail also tags the sent message CATEGORY_PERSONAL."""
+        routes: dict[Route, object] = {
+            ("users", "history", "list"): history_page(history_record(72, "sent-2")),
+            ("users", "messages", "get"): labels_response(
+                "sent-2", ["SENT", "CATEGORY_PERSONAL"]
+            ),
+        }
+        storage.set_meta(META_HISTORY_ID, "71")
+        processor = HistoryProcessor(make_settings(), FakeGmailService(routes), storage)
+        delta = processor.new_message_ids(event_history_id=72)
+        assert delta.message_ids == []
+        assert delta.unknown_count == 0
+
+    def test_missing_inbox_is_not_primary(self, storage: Storage) -> None:
+        """A message without INBOX (e.g. archived) is not new incoming Primary,
+        even if it has CATEGORY_PERSONAL."""
+        routes: dict[Route, object] = {
+            ("users", "history", "list"): history_page(history_record(73, "m-arch")),
+            ("users", "messages", "get"): labels_response("m-arch", ["CATEGORY_PERSONAL"]),
+        }
+        storage.set_meta(META_HISTORY_ID, "72")
+        processor = HistoryProcessor(make_settings(), FakeGmailService(routes), storage)
+        delta = processor.new_message_ids(event_history_id=73)
+        assert delta.message_ids == []
+        assert delta.unknown_count == 0
+
     def test_dedup_against_db_and_within_batch(self, storage: Storage) -> None:
         routes: dict[Route, object] = {
             ("users", "history", "list"): history_page(
                 history_record(80, "m1", "m2", "m2", "m3")
             ),
-            ("users", "messages", "get"): labels_response("m1", ["CATEGORY_PERSONAL"]),
+            ("users", "messages", "get"): labels_response("m1", ["INBOX", "CATEGORY_PERSONAL"]),
         }
         storage.set_meta(META_HISTORY_ID, "79")
         from inboxbridge.models import MessageStatus
@@ -119,7 +162,7 @@ class TestNewMessageIds:
             )
             if kwargs.get("pageToken") is None
             else history_page(history_record(91, "m2")),
-            ("users", "messages", "get"): labels_response("m1", ["CATEGORY_PERSONAL"]),
+            ("users", "messages", "get"): labels_response("m1", ["INBOX", "CATEGORY_PERSONAL"]),
         }
         storage.set_meta(META_HISTORY_ID, "89")
         service = FakeGmailService(routes)

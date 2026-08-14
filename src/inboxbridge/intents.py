@@ -165,6 +165,10 @@ _COMPOSE = re.compile(
     r"manda un mail a |escr[ií]be un mail a )",
     re.IGNORECASE,
 )
+_REPLY = re.compile(
+    r"\b(resp[oó]ndele|respondele|cont[eé]stale|contestale|dile que)\b",
+    re.IGNORECASE,
+)
 _REMINDER = re.compile(
     r"\b(recu[eé]rdame|recu[eé]rdamelo|recu[eé]rdame esto|no me lo olvides)\b",
     re.IGNORECASE,
@@ -305,7 +309,7 @@ def _rule_classify(text: str) -> _RuleResult:
     if _LIST_REMINDERS.search(stripped):
         return _RuleResult(IntentAction.LIST_REMINDERS, explicit=False)
 
-    # Compose / forward.
+    # Compose / forward / reply.
     if _FORWARD.search(stripped):
         recipient = _extract_after(stripped, _FORWARD)
         return _RuleResult(
@@ -319,6 +323,15 @@ def _rule_classify(text: str) -> _RuleResult:
             IntentAction.COMPOSE_NEW_EMAIL,
             explicit=False,
             payload={"recipient": target, "instruction": stripped},
+        )
+    if _REPLY.search(stripped):
+        # Deterministic reply intent ("respóndele que…", "dile que…"): never
+        # depends on an LLM classification, so a transient empty LLM response
+        # cannot break this UX.
+        return _RuleResult(
+            IntentAction.REPLY_TO_EMAIL,
+            explicit=False,
+            payload={"instruction": stripped},
         )
 
     # Questions / attachments / summaries.

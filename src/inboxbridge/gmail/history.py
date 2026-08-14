@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 PRIMARY_LABEL = "CATEGORY_PERSONAL"
 CATEGORY_PREFIX = "CATEGORY_"
 INBOX_LABEL = "INBOX"
+SENT_LABEL = "SENT"
 # Safety cap: history.list pages (~1000 records each) must never loop forever.
 MAX_HISTORY_PAGES = 100
 
@@ -178,6 +179,18 @@ class HistoryProcessor:
             logger.exception("could not fetch labels for %s; unknown", message_id)
             return PrimaryStatus.UNKNOWN
         labels = {str(label) for label in resp.get("labelIds") or []}
+        # Our own outgoing messages (reply / new email / forward) carry SENT and
+        # must NEVER be processed as incoming Primary — even if Gmail's INBOX
+        # history surfaced them (e.g. a reply inside a thread that lives in
+        # INBOX). Skipping them is safe: the baseline advances past them and
+        # real reception is unaffected.
+        if SENT_LABEL in labels:
+            return PrimaryStatus.NOT_PRIMARY
+        # Only inbox messages are incoming candidates. (history.list is already
+        # filtered by INBOX, but this is defense in depth: a message that lost
+        # INBOX — e.g. it was archived or sent — is not new incoming Primary.)
+        if INBOX_LABEL not in labels:
+            return PrimaryStatus.NOT_PRIMARY
         if PRIMARY_LABEL in labels or not any(
             label.startswith(CATEGORY_PREFIX) for label in labels
         ):
