@@ -85,6 +85,10 @@ class FakeAi:
         # LLMEmptyResponse (transient) — the caller must retry boundedly.
         self.translate_failures = 0
         self.translate_calls = 0
+        # Draft-edit retry simulation: first N draft_edit calls raise
+        # LLMEmptyResponse (transient) — the caller must retry boundedly.
+        self.draft_edit_failures = 0
+        self.draft_edit_calls = 0
 
     async def text(self, messages: list[Any], *, max_tokens: int, task: str) -> str:
         self.calls.append((task, "deepseek-v4-flash"))
@@ -107,6 +111,12 @@ class FakeAi:
                 'freundlichen Grüßen"}'
             )
         if task == "draft_edit":
+            self.draft_edit_calls += 1
+            if self.draft_edit_failures > 0:
+                self.draft_edit_failures -= 1
+                from inboxbridge.llm.base import LLMEmptyResponse
+
+                raise LLMEmptyResponse("simulated empty edit")
             return "Sehr geehrte Frau Muster,\n\nkurz und klar.\n\nMit freundlichen Grüßen"
         return self.default_text
 
@@ -1083,6 +1093,93 @@ async def test_flow_y_edit_spanish_never_in_gmail_body(stack: Stack) -> None:
     assert len(stack.gmail.sent) == 1
     assert "[ES]" not in stack.gmail.sent[0].body  # Spanish never sent
     assert "⚠️" not in stack.gmail.sent[0].body
+
+
+# ── Z. RULES-FIRST EDITS + DRAFT_EDIT BOUNDED RETRY ──────────────────────────
+
+
+def _preview_count(stack: Stack) -> int:
+    return sum(1 for m in stack.sender.messages if (m.text or "").startswith("Borrador ("))
+
+
+async def test_flow_z_edit_routes_rules_first_no_intent_llm(stack: Stack) -> None:
+    """'más largo' with an active draft edits directly; the intent LLM is
+    never consulted."""
+    await _compose_draft_token(stack)
+    await stack.send("más largo")
+    await asyncio.sleep(0.05)
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews and "kurz und klar" in previews[-1]  # edited
+    assert not any(c[0] == "intent" for c in stack.ai.calls)  # rules-first
+    assert stack.ai.draft_edit_calls == 1
+
+
+async def test_flow_z_tone_edit_routes_rules_first(stack: Stack) -> None:
+    await _compose_draft_token(stack)
+    await stack.send("más formal")
+    await asyncio.sleep(0.05)
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews and "kurz und klar" in previews[-1]  # edited
+    assert not any(c[0] == "intent" for c in stack.ai.calls)
+
+
+async def test_flow_z_edit_without_draft_does_not_mutate(stack: Stack) -> None:
+    await stack.send("más largo")
+    await asyncio.sleep(0.05)
+    assert stack.storage.get_draft(1) is None  # no draft created/mutated
+    assert stack.gmail.sent == []
+
+
+async def test_flow_z_edit_retry_succeeds_one_preview(stack: Stack) -> None:
+    """First draft_edit returns LLMEmptyResponse; bounded retry succeeds →
+    exactly one new preview, translation runs after the successful edit."""
+    stack.ai.draft_edit_failures = 1
+    await _compose_draft_token(stack)
+    before = _preview_count(stack)
+    await stack.send("más largo")
+    await asyncio.sleep(0.05)
+    assert stack.ai.draft_edit_calls == 2  # one retry
+    assert _preview_count(stack) == before + 1  # exactly one new preview
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert "kurz und klar" in previews[-1]
+    assert "[ES]" in previews[-1]  # translation ran after the successful edit
+    assert stack.ai.translate_calls == 1
+
+
+async def test_flow_z_edit_retry_exhausted_preserves_draft(stack: Stack) -> None:
+    """Both draft_edit attempts fail → the original draft/preview stays active
+    and unchanged; the user is told the edit could not be completed."""
+    stack.ai.draft_edit_failures = 5  # more than the retry budget
+    await _compose_draft_token(stack)
+    before = _preview_count(stack)
+    await stack.send("más largo")
+    await asyncio.sleep(0.05)
+    assert stack.ai.draft_edit_calls == 2  # bounded
+    assert _preview_count(stack) == before  # no new preview
+    assert any("No pude editar" in (m.text or "") for m in stack.sender.messages)
+    assert stack.draft_row(1)["status"] == DraftStatus.PENDING.value  # still active
+
+
+async def test_flow_z_edit_retry_preserves_subject_recipient(stack: Stack) -> None:
+    stack.ai.draft_edit_failures = 1
+    stack.contacts.create_contact("Roman", "femo@femo.ch")
+    await stack.send_bg("escribe a Roman y dile que hola")
+    await asyncio.sleep(0.05)
+    await stack.send("más largo")
+    await asyncio.sleep(0.05)
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews
+    edited = previews[-1]
+    assert "Asunto: Vielen Dank" in edited  # subject preserved
+    assert "femo@femo.ch" in edited  # recipient preserved
 
 
 # ── T. VOICE (EXPERIMENTAL) ──────────────────────────────────────────────────

@@ -158,10 +158,19 @@ class EmailAssistant:
                 )
             await self._bot.send_typing()
             messages = prompts.edit_draft_messages(pending.draft.body, instruction, thread)
-            new_body = await self._ai.text(
-                messages,
-                max_tokens=self._settings.llm_max_tokens_draft,
-                task="draft_edit",
+            # Bounded retry (one extra attempt) covers transient LLMEmptyResponse
+            # on the edit generation itself. The retry runs the SAME operation
+            # against the SAME current German draft; recipient/subject/thread/
+            # attachments/owner are untouched, and a new preview is only
+            # published after one edit generation succeeds.
+            new_body = await call_with_retry(
+                lambda: self._ai.text(
+                    messages,
+                    max_tokens=self._settings.llm_max_tokens_draft,
+                    task="draft_edit",
+                ),
+                max_attempts=2,
+                base_backoff=self._settings.retry_backoff_base,
             )
         except LLMError:
             await self._bot.send_notice("No pude editar el borrador ahora; inténtalo otra vez.")

@@ -113,11 +113,18 @@ _CANCEL_DRAFT = re.compile(
     re.IGNORECASE,
 )
 _EDIT = re.compile(
-    r"\b(hazlo m[aá]s corto|m[aá]s corto|hazlo m[aá]s formal|m[aá]s formal|"
-    r"hazlo m[aá]s amable|m[aá]s amable|m[aá]s educado|m[aá]s cordial|"
-    r"hazlo m[aá]s pol[ií]tico|ed[ií]talo y|ed[ií]talo|pon que|ponle que|"
-    r"cambia (el|la|lo|las|los)|a[nñ]ade (que|la|el|lo)|quita (el|la|lo|las|los)|"
-    r"no, mejor|mejor dile|en su lugar dile|dile mejor)\b",
+    r"\b("
+    # Length/tone modifiers — a modifier is required ("más largo", "mucho más
+    # corto", "hazlo muy breve"...), optionally with a verb prefix.
+    r"(?:hazlo |ponlo |d[eé]jalo |h[aá]zlo )?"
+    r"(?:un poco |mucho |muy |m[aá]s |menos )"
+    r"(?:largo|corto|breve|formal|informal|cercano|amable|directo|profesional|"
+    r"educado|cordial|pol[ií]tico)"
+    # Existing verb forms.
+    r"|ed[ií]talo y|ed[ií]talo|pon que|ponle que"
+    r"|cambia (el|la|lo|las|los)|a[nñ]ade (que|la|el|lo)|quita (el|la|lo|las|los)"
+    r"|no, mejor|mejor dile|en su lugar dile|dile mejor"
+    r")\b",
     re.IGNORECASE,
 )
 _REGENERATE = re.compile(

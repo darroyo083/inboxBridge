@@ -713,6 +713,12 @@ class TelegramBot(TelegramNotifier):
             )
             return
 
+        # Edit language ("más largo", "más formal"...) only routes as an edit
+        # when there IS an active draft. Outside a draft it must not mutate
+        # anything: treat it as ambiguous so the normal fallback applies.
+        if action in (IntentAction.MODIFY_DRAFT, IntentAction.REGENERATE_DRAFT) and not has_draft:
+            action = IntentAction.UNKNOWN
+
         if action in (IntentAction.CLARIFY, IntentAction.UNKNOWN):
             if fallback_to_reply:
                 # Classic reply flow: the member's message is the reply intent

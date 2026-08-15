@@ -48,6 +48,33 @@ class TestRuleBasics:
         assert classify_rule("cambia las 18:00 por las 19:00").action == IntentAction.MODIFY_DRAFT
         assert classify_rule("reescríbelo").action == IntentAction.REGENERATE_DRAFT
 
+    def test_edit_length_tone_modifiers_rules_first(self) -> None:
+        """Common edit language must classify rules-first (no LLM intent call)."""
+        for phrase in (
+            "más largo",
+            "mas largo",
+            "hazlo más largo",
+            "hazlo mas largo",
+            "mucho más largo",
+            "un poco más largo",
+            "más corto",
+            "mas corto",
+            "hazlo más corto",
+            "un poco más corto",
+            "muy corto",
+            "hazlo muy breve",
+            "más formal",
+            "menos formal",
+            "más informal",
+            "más cercano",
+            "más amable",
+            "más directo",
+            "más profesional",
+        ):
+            intent = classify_rule(phrase)
+            assert intent.action == IntentAction.MODIFY_DRAFT, phrase
+            assert not intent.explicit
+
     def test_questions_and_summaries(self) -> None:
         assert classify_rule("¿qué me está pidiendo?").action == IntentAction.ASK_ABOUT_EMAIL
         assert classify_rule("¿tengo que responder?").action == IntentAction.ASK_ABOUT_EMAIL
