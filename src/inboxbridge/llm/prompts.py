@@ -12,6 +12,7 @@ from __future__ import annotations
 from openai.types.chat import ChatCompletionMessageParam
 
 from ..models import DraftRequest, ParsedEmail, ThreadContext
+from .qa import CONTEXTUAL_EMOJIS
 
 #: Delimiters that mark untrusted (third-party) content in user messages.
 UNTRUSTED_DATA_START = "<<<UNTRUSTED_EMAIL_CONTENT_START>>>"
@@ -346,8 +347,14 @@ def ask_about_email_messages(
     Context includes each message body plus bounded extracted attachment text,
     all inside the untrusted delimiters (sealed). An unreadable attachment is
     flagged so the model never invents facts it could not read.
+
+    The answer uses a structured JSON contract (answer line + optional fact
+    sections) so the application can render deterministic safe formatting and
+    so the model is forced to extract the exact requested facts instead of
+    drifting into a generic summary of the email.
     """
     thread_text = _join_context(thread)
+    allowed_emojis = " ".join(sorted(CONTEXTUAL_EMOJIS))
     return [
         {
             "role": "system",
@@ -357,17 +364,34 @@ def ask_about_email_messages(
                 "breve y claro.\n\n"
                 f"{_SECURITY_BLOCK}\n\n"
                 "Usa el cuerpo del correo Y el contenido de los adjuntos (si "
-                "aporta la respuesta). Preserva exactos fechas, horas, importes, "
-                "monedas, direcciones, nombres y plazos.\n"
-                "Responde PRIMERO a la pregunta concreta; no resumas el correo "
-                "salvo que sea útil. Nunca inventes información que no esté en el "
-                "contexto. Si un adjunto no se pudo leer y la respuesta depende de "
-                "él, dilo claramente (p. ej. «no puedo confirmar el importe: no "
-                "pude leer el adjunto»). Si el correo y un adjunto se contradicen, "
-                "menciónalo. Si la respuesta no está disponible, dilo.\n"
-                "Formato: para respuestas cortas, una línea simple. Para varias "
-                "fechas, usa secciones cortas con un emoji contextual y viñetas "
-                "«•». No uses markdown."
+                "aporta la respuesta).\n\n"
+                "RESPONDE SOLO EN JSON con esta forma exacta (sin markdown, sin "
+                "texto fuera del JSON):\n"
+                '{"answer": "<respuesta directa de 1 línea>", "sections": ['
+                '{"emoji": "<emoji permitido>", "title": "<título corto>", '
+                '"items": ["<hecho 1>", "<hecho 2>"]}]}\n\n'
+                "REGLAS:\n"
+                "1. `answer` responde PRIMERO y directamente a la pregunta, con "
+                "TODOS los datos pedidos. Si la pregunta pide varios hechos "
+                "(importe Y lugar, fecha Y plazo, documentos, etc.), `answer` "
+                "menciona cada dato pedido; nunca respondas solo a una parte.\n"
+                "2. `sections` añade UNA sección por cada hecho pedido (máx. 5). "
+                "Preguntas de un solo hecho: `answer` con el hecho completo y UNA "
+                "sección con UN item con el MISMO texto exacto.\n"
+                "3. Usa SOLO estos emojis: "
+                f"{allowed_emojis}\n"
+                "4. Preserva exactos números, moneda, direcciones, fechas, horas "
+                "y plazos (p. ej. «125 CHF», «Bahnhofstrasse 10, 8001 Zürich», "
+                "«18 de agosto de 2026, 14:30»).\n"
+                "5. Si un adjunto no se pudo leer y la respuesta depende de él, "
+                "dilo en `answer` (p. ej. «no puedo confirmar el importe: no pude "
+                "leer el adjunto»); NUNCA inventes datos.\n"
+                "6. Si el correo y un adjunto se contradicen, menciónalo.\n"
+                "7. No sustituyas una respuesta factual por un resumen genérico "
+                "del correo. Si la pregunta pide datos, responde ESOS datos; no "
+                "digas «te pide que revises…» salvo que la pregunta pregunte "
+                "literalmente qué pide el remitente.\n"
+                "8. Si la respuesta no está en el contexto, dilo en `answer`."
             ),
         },
         {

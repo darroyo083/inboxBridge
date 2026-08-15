@@ -32,6 +32,7 @@ from .gmail.client import GmailClient
 from .llm import prompts
 from .llm.ai_service import AIService
 from .llm.base import LLMError, call_with_retry
+from .llm.qa import parse_qa_answer
 from .llm.signature import finalize_draft_body
 from .models import DraftReply, EmailAddress, OutgoingAttachment, ParsedEmail, ThreadContext
 from .reminders import ReminderParseError, ReminderService
@@ -250,7 +251,7 @@ class EmailAssistant:
                     prompts.ask_about_email_messages(
                         question or "¿Qué me está pidiendo?", thread
                     ),
-                    max_tokens=600,
+                    max_tokens=800,
                     task="qa",
                 ),
                 max_attempts=2,
@@ -266,7 +267,13 @@ class EmailAssistant:
             attachment_count,
             ("true" if attachment_count else "false"),
         )
-        await self._bot.send_rich_notice(_cap(answer, 1800))
+        parsed = parse_qa_answer(answer)
+        if parsed is not None:
+            # Structured contract → deterministic safe section formatting.
+            await self._bot.send_qa_answer(parsed.answer, parsed.sections)
+        else:
+            # Malformed/plain response: safe rich formatting, nothing lost.
+            await self._bot.send_rich_notice(_cap(answer, 1800))
 
     async def _act_summarize_thread(self, payload: dict[str, Any]) -> None:
         thread_id = str(payload.get("thread_id") or "")

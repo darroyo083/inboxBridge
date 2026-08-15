@@ -10,6 +10,7 @@ Q&A, thread summary, forward, mark read, archive, reminder, voice
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -102,6 +103,8 @@ class FakeAi:
         self.qa_calls = 0
         self.thread_summary_failures = 0
         self.thread_summary_calls = 0
+        # Override for the QA answer (malformed / compact scenarios).
+        self.qa_override: str | None = None
         # Last prompt per Q&A / thread-summary call (content assertions).
         self.qa_messages: list[list[Any]] = []
         self.thread_summary_messages: list[list[Any]] = []
@@ -158,8 +161,24 @@ class FakeAi:
                 from inboxbridge.llm.base import LLMEmptyResponse
 
                 raise LLMEmptyResponse("simulated empty qa")
-            return (
-                "💰 Importe\n• Total: 500 EUR\n📍 Cita\n• Bahnhofstrasse 10, Zürich"
+            if self.qa_override is not None:
+                return self.qa_override
+            return json.dumps(
+                {
+                    "answer": "Hay que pagar 500 EUR. La cita es en "
+                    "Bahnhofstrasse 10, Zürich.",
+                    "sections": [
+                        {"emoji": "💰", "title": "Importe", "items": ["500 EUR"]},
+                        {
+                            "emoji": "📍",
+                            "title": "Cita",
+                            "items": [
+                                "Bahnhofstrasse 10, Zürich",
+                                "18 de agosto de 2026, 14:30",
+                            ],
+                        },
+                    ],
+                }
             )
         if task == "thread_summary":
             self.thread_summary_calls += 1
@@ -859,6 +878,9 @@ async def test_flow_q_qa_attachment_context_and_rich_send(
     content = _qa_prompt_content(stack)
     assert "Adjunto «rechnung.pdf»" in content
     assert "125 CHF" in content
+    # THE exact user question must reach the model (rules-first Q&A must not
+    # fall back to an internal default like "¿qué me está pidiendo?").
+    assert "¿cuánto hay que pagar y dónde es la cita?" in content
     # Bounded fetch: Q&A asks for attachments explicitly.
     assert ("t-qa", True) in stack.gmail.thread_context_calls
 
@@ -922,6 +944,102 @@ async def test_flow_q_qa_rich_fallback_plain(stack: Stack) -> None:
     # The full answer arrives as plain text (no bold tags, no lost content).
     assert any("Bahnhofstrasse 10, Zürich" in (t or "") for t in texts)
     assert not any("<b>" in (t or "") for t in texts)
+
+
+async def test_flow_q_qa_compact_single_fact(stack: Stack) -> None:
+    """A one-fact question renders compact: emoji + answer with the fact
+    bolded inline, not a large card."""
+    stack.gmail.threads["t1"] = make_thread("t1")
+    stack.ai.qa_override = json.dumps(
+        {
+            "answer": "El contacto es Markus Schneider.",
+            "sections": [
+                {"emoji": "👤", "title": "Contacto", "items": ["Markus Schneider"]}
+            ],
+        }
+    )
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("¿qué me pide? ¿quién es el contacto?", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    texts = [m.text for m in stack.sender.messages]
+    assert any(
+        "👤 El contacto es <b>Markus Schneider</b>." in (t or "") for t in texts
+    )
+
+
+async def test_flow_q_qa_malformed_structured_falls_back(stack: Stack) -> None:
+    """A malformed (non-JSON) structured response still posts the complete
+    answer with the safe rich formatter — information is never lost."""
+    stack.gmail.threads["t1"] = make_thread("t1")
+    stack.ai.qa_override = "💰 Importe\n• 500 EUR\n📍 Cita\n• Bahnhofstrasse 10, Zürich"
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("¿qué me pide? ¿cuánto hay que pagar?", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    texts = [m.text for m in stack.sender.messages]
+    assert any("500 EUR" in (t or "") for t in texts)
+    assert any("Bahnhofstrasse 10, Zürich" in (t or "") for t in texts)
+    assert any("💰 <b>Importe</b>" in (t or "") for t in texts)
+
+
+async def test_flow_q_qa_dynamic_values_escaped(stack: Stack) -> None:
+    """HTML-special characters in facts and titles stay escaped."""
+    stack.gmail.threads["t1"] = make_thread("t1")
+    stack.ai.qa_override = json.dumps(
+        {
+            "answer": "El total es 100 < 200?",
+            "sections": [
+                {
+                    "emoji": "💰",
+                    "title": "Precio < 200 & oferta",
+                    "items": ["100 < 200 & más"],
+                }
+            ],
+        }
+    )
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("¿qué me pide? ¿cuánto es?", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    texts = [m.text for m in stack.sender.messages]
+    assert any("&lt;200" in (t or "") or "&lt; 200" in (t or "") for t in texts)
+    # The model-provided "<" is escaped, not raw markup after <b>.
+    assert not any("<b>Precio <" in (t or "") for t in texts)
+
+
+async def test_flow_q_button_summary_routes_rules_first(
+    stack: Stack, caplog: pytest.LogCaptureFixture
+) -> None:
+    """"resume toda la conversación" after pressing the Preguntar button must
+    route deterministically to SUMMARIZE_THREAD (not Q&A)."""
+    caplog.set_level(logging.INFO, logger="inboxbridge.assistant")
+    stack.gmail.threads["t-qa"] = _thread_with_attachment(
+        text="Frist: 31.08.2026, Zahlung 125 CHF."
+    )
+    summary_id = await stack.bot.send_summary(
+        make_email(thread_id="t-qa"), EmailSummary(subject_es="Asunto")
+    )
+    await stack.tap(CHAT_ID, f"question:{summary_id}")
+    await stack.send("resume toda la conversación")
+    await asyncio.sleep(0.05)
+    assert stack.ai.thread_summary_calls == 1
+    assert stack.ai.qa_calls == 0
+    assert any("Resumen del hilo" in (m.text or "") for m in stack.sender.messages)
+    # The summary used attachment context and logged it privacy-safely.
+    assert stack.ai.thread_summary_messages
+    content = str(stack.ai.thread_summary_messages[-1][-1]["content"])
+    assert "Adjunto «rechnung.pdf»" in content
+    assert any(
+        "thread_summary outcome=success attachments=1 attachment_context=true" in r.message
+        for r in caplog.records
+    )
+
+
+async def test_flow_q_summary_without_thread_does_not_guess(stack: Stack) -> None:
+    """Standalone "resume toda la conversación" (no known thread) asks for a
+    thread instead of guessing one."""
+    await stack.send("resume toda la conversación")
+    await asyncio.sleep(0.05)
+    assert stack.ai.thread_summary_calls == 0
+    assert any("¿Qué hilo?" in (m.text or "") for m in stack.sender.messages)
 
 
 # ── R. THREAD SUMMARY ────────────────────────────────────────────────────────

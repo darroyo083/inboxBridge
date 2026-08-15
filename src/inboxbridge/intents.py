@@ -382,9 +382,17 @@ def _rule_classify(text: str) -> _RuleResult:
             payload={"instruction": stripped},
         )
     if _ASK.search(stripped):
-        return _RuleResult(IntentAction.ASK_ABOUT_EMAIL, explicit=False)
+        return _RuleResult(
+            IntentAction.ASK_ABOUT_EMAIL,
+            explicit=False,
+            payload={"instruction": stripped},
+        )
     if _THREAD_SUMMARY.search(stripped):
-        return _RuleResult(IntentAction.SUMMARIZE_THREAD, explicit=False)
+        return _RuleResult(
+            IntentAction.SUMMARIZE_THREAD,
+            explicit=False,
+            payload={"instruction": stripped},
+        )
 
     # Draft editing / regeneration.
     if _REGENERATE.search(stripped):
@@ -399,6 +407,16 @@ def _rule_classify(text: str) -> _RuleResult:
 
 
 # ── LLM fallback ─────────────────────────────────────────────────────────────
+
+
+def is_thread_summary_request(text: str) -> bool:
+    """Deterministic rules-first check for thread-summary phrases (no LLM).
+
+    Used to route natural "resume este hilo" phrases to SUMMARIZE_THREAD even
+    inside flows that would otherwise force another action (e.g. the
+    "Preguntar" button).
+    """
+    return bool(_THREAD_SUMMARY.search(text.strip()))
 
 
 def _llm_classify_messages(text: str, context: str) -> list[dict[str, str]]:

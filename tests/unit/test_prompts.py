@@ -402,7 +402,51 @@ def test_qa_prompt_preserves_exact_facts() -> None:
 def test_qa_prompt_discourages_embellishment() -> None:
     messages = prompts.ask_about_email_messages("pregunta", _thread())
     system = str(messages[0]["content"])
-    assert "Nunca inventes información que no esté en el contexto" in system
+    assert "NUNCA inventes datos" in system
+    assert "inventes" in system
+
+
+def test_qa_prompt_structured_json_contract() -> None:
+    messages = prompts.ask_about_email_messages("pregunta", _thread())
+    system = str(messages[0]["content"])
+    assert "RESPONDE SOLO EN JSON" in system
+    assert '"answer"' in system
+    assert '"sections"' in system
+    assert '"emoji"' in system
+    assert '"title"' in system
+    assert '"items"' in system
+
+
+def test_qa_prompt_requires_all_asked_dimensions() -> None:
+    messages = prompts.ask_about_email_messages("pregunta", _thread())
+    system = str(messages[0]["content"])
+    assert "TODOS los datos pedidos" in system
+    assert "nunca respondas solo a una parte" in system
+
+
+def test_qa_prompt_forbids_generic_summary_replacement() -> None:
+    messages = prompts.ask_about_email_messages("pregunta", _thread())
+    system = str(messages[0]["content"])
+    assert "te pide que revises" in system
+    assert "no digas «te pide que revises" in system
+
+
+def test_qa_prompt_lists_only_allowlisted_emojis() -> None:
+    messages = prompts.ask_about_email_messages("pregunta", _thread())
+    system = str(messages[0]["content"])
+    assert "Usa SOLO estos emojis" in system
+    for emoji in ("💰", "📍", "📅", "⏰", "📄", "👤"):
+        assert emoji in system
+    # The prompt never suggests an emoji outside the shared allowlist.
+    for emoji in ("🚀", "😀"):
+        assert emoji not in system
+
+
+def test_qa_prompt_compact_rule() -> None:
+    messages = prompts.ask_about_email_messages("pregunta", _thread())
+    system = str(messages[0]["content"])
+    assert "UNA sección con UN item" in system
+    assert "MISMO texto exacto" in system
 
 
 def test_thread_summary_context_includes_attachment_text() -> None:

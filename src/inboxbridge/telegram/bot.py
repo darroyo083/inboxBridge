@@ -81,7 +81,14 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes, Messag
 from ..config import Settings
 from ..contracts import TelegramNotifier
 from ..db import Storage
-from ..intents import IntentAction, IntentClassifier, has_latest_reference, strip_latest_reference
+from ..intents import (
+    IntentAction,
+    IntentClassifier,
+    has_latest_reference,
+    is_thread_summary_request,
+    strip_latest_reference,
+)
+from ..llm.qa import CONTEXTUAL_EMOJIS, QaSection
 from ..models import DraftReply, EmailSummary, OutgoingAttachment, ParsedEmail
 
 logger = logging.getLogger(__name__)
@@ -234,11 +241,9 @@ def neutralize_links(text: str) -> str:
     return _URL_SCHEME_RE.sub(lambda match: f"hxxp{match.group(0)[4:]}", text)
 
 
-#: Emojis allowed as section-heading anchors in AI answers. A line starting
-#: with one of these is bolded; everything else stays escaped plain text.
-_RICH_HEADING_EMOJIS = frozenset(
-    "💰📍📅⏰🕐✈️🏠🏢📄📎🖇️✅⚠️ℹ️📞✉️👤📬📦🔔❓👋"
-)
+#: Neutral fallback emoji for sections whose model-provided emoji is not in
+#: the shared allowlist (``llm.qa.CONTEXTUAL_EMOJIS``).
+_NEUTRAL_EMOJI = "ℹ️"
 
 
 def render_rich_text(text: str) -> str:
@@ -254,11 +259,77 @@ def render_rich_text(text: str) -> str:
     lines: list[str] = []
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped and stripped[0] in _RICH_HEADING_EMOJIS:
+        if stripped and stripped[0] in CONTEXTUAL_EMOJIS:
             heading = html.escape(stripped[1:].strip())
             lines.append(f"{stripped[0]} <b>{heading}</b>" if heading else stripped[0])
         else:
             lines.append(html.escape(line))
+    return "\n".join(lines)
+
+
+def _cap_field(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def render_qa_answer(answer: str, sections: list[QaSection]) -> str:
+    """Deterministic, safe render of the structured Q&A contract.
+
+    Application-controlled layout: one line per section — ``<emoji> <b>title``
+    + items (a single item is rendered bare on the next line, multiple items
+    as bullets). A single-section/single-item answer whose item appears in
+    ``answer`` renders compact and inline: ``👤 El contacto es <b>Markus
+    Schneider</b>.`` All dynamic values are HTML-escaped; emojis outside the
+    allowlist fall back to a neutral one; only this function emits tags, so
+    the output is always well-formed Telegram HTML.
+    """
+    answer = _cap_field(answer, 600)
+    if not sections:
+        return html.escape(answer)
+    if (
+        len(sections) == 1
+        and len(sections[0].items) == 1
+        and answer
+    ):
+        section = sections[0]
+        item = section.items[0]
+        escaped_answer = html.escape(answer)
+        escaped_item = html.escape(_cap_field(item, 300))
+        if escaped_item and escaped_item in escaped_answer:
+            emoji = (
+                section.emoji if section.emoji in CONTEXTUAL_EMOJIS else _NEUTRAL_EMOJI
+            )
+            bolded = escaped_answer.replace(escaped_item, f"<b>{escaped_item}</b>", 1)
+            return f"{emoji} {bolded}"
+    lines: list[str] = []
+    if answer:
+        lines.append(html.escape(answer))
+    for section in sections:
+        emoji = section.emoji if section.emoji in CONTEXTUAL_EMOJIS else _NEUTRAL_EMOJI
+        lines.append(f"{emoji} <b>{html.escape(_cap_field(section.title, 60))}</b>")
+        items = [_cap_field(item, 300) for item in section.items]
+        if len(items) == 1:
+            lines.append(html.escape(items[0]))
+        else:
+            lines.extend(f"• {html.escape(item)}" for item in items)
+    return "\n".join(lines)
+
+
+def render_qa_plain(answer: str, sections: list[QaSection]) -> str:
+    """Plain-text variant of the structured answer (no markup at all).
+
+    Used as the Telegram fallback when a formatted send fails: keeps every
+    fact, loses only the bold layout.
+    """
+    lines: list[str] = []
+    if answer:
+        lines.append(answer)
+    for section in sections:
+        lines.append(f"{section.emoji} {section.title}")
+        items = section.items
+        if len(items) == 1:
+            lines.append(items[0])
+        else:
+            lines.extend(f"• {item}" for item in items)
     return "\n".join(lines)
 
 
@@ -640,6 +711,18 @@ class TelegramBot(TelegramNotifier):
         if pending is not None:
             tg_message_id, thread_id, mode = pending
             if mode == "question":
+                if is_thread_summary_request(text):
+                    # Natural "resume este hilo" phrases route rules-first to
+                    # SUMMARIZE_THREAD even when the user pressed "Preguntar",
+                    # instead of being answered as a Q&A question.
+                    await self._dispatch_intent(
+                        text,
+                        thread_id=thread_id,
+                        tg_message_id=tg_message_id,
+                        user_id=user.id,
+                        force=IntentAction.SUMMARIZE_THREAD,
+                    )
+                    return
                 await self._dispatch_intent(
                     text,
                     thread_id=thread_id,
@@ -728,6 +811,11 @@ class TelegramBot(TelegramNotifier):
         payload.setdefault("user_id", user_id)
         payload.setdefault("thread_id", thread_id)
         payload.setdefault("tg_message_id", tg_message_id)
+        # The user's exact text must ALWAYS reach the intent handler: rules
+        # without an instruction payload (Q&A, thread summary) must not fall
+        # back to an internal default question.
+        if not payload.get("instruction"):
+            payload["instruction"] = text
         if tg_message_id:
             payload.setdefault(
                 "message_id", self._storage.get_meta(f"{_TG_GMAIL_PREFIX}{tg_message_id}") or ""
@@ -2093,6 +2181,25 @@ class TelegramBot(TelegramNotifier):
         except Exception:
             logger.warning("rich-format send failed; falling back to plain text")
             return await self._send(neutralize_links(text))
+
+    async def send_qa_answer(self, answer: str, sections: list[QaSection]) -> int:
+        """Send the structured Q&A contract with deterministic safe formatting
+        (application-controlled sections, escaped values, allowlisted emojis).
+        Falls back to a plain-text rendering of the SAME content when the
+        formatted send fails — the answer is never lost."""
+        rendered = render_qa_answer(answer, sections)
+        try:
+            sender = self._ensure_sender()
+            message = await sender.send_message(
+                self._allowed_chat_id,
+                rendered,
+                parse_mode=ParseMode.HTML,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+            return message.message_id
+        except Exception:
+            logger.warning("rich-format send failed; falling back to plain text")
+            return await self._send(neutralize_links(render_qa_plain(answer, sections)))
 
     async def send_typing(self) -> None:
         await self._ensure_sender().send_chat_action(self._allowed_chat_id, ChatAction.TYPING)
