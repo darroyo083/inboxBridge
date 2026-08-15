@@ -47,6 +47,21 @@ lands in the volume directly. Refresh tokens from installed-app flows do not
 expire; the access token still expires and is refreshed + saved back to
 `data/token.json` on every expiry, which is why that path must stay writable.
 
+### Switching to another Gmail account
+
+Only two things are genuinely account-specific:
+
+1. **OAuth token** — re-run `docker compose run --rm inboxbridge python -m
+   inboxbridge.oauth_bootstrap` (or delete `data/token.json` and start, which
+   triggers the flow), authorizing with the new account. The refresh token in
+   the volume is replaced.
+2. **`EMAIL_SIGNATURE_NAME`** — set it to the display/signature name you want
+   on outgoing drafts for the new account (it is explicit configuration; it is
+   never inferred from the mailbox).
+
+The OAuth token and the signature identity are independent: nothing else needs
+to change when switching accounts.
+
 ## 4. Run
 
 ```bash

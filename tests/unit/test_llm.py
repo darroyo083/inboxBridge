@@ -31,6 +31,7 @@ def _settings(monkeypatch: pytest.MonkeyPatch, **overrides: object) -> Settings:
         "LLM_MODEL": "test-model",
         "AI_TEXT_MODEL": "test-model",
         "LLM_MAX_RETRIES": "1",
+        "EMAIL_SIGNATURE_NAME": "Daniel",
         "TELEGRAM_BOT_TOKEN": "test-token",
     }
     for key, value in overrides.items():
@@ -431,7 +432,9 @@ async def test_draft_reply_builds_draft_from_trusted_thread_data(
     _fake_create(provider, monkeypatch, content=content)
     request = DraftRequest(thread_id="t1", user_instructions="Danke sagen", language="de")
     reply = await provider.draft_reply(request, _thread())
-    assert reply.body == "Sehr geehrte Frau Ana,\n\nDanke.\n\nMit freundlichen Grüßen"
+    assert reply.body == (
+        "Sehr geehrte Frau Ana,\n\nDanke.\n\nMit freundlichen Grüßen\n\nDaniel"
+    )
     assert reply.thread_id == "t1"
     assert reply.subject == "Re: Proyecto"
     assert reply.to == [EmailAddress("Ana", "ana@example.com")]
@@ -541,3 +544,46 @@ async def test_draft_reply_all_incomplete_raises(
     with pytest.raises(base.LLMIncompleteResponse):
         await provider.draft_reply(request, _thread())
     assert len(captured) == 2  # bounded retries exhausted
+
+
+async def test_draft_reply_signature_from_config_not_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The signature is trusted config, never invented from thread/recipient."""
+    provider = _provider(monkeypatch)
+    _fake_create(
+        provider,
+        monkeypatch,
+        content="Sehr geehrte Frau Ana,\n\nDanke.\n\nMit freundlichen Grüßen",
+    )
+    request = DraftRequest(thread_id="t1", user_instructions="Danke", language="de")
+    reply = await provider.draft_reply(request, _thread())
+    lines = [ln for ln in reply.body.splitlines() if ln.strip()]
+    assert lines[-1] == "Daniel"  # config signature, not "Ana"
+    assert reply.body.endswith("Mit freundlichen Grüßen\n\nDaniel")
+
+
+async def test_draft_reply_signature_change_affects_new_drafts_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Changing EMAIL_SIGNATURE_NAME affects NEW drafts; existing drafts keep
+    their frozen body."""
+    provider_a = _provider(monkeypatch)
+    _fake_create(
+        provider_a,
+        monkeypatch,
+        content="Sehr geehrte Frau Muster,\n\nDanke.\n\nMit freundlichen Grüßen",
+    )
+    request = DraftRequest(thread_id="t1", user_instructions="Danke", language="de")
+    first = await provider_a.draft_reply(request, _thread())
+    assert first.body.endswith("Grüßen\n\nDaniel")
+
+    provider_b = OpenAICompatLLM(_settings(monkeypatch, EMAIL_SIGNATURE_NAME="Otro Nombre"))
+    _fake_create(
+        provider_b,
+        monkeypatch,
+        content="Sehr geehrte Frau Muster,\n\nDanke.\n\nMit freundlichen Grüßen",
+    )
+    second = await provider_b.draft_reply(request, _thread())
+    assert second.body.endswith("Grüßen\n\nOtro Nombre")
+    assert first.body.endswith("Grüßen\n\nDaniel")  # frozen draft untouched

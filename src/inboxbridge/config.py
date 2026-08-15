@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     send_emails: bool = Field(default=False, alias="SEND_EMAILS")
 
+    # Trusted sender signature for outgoing drafts (display name appended after
+    # the formal closing). Explicit application configuration — NEVER inferred
+    # from email/LLM/Telegram content. When empty, a draft that ends on a formal
+    # closing (orphan sign-off) is rejected as incomplete.
+    email_signature_name: str = Field(default="", alias="EMAIL_SIGNATURE_NAME")
+
     # Telegram
     telegram_bot_token: SecretStr = Field(default=SecretStr(""), alias="TELEGRAM_BOT_TOKEN")
     telegram_allowed_chat_id: int = Field(default=0, alias="TELEGRAM_ALLOWED_CHAT_ID")

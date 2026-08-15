@@ -32,6 +32,7 @@ from .gmail.client import GmailClient
 from .llm import prompts
 from .llm.ai_service import AIService
 from .llm.base import LLMError, call_with_retry
+from .llm.signature import finalize_draft_body
 from .models import DraftReply, EmailAddress, OutgoingAttachment, ParsedEmail, ThreadContext
 from .reminders import ReminderParseError, ReminderService
 from .telegram.bot import TelegramBot
@@ -173,6 +174,14 @@ class EmailAssistant:
                 max_attempts=2,
                 base_backoff=self._settings.retry_backoff_base,
             )
+        except LLMError:
+            await self._bot.send_notice("No pude editar el borrador ahora; inténtalo otra vez.")
+            return
+        # Normalize the trusted signature on the edited body (dedup-safe) and
+        # reject an orphan sign-off; the translation below then covers the
+        # exact final German body.
+        try:
+            new_body = finalize_draft_body(new_body, self._settings.email_signature_name)
         except LLMError:
             await self._bot.send_notice("No pude editar el borrador ahora; inténtalo otra vez.")
             return
@@ -577,6 +586,11 @@ class EmailAssistant:
             subject = _FALLBACK_SUBJECT  # safe deterministic fallback, never the command
         # Defensive: never leak the recipient's address into the subject.
         subject = _strip_recipient_from_subject(subject, contact["email"])
+        try:
+            body = finalize_draft_body(body, self._settings.email_signature_name)
+        except LLMError:
+            await self._bot.send_notice("No pude redactar el correo ahora; inténtalo otra vez.")
+            return
         draft = DraftReply(
             thread_id="",
             subject=subject,
@@ -621,6 +635,11 @@ class EmailAssistant:
         # Include the original's attachments (bounded; the preview shows them
         # and the send pipeline verifies them against Gmail).
         attachments = await self._collect_original_attachments(original)
+        try:
+            body = finalize_draft_body(body, self._settings.email_signature_name)
+        except LLMError:
+            await self._bot.send_notice("No pude preparar el reenvío ahora; inténtalo otra vez.")
+            return
         draft = DraftReply(
             thread_id="",
             subject=subject,

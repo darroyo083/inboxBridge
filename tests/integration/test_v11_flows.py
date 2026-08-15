@@ -61,6 +61,7 @@ def make_settings(**overrides: object) -> Settings:
         "AI_VISION_MODEL": "mimo-v2.5",
         "AI_VISION_FALLBACK_MODEL": "gpt-5.6-luna",
         "AI_AUDIO_ENABLED": False,
+        "EMAIL_SIGNATURE_NAME": "Daniel",
         "send_verification_attempts": 2,
         "send_verification_backoff_seconds": 0.01,
         "llm_max_retries": 1,
@@ -1286,6 +1287,58 @@ async def test_flow_aa_forward_retry_no_duplicate_attachments(stack: Stack) -> N
     delivery = Path(str(stack.settings.tmp_dir)) / "delivery"
     leftovers = list(delivery.iterdir()) if delivery.is_dir() else []
     assert leftovers == []  # claimed into the draft dir, no strays
+
+
+# ── AB. TRUSTED SIGNATURE ON SENDABLE DRAFTS ─────────────────────────────────
+
+
+async def test_flow_ab_compose_signature_once_in_preview_and_gmail(stack: Stack) -> None:
+    """The trusted signature appears exactly once in the final German body sent
+    to Gmail, and never the Spanish translation."""
+    await stack.send_bg("envía un correo a user@example.com diciendo que hola")
+    await asyncio.sleep(0.05)
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews
+    preview = previews[-1]
+    assert "Mit freundlichen Grüßen" in preview
+    assert "Daniel" in preview  # trusted signature (config, not invented)
+
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    body = stack.gmail.sent[0].body
+    assert body.count("Daniel") == 1  # German signature exactly once
+    assert "[ES]" not in body  # Spanish never sent
+
+
+async def test_flow_ab_edit_keeps_single_signature(stack: Stack) -> None:
+    """Repeated body edits never duplicate the trusted signature."""
+    await _compose_draft_token(stack)
+    for _ in range(2):
+        await stack.send("más corto")
+        await asyncio.sleep(0.05)
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews
+    german = previews[-1].split("🇪🇸")[0]  # German section only
+    assert "Mit freundlichen Grüßen" in german
+    assert german.count("Daniel") == 1  # never duplicated
+
+
+async def test_flow_ab_translation_covers_final_body_with_signature(stack: Stack) -> None:
+    """The Spanish preview is derived from the EXACT final German body,
+    including the trusted signature."""
+    await _compose_draft_token(stack)
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews
+    spanish = previews[-1].split("🇪🇸")[-1]
+    assert "Daniel" in spanish  # translation includes the signer
 
 
 # ── T. VOICE (EXPERIMENTAL) ──────────────────────────────────────────────────

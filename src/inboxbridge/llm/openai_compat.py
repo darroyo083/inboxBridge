@@ -46,6 +46,7 @@ from .base import (
     LLMUnsupportedModality,
     call_with_retry,
 )
+from .signature import finalize_draft_body
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,7 @@ class OpenAICompatLLM:
         # The original sender is the first message of the thread; the
         # coordinator may override via the Gmail client if needed.
         recipients = [thread.messages[0].from_] if thread.messages else []
+        body = finalize_draft_body(body, self._settings.email_signature_name)
         return DraftReply(
             thread_id=request.thread_id,
             subject=thread.subject,
