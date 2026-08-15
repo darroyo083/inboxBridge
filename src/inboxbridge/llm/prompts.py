@@ -351,7 +351,9 @@ def compose_messages(
     instruction: str,
 ) -> list[ChatCompletionMessageParam]:
     """New-email draft. The recipient/address is DETERMINISTIC (resolved by the
-    contact system); the LLM only writes the German body."""
+    contact system); the LLM writes the German SUBJECT and BODY. One call
+    produces both so the subject always matches the intended content — it is
+    NEVER derived from the raw bot command."""
     return [
         {
             "role": "system",
@@ -359,9 +361,11 @@ def compose_messages(
                 "Eres InboxBridge, el asistente de correo de un pequeño equipo. "
                 "Redactas un correo NUEVO en alemán profesional y natural.\n\n"
                 f"{_SECURITY_BLOCK}\n\n"
-                "Saluda y despide con naturalidad alemana. Emite SOLO el cuerpo: "
-                "sin asunto, sin markdown, sin notas. El destinatario lo decide "
-                "el sistema, nunca tú."
+                "Saluda y despide con naturalidad alemana. Genera también un "
+                "ASUNTO corto y natural en alemán, derivado del contenido, sin "
+                "incluir direcciones de correo ni copiar la instrucción literal.\n"
+                "RESPONDE SOLO EN JSON con esta forma exacta (sin markdown):\n"
+                '{"subject_de": "<asunto en alemán>", "body_de": "<cuerpo en alemán>"}'
             ),
         },
         {

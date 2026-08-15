@@ -19,7 +19,9 @@ Flows implemented here:
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -526,7 +528,7 @@ class EmailAssistant:
             return  # ambiguity/unknown already handled (asked)
         await self._bot.send_typing()
         try:
-            body = await self._ai.text(
+            content = await self._ai.text(
                 prompts.compose_messages(
                     contact["display_name"],
                     instruction or "Saluda y presenta el asunto.",
@@ -537,7 +539,14 @@ class EmailAssistant:
         except LLMError:
             await self._bot.send_notice("No pude redactar el correo ahora; inténtalo otra vez.")
             return
-        subject = _default_subject(instruction)
+        subject, body = _parse_compose(content)
+        if not body:
+            await self._bot.send_notice("No pude redactar el correo ahora; inténtalo otra vez.")
+            return
+        if not subject:
+            subject = _FALLBACK_SUBJECT  # safe deterministic fallback, never the command
+        # Defensive: never leak the recipient's address into the subject.
+        subject = _strip_recipient_from_subject(subject, contact["email"])
         draft = DraftReply(
             thread_id="",
             subject=subject,
@@ -764,13 +773,43 @@ def _parse_alias_instruction(text: str, *, add: bool) -> tuple[str, str] | None:
     return alias, contact
 
 
-def _default_subject(instruction: str) -> str:
-    """Heuristic subject from the instruction; the user can change it later."""
-    for word in instruction.split():
-        if "@" in word:
-            continue
-    subject = " ".join(instruction.split()[:6])
-    return subject[:80] or "Sin asunto"
+_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+#: Safe deterministic fallback subject when the LLM does not produce one.
+_FALLBACK_SUBJECT = "Kein Betreff"
+
+
+def _parse_compose(content: str) -> tuple[str, str]:
+    """Parse the compose LLM JSON ``{"subject_de": ..., "body_de": ...}``.
+
+    Tolerant like the summary parser: when the output is not valid JSON, the
+    whole text becomes the body and the subject is empty (the caller applies
+    the safe fallback). The raw bot command NEVER becomes the subject.
+    Returns ``(subject, body)``.
+    """
+    match = _JSON_BLOCK_RE.search(content)
+    if match is not None:
+        try:
+            payload = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            body = payload.get("body_de")
+            subject = payload.get("subject_de")
+            if isinstance(body, str) and body.strip():
+                subject = subject if isinstance(subject, str) else ""
+                return subject.strip(), body.strip()
+    return "", content.strip()
+
+
+def _strip_recipient_from_subject(subject: str, recipient_email: str) -> str:
+    """Never leak the recipient's email address into the generated subject."""
+    if not subject or not recipient_email:
+        return subject
+    cleaned = re.sub(
+        re.escape(recipient_email), "", subject, flags=re.IGNORECASE
+    ).strip(" .,;:!?¿¡")
+    return cleaned[:80] or _FALLBACK_SUBJECT
 
 
 def _remove_file(path: str) -> None:

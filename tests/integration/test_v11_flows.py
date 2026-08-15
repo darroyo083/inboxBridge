@@ -97,8 +97,11 @@ class FakeAi:
         if task in self.text_responses:
             return self.text_responses[task]
         if task == "compose":
-            return ("Sehr geehrte Frau Muster,\n\nvielen Dank für Ihre Nachricht.\n\n"
-                    "Mit freundlichen Grüßen")
+            return (
+                '{"subject_de": "Vielen Dank", "body_de": "Sehr geehrte Frau '
+                'Muster,\\n\\nvielen Dank für Ihre Nachricht.\\n\\nMit '
+                'freundlichen Grüßen"}'
+            )
         if task == "draft_edit":
             return "Sehr geehrte Frau Muster,\n\nkurz und klar.\n\nMit freundlichen Grüßen"
         return self.default_text
@@ -930,6 +933,58 @@ async def test_flow_w_active_draft_new_compose_asks_cancel(stack: Stack) -> None
         "borrador pendiente" in (m.text or "").lower() for m in stack.sender.messages
     )
     assert stack.storage.get_draft(2) is None  # no second draft created
+
+
+# ── X. NEW-MAIL SUBJECT (LLM JSON, never the raw command) ────────────────────
+
+
+def _subject_line(preview: str) -> str:
+    for line in preview.splitlines():
+        if line.startswith("Asunto:"):
+            return line
+    raise AssertionError("no Asunto line in preview")
+
+
+async def test_flow_x_compose_subject_is_natural_one_turn(stack: Stack) -> None:
+    await stack.send_bg(
+        "envía un correo a user@example.com diciendo que esta es una prueba"
+    )
+    await asyncio.sleep(0.05)
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews
+    subject_line = _subject_line(previews[-1])
+    assert "Vielen Dank" in subject_line  # LLM subject, derived from content
+    assert "envía un correo" not in subject_line  # no command scaffolding
+    assert "user@example.com" not in subject_line  # no recipient leak
+
+
+async def test_flow_x_compose_subject_is_natural_multi_turn(stack: Stack) -> None:
+    await stack.send("envía un correo")
+    await asyncio.sleep(0.05)
+    await stack.send("a user@example.com")
+    await asyncio.sleep(0.05)
+    await stack.send_bg("dile que mañana llegaré media hora tarde")
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews
+    subject_line = _subject_line(previews[-1])
+    assert "Vielen Dank" in subject_line
+    assert "dile que" not in subject_line
+
+
+async def test_flow_x_compose_subject_survives_to_gmail(stack: Stack) -> None:
+    stack.contacts.create_contact("Roman", "femo@femo.ch")
+    await stack.send_bg("escribe a Roman y dile que hola")
+    await asyncio.sleep(0.05)
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    # The subject generated at preview time is the one sent to Gmail.
+    assert stack.gmail.sent[0].subject == "Vielen Dank"
 
 
 # ── T. VOICE (EXPERIMENTAL) ──────────────────────────────────────────────────
