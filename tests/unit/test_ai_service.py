@@ -40,7 +40,9 @@ class FakeClient:
         self.calls: list[tuple[str, Any]] = []  # (method, model)
         self.model: str = ""
 
-    async def complete(self, messages: list[Any], *, max_tokens: int) -> str:
+    async def complete(
+        self, messages: list[Any], *, max_tokens: int, require_complete: bool = False
+    ) -> str:
         self.calls.append(("complete", self.model))
         return self._next()
 

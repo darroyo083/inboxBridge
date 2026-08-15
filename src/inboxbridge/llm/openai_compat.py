@@ -40,6 +40,7 @@ from . import prompts
 from .base import (
     LLMEmptyResponse,
     LLMError,
+    LLMIncompleteResponse,
     LLMRateLimited,
     LLMUnavailable,
     LLMUnsupportedModality,
@@ -50,6 +51,41 @@ logger = logging.getLogger(__name__)
 
 #: Tolerant JSON extraction for LLM output (fenced code blocks included).
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+#: Words that can never end a sentence naturally (articles, prepositions and
+#: connectors in German — and Spanish equivalents for translated drafts).
+#: A completion ending with one of these (without terminal punctuation) is
+#: obviously truncated and must not become a sendable draft.
+_DANGLING_WORDS = frozenset(
+    {
+        # German articles / prepositions / connectors.
+        "der", "die", "das", "den", "dem", "des", "ein", "eine", "einen",
+        "einem", "einer", "für", "mit", "zu", "von", "auf", "bei", "nach",
+        "über", "unter", "an", "in", "aus", "um", "gegen", "ohne", "durch",
+        "und", "oder", "dass", "weil",
+        # Spanish equivalents (for translated drafts).
+        "el", "la", "los", "las", "un", "una", "de", "del", "con", "para",
+        "por", "en", "y", "o", "que",
+    }
+)
+
+
+def _looks_incomplete(text: str) -> bool:
+    """Conservative check for OBVIOUSLY truncated completions.
+
+    Only unambiguous signals: a trailing comma, or an ending that is a dangling
+    article/preposition/connector with no terminal punctuation. Complete short
+    replies such as "Danke, bis morgen." are never rejected.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if stripped[-1] in ".!?…":
+        return False
+    if stripped.endswith(","):
+        return True
+    last = stripped.rsplit(None, 1)[-1]
+    return last.casefold() in _DANGLING_WORDS
 
 #: httpx timeouts for LLM calls (long reads: summaries/drafts can be slow).
 _CONNECT_TIMEOUT = 10.0
@@ -106,7 +142,9 @@ class OpenAICompatLLM:
     async def draft_reply(self, request: DraftRequest, thread: ThreadContext) -> DraftReply:
         body = await call_with_retry(
             lambda: self._complete(
-                prompts.draft_messages(request, thread), self._settings.llm_max_tokens_draft
+                prompts.draft_messages(request, thread),
+                self._settings.llm_max_tokens_draft,
+                require_complete=True,
             ),
             max_attempts=self._settings.llm_max_retries,
             base_backoff=self._settings.retry_backoff_base,
@@ -125,20 +163,40 @@ class OpenAICompatLLM:
             references="",
         )
 
-    async def _complete(self, messages: list[ChatCompletionMessageParam], max_tokens: int) -> str:
-        return await self.complete(messages, max_tokens=max_tokens)
+    async def _complete(
+        self,
+        messages: list[ChatCompletionMessageParam],
+        max_tokens: int,
+        *,
+        require_complete: bool = False,
+    ) -> str:
+        return await self.complete(
+            messages, max_tokens=max_tokens, require_complete=require_complete
+        )
 
     async def translate_to_spanish(self, body: str) -> str:
         """Translate a German draft body to Spanish (display-only, never sent)."""
         return await self.complete(
             prompts.translate_to_spanish_messages(body),
             max_tokens=self._settings.llm_max_tokens_draft,
+            require_complete=True,
         )
 
     async def complete(
-        self, messages: list[ChatCompletionMessageParam], *, max_tokens: int
+        self,
+        messages: list[ChatCompletionMessageParam],
+        *,
+        max_tokens: int,
+        require_complete: bool = False,
     ) -> str:
-        """One chat completion against THIS instance's model."""
+        """One chat completion against THIS instance's model.
+
+        ``require_complete`` (sendable content paths) additionally rejects
+        truncated/incomplete outputs: ``finish_reason=length``, a content
+        filter, or an obviously dangling ending raise a retryable/failing
+        error so a cut-off draft can never become sendable. Incoming summaries
+        keep the tolerant behavior (``require_complete=False``).
+        """
         try:
             response = await self._client.chat.completions.create(
                 model=self._model,
@@ -158,9 +216,22 @@ class OpenAICompatLLM:
             raise LLMError(f"LLM request rejected: {exc}") from exc
         except APIError as exc:
             raise LLMError(f"LLM API error: {exc}") from exc
-        if not response.choices or not response.choices[0].message.content:
+        content = response.choices[0].message.content
+        if not content:
             raise LLMEmptyResponse("LLM returned an empty response")
-        return response.choices[0].message.content.strip()
+        if require_complete:
+            finish_reason = getattr(response.choices[0], "finish_reason", None)
+            if finish_reason == "length":
+                raise LLMIncompleteResponse(
+                    "LLM output truncated (finish_reason=length)"
+                )
+            if finish_reason == "content_filter":
+                raise LLMError("LLM output filtered (finish_reason=content_filter)")
+            if _looks_incomplete(content):
+                raise LLMIncompleteResponse(
+                    "LLM output ends with an obviously dangling fragment"
+                )
+        return content.strip()
 
     async def complete_vision(
         self,

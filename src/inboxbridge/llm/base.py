@@ -46,13 +46,24 @@ class LLMEmptyResponse(LLMInvalidResponse):
     """
 
 
+class LLMIncompleteResponse(LLMError):
+    """Provider answered with non-empty but TRUNCATED/incomplete content
+    (``finish_reason=length`` or an obviously dangling ending).
+
+    A sendable draft must never be built from such content: it is retryable
+    (the same request may complete on a later attempt).
+    """
+
+
 class LLMUnsupportedModality(LLMError):
     """Provider rejected the request on technical grounds (unsupported
     modality, bad format). Fallback-worthy: a different model may accept it."""
 
 
 def _default_retryable(exc: BaseException) -> bool:
-    return isinstance(exc, LLMRateLimited | LLMUnavailable | LLMEmptyResponse)
+    return isinstance(
+        exc, LLMRateLimited | LLMUnavailable | LLMEmptyResponse | LLMIncompleteResponse
+    )
 
 
 def _backoff_delay(attempt: int, base_backoff: float, max_backoff: float) -> float:

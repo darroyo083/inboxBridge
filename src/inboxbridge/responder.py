@@ -39,7 +39,7 @@ from .config import Settings
 from .contracts import GmailClient, LLMProvider
 from .db import Storage
 from .gmail.client import AmbiguousSendError, SendingDisabledError
-from .llm.base import call_with_retry
+from .llm.base import LLMIncompleteResponse, call_with_retry
 from .models import (
     DraftReply,
     DraftRequest,
@@ -116,6 +116,12 @@ class ReplyCoordinator:
             if request.attachments:
                 draft = replace(draft, attachments=request.attachments)
             await self._present_draft(draft, user_id=request.user_id)
+        except LLMIncompleteResponse:
+            logger.warning(
+                "reply draft incomplete for thread %s; not presenting",
+                request.thread_id,
+            )
+            await self._bot.send_notice("La respuesta quedó incompleta. Inténtalo de nuevo.")
         except Exception:
             logger.exception("reply flow failed for thread %s", request.thread_id)
             await self._bot.send_notice("No pude preparar la respuesta. Inténtalo de nuevo.")

@@ -97,6 +97,35 @@ class TestVerifiedDelivery:
         assert len(gmail.sent) == 1
         assert any("verificado" in n for n in bot.notices)
 
+    def test_incomplete_reply_never_presents_sendable_draft(self, tmp_path: Path) -> None:
+        """A truncated (incomplete) reply body must never reach the draft flow:
+        no draft row, no send, and a safe 'incomplete' notice."""
+        from inboxbridge.llm.base import LLMIncompleteResponse
+
+        class IncompleteLLM(MockLLM):
+            async def draft_reply(self, request: object, thread: object) -> object:
+                raise LLMIncompleteResponse("truncated body")
+
+        gmail = FakeGmail(threads={"t1": make_thread()}, send_ok=True)
+        storage = make_storage(tmp_path)
+        bot = FakeReplyBot()
+        coordinator = ReplyCoordinator(
+            make_settings(tmp_dir=str(tmp_path / "tmp")),
+            gmail,
+            IncompleteLLM(),
+            bot,
+            storage,
+        )
+        run_request(
+            coordinator,
+            ReplyRequest(thread_id="t1", user_instructions="Danke", source_message_id=99),
+        )
+        assert any("incompleta" in n for n in bot.notices)
+        assert storage.drafts_in_statuses(
+            [DraftStatus.PENDING, DraftStatus.CONFIRMED, DraftStatus.SENT_VERIFIED]
+        ) == []
+        assert gmail.sent == []
+
     def test_ambiguous_timeout_reconciliation_finds_message_no_second_send(
         self, tmp_path: Path
     ) -> None:

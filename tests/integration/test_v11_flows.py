@@ -95,7 +95,9 @@ class FakeAi:
         self.forward_failures = 0
         self.forward_calls = 0
 
-    async def text(self, messages: list[Any], *, max_tokens: int, task: str) -> str:
+    async def text(
+        self, messages: list[Any], *, max_tokens: int, task: str, require_complete: bool = False
+    ) -> str:
         self.calls.append((task, "deepseek-v4-flash"))
         if task == "intent":
             # Extract the user text from the message and return scripted JSON.

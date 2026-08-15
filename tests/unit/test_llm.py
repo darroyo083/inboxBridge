@@ -116,6 +116,26 @@ def _fake_create(
     return captured
 
 
+def _fake_create_with_finish(
+    provider: OpenAICompatLLM,
+    monkeypatch: pytest.MonkeyPatch,
+    results: list[tuple[str, str]],
+) -> list[dict[str, object]]:
+    """Results are (content, finish_reason) returned in order per call."""
+    captured: list[dict[str, object]] = []
+    it = iter(results)
+
+    async def fake_create(**kwargs: object) -> SimpleNamespace:
+        captured.append(kwargs)
+        content, finish_reason = next(it)
+        message = SimpleNamespace(content=content)
+        choice = SimpleNamespace(message=message, finish_reason=finish_reason)
+        return SimpleNamespace(choices=[choice])
+
+    monkeypatch.setattr(provider._client.chat.completions, "create", fake_create)
+    return captured
+
+
 # ── retry wrapper ─────────────────────────────────────────────────────────
 
 
@@ -435,3 +455,89 @@ def test_provider_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LLM_API_KEY", "")
     with pytest.raises(ValueError, match="LLM_API_KEY"):
         OpenAICompatLLM(Settings())
+
+
+# ── incomplete/truncated completion rejection (require_complete) ─────────────
+
+
+async def test_complete_require_complete_rejects_finish_reason_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(monkeypatch)
+    _fake_create_with_finish(
+        provider, monkeypatch, [("Sehr geehrte Frau Muster,\n\nvielen Dank für die", "length")]
+    )
+    with pytest.raises(base.LLMIncompleteResponse):
+        await provider.complete(
+            [{"role": "user", "content": "x"}], max_tokens=100, require_complete=True
+        )
+
+
+async def test_complete_require_complete_rejects_dangling_ending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(monkeypatch)
+    # finish_reason says "stop" but the text is obviously cut mid-clause.
+    _fake_create_with_finish(
+        provider, monkeypatch, [("Sehr geehrter Herr Arroyo,\n\nvielen Dank für die", "stop")]
+    )
+    with pytest.raises(base.LLMIncompleteResponse):
+        await provider.complete(
+            [{"role": "user", "content": "x"}], max_tokens=100, require_complete=True
+        )
+
+
+async def test_complete_require_complete_accepts_short_complete_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(monkeypatch)
+    _fake_create_with_finish(provider, monkeypatch, [("Danke, bis morgen.", "stop")])
+    result = await provider.complete(
+        [{"role": "user", "content": "x"}], max_tokens=100, require_complete=True
+    )
+    assert result == "Danke, bis morgen."
+
+
+async def test_complete_without_require_complete_keeps_tolerant_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Incoming summaries must NOT fail on truncation (require_complete=False).
+    provider = _provider(monkeypatch)
+    _fake_create_with_finish(provider, monkeypatch, [("cuerpo incompleto y", "length")])
+    result = await provider.complete([{"role": "user", "content": "x"}], max_tokens=100)
+    assert result == "cuerpo incompleto y"
+
+
+async def test_draft_reply_retries_incomplete_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OpenAICompatLLM(_settings(monkeypatch, LLM_MAX_RETRIES=2))
+    captured = _fake_create_with_finish(
+        provider,
+        monkeypatch,
+        [
+            ("Sehr geehrte Frau Muster,\n\nvielen Dank für die", "length"),
+            (
+                "Sehr geehrte Frau Muster,\n\nvielen Dank für Ihre Nachricht.\n\n"
+                "Mit freundlichen Grüßen",
+                "stop",
+            ),
+        ],
+    )
+    request = DraftRequest(thread_id="t1", user_instructions="Danke", language="de")
+    reply = await provider.draft_reply(request, _thread())
+    assert "vielen Dank für Ihre Nachricht" in reply.body
+    assert len(captured) == 2  # truncated attempt retried once
+
+
+async def test_draft_reply_all_incomplete_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OpenAICompatLLM(_settings(monkeypatch, LLM_MAX_RETRIES=2))
+    captured = _fake_create_with_finish(
+        provider, monkeypatch, [("...die", "length"), ("...die", "length")]
+    )
+    request = DraftRequest(thread_id="t1", user_instructions="Danke", language="de")
+    with pytest.raises(base.LLMIncompleteResponse):
+        await provider.draft_reply(request, _thread())
+    assert len(captured) == 2  # bounded retries exhausted

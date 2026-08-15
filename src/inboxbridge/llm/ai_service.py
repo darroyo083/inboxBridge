@@ -112,12 +112,19 @@ class AIService:
         *,
         max_tokens: int = 1000,
         task: str = "text",
+        require_complete: bool = False,
     ) -> str:
-        """Text-only completion on the configured text model."""
+        """Text-only completion on the configured text model.
+
+        ``require_complete`` (sendable content paths) rejects truncated/
+        incomplete outputs (see :meth:`OpenAICompatLLM.complete`).
+        """
         record = AiCall(task=task, model=self.text_model)
         started = time.monotonic()
         try:
-            result = await self._text_client().complete(messages, max_tokens=max_tokens)
+            result = await self._text_client().complete(
+                messages, max_tokens=max_tokens, require_complete=require_complete
+            )
             record.success = True
             self._finish(record, started)
             return result
@@ -132,6 +139,7 @@ class AIService:
             prompts.translate_to_spanish_messages(body),
             max_tokens=self._settings.llm_max_tokens_draft,
             task="translate",
+            require_complete=True,
         )
 
     # ── vision ──────────────────────────────────────────────────────────────
