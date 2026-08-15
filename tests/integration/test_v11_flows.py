@@ -89,6 +89,11 @@ class FakeAi:
         # LLMEmptyResponse (transient) — the caller must retry boundedly.
         self.draft_edit_failures = 0
         self.draft_edit_calls = 0
+        # Compose/forward retry simulation: first N calls raise LLMEmptyResponse.
+        self.compose_failures = 0
+        self.compose_calls = 0
+        self.forward_failures = 0
+        self.forward_calls = 0
 
     async def text(self, messages: list[Any], *, max_tokens: int, task: str) -> str:
         self.calls.append((task, "deepseek-v4-flash"))
@@ -105,11 +110,25 @@ class FakeAi:
         if task in self.text_responses:
             return self.text_responses[task]
         if task == "compose":
+            self.compose_calls += 1
+            if self.compose_failures > 0:
+                self.compose_failures -= 1
+                from inboxbridge.llm.base import LLMEmptyResponse
+
+                raise LLMEmptyResponse("simulated empty compose")
             return (
                 '{"subject_de": "Vielen Dank", "body_de": "Sehr geehrte Frau '
                 'Muster,\\n\\nvielen Dank für Ihre Nachricht.\\n\\nMit '
                 'freundlichen Grüßen"}'
             )
+        if task == "forward":
+            self.forward_calls += 1
+            if self.forward_failures > 0:
+                self.forward_failures -= 1
+                from inboxbridge.llm.base import LLMEmptyResponse
+
+                raise LLMEmptyResponse("simulated empty forward")
+            return "Sehr geehrte Frau Muster,\n\nWeiterleitung von ...\n\nMit freundlichen Grüßen"
         if task == "draft_edit":
             self.draft_edit_calls += 1
             if self.draft_edit_failures > 0:
@@ -1180,6 +1199,91 @@ async def test_flow_z_edit_retry_preserves_subject_recipient(stack: Stack) -> No
     edited = previews[-1]
     assert "Asunto: Vielen Dank" in edited  # subject preserved
     assert "femo@femo.ch" in edited  # recipient preserved
+
+
+# ── AA. COMPOSE/FORWARD BOUNDED RETRY (LLMEmptyResponse) ─────────────────────
+
+
+async def test_flow_aa_compose_retry_succeeds_one_draft(stack: Stack) -> None:
+    """Compose first LLMEmptyResponse → bounded retry succeeds → exactly one
+    draft (never two)."""
+    stack.ai.compose_failures = 1
+    await stack.send("envía un correo a user@example.com diciendo que hola")
+    await asyncio.sleep(0.1)
+    assert stack.ai.compose_calls == 2  # one retry
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews and "user@example.com" in previews[-1]
+    assert stack.storage.get_draft(1) is not None
+    assert stack.storage.get_draft(2) is None  # exactly one draft
+
+
+async def test_flow_aa_compose_retry_exhausted_no_draft(stack: Stack) -> None:
+    """Compose both attempts fail → no draft, safe notice, no pending state."""
+    stack.ai.compose_failures = 5  # more than the retry budget
+    await stack.send("envía un correo a user@example.com diciendo que hola")
+    await asyncio.sleep(0.05)
+    assert stack.ai.compose_calls == 2  # bounded
+    assert any("No pude redactar" in (m.text or "") for m in stack.sender.messages)
+    assert stack.storage.get_draft(1) is None  # no draft created
+
+
+async def test_flow_aa_forward_retry_succeeds_one_draft(stack: Stack) -> None:
+    """Forward first LLMEmptyResponse → retry succeeds → exactly one draft."""
+    stack.contacts.create_contact("Daniel", "daniel@forward.ch")
+    original = email_with_attachments(make_email(message_id="m-fwd", subject="Presupuesto"))
+    stack.gmail.messages["m-fwd"] = original
+    stack.gmail.attachment_bytes[("m-fwd", 0)] = b"%PDF-1.4 fake pdf content"
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    stack.ai.forward_failures = 1
+    await stack.send("reenvíaselo a Daniel", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.1)
+    assert stack.ai.forward_calls == 2  # one retry
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews and "daniel@forward.ch" in previews[-1]
+    assert stack.storage.get_draft(1) is not None
+    assert stack.storage.get_draft(2) is None
+
+
+async def test_flow_aa_forward_retry_exhausted_no_draft(stack: Stack) -> None:
+    """Forward both attempts fail → no draft, safe notice."""
+    stack.contacts.create_contact("Daniel", "daniel@forward.ch")
+    original = make_email(message_id="m-fwd", subject="Presupuesto")
+    stack.gmail.messages["m-fwd"] = original
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    stack.ai.forward_failures = 5  # more than the retry budget
+    await stack.send("reenvíaselo a Daniel", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    assert stack.ai.forward_calls == 2  # bounded
+    assert any("No pude preparar el reenvío" in (m.text or "") for m in stack.sender.messages)
+    assert stack.storage.get_draft(1) is None
+
+
+async def test_flow_aa_forward_retry_no_duplicate_attachments(stack: Stack) -> None:
+    """The forward retry reuses the same original: the attachment is fetched
+    and written exactly once (no duplicate temp files)."""
+    stack.contacts.create_contact("Daniel", "daniel@forward.ch")
+    original = email_with_attachments(make_email(message_id="m-fwd", subject="Presupuesto"))
+    stack.gmail.messages["m-fwd"] = original
+    stack.gmail.attachment_bytes[("m-fwd", 0)] = b"%PDF-1.4 fake pdf content"
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    stack.ai.forward_failures = 1
+    await stack.send("reenvíaselo a Daniel", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.1)
+    assert stack.ai.forward_calls == 2  # body retried once
+    assert len(stack.gmail.attachment_fetches) == 1  # attachment fetched ONCE
+    import json as _json
+
+    row = stack.draft_row(1)
+    attachments = _json.loads(row["attachments_json"])
+    assert len(attachments) == 1
+    assert attachments[0]["filename"] == "presupuesto.pdf"
+    delivery = Path(str(stack.settings.tmp_dir)) / "delivery"
+    leftovers = list(delivery.iterdir()) if delivery.is_dir() else []
+    assert leftovers == []  # claimed into the draft dir, no strays
 
 
 # ── T. VOICE (EXPERIMENTAL) ──────────────────────────────────────────────────

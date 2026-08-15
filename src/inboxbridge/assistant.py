@@ -548,13 +548,21 @@ class EmailAssistant:
             return  # ambiguity/unknown already handled (asked)
         await self._bot.send_typing()
         try:
-            content = await self._ai.text(
-                prompts.compose_messages(
-                    contact["display_name"],
-                    instruction or "Saluda y presenta el asunto.",
+            messages = prompts.compose_messages(
+                contact["display_name"],
+                instruction or "Saluda y presenta el asunto.",
+            )
+            # Bounded retry (one extra attempt) covers transient LLMEmptyResponse.
+            # The retry uses the SAME recipient + instruction, and the draft is
+            # only built/presented after one AI call succeeds (never two drafts).
+            content = await call_with_retry(
+                lambda: self._ai.text(
+                    messages,
+                    max_tokens=self._settings.llm_max_tokens_draft,
+                    task="compose",
                 ),
-                max_tokens=self._settings.llm_max_tokens_draft,
-                task="compose",
+                max_attempts=2,
+                base_backoff=self._settings.retry_backoff_base,
             )
         except LLMError:
             await self._bot.send_notice("No pude redactar el correo ahora; inténtalo otra vez.")
@@ -590,10 +598,18 @@ class EmailAssistant:
         try:
             original = await self._gmail.fetch_message(gmail_message_id)
             await self._bot.send_typing()
-            body = await self._ai.text(
-                prompts.forward_body_messages(original),
-                max_tokens=self._settings.llm_max_tokens_draft,
-                task="forward",
+            messages = prompts.forward_body_messages(original)
+            # Bounded retry (one extra attempt) covers transient LLMEmptyResponse.
+            # The retry reuses the SAME fetched original; attachments are only
+            # collected AFTER the body succeeds, so no duplicate temp files.
+            body = await call_with_retry(
+                lambda: self._ai.text(
+                    messages,
+                    max_tokens=self._settings.llm_max_tokens_draft,
+                    task="forward",
+                ),
+                max_attempts=2,
+                base_backoff=self._settings.retry_backoff_base,
             )
         except LLMError:
             await self._bot.send_notice("No pude preparar el reenvío ahora; inténtalo otra vez.")

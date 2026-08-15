@@ -57,6 +57,7 @@ class FakeGmail:
     ambiguous_accepts: bool = True  # False: ambiguous send never reached Gmail
     labelled: list[tuple[str, list[str], list[str]]] = field(default_factory=list)
     attachment_bytes: dict[tuple[str, int], bytes] = field(default_factory=dict)
+    attachment_fetches: list[tuple[str, int]] = field(default_factory=list)
     _next_id: int = 100
 
     async def fetch_message(self, message_id: str) -> ParsedEmail:
@@ -84,6 +85,7 @@ class FakeGmail:
     async def fetch_attachment_bytes(
         self, message_id: str, attachment_index: int
     ) -> bytes | None:
+        self.attachment_fetches.append((message_id, attachment_index))
         return self.attachment_bytes.get((message_id, attachment_index))
 
     async def send_reply(self, draft: DraftReply) -> str:
