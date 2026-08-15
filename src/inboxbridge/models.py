@@ -195,6 +195,9 @@ class DraftReply:
 
     ``body_es`` is a display-only Spanish translation of ``body`` for the
     Telegram preview. It is NEVER sent to Gmail and is never persisted.
+    ``translation_failed`` marks that a translation was attempted but failed,
+    so the preview can show an explicit "translation unavailable" state
+    instead of silently omitting the Spanish section.
     """
 
     thread_id: str
@@ -206,6 +209,7 @@ class DraftReply:
     references: str = ""
     attachments: tuple[OutgoingAttachment, ...] = ()
     body_es: str = ""
+    translation_failed: bool = False
 
 
 @dataclass(frozen=True)

@@ -31,7 +31,7 @@ from .db import Storage
 from .gmail.client import GmailClient
 from .llm import prompts
 from .llm.ai_service import AIService
-from .llm.base import LLMError
+from .llm.base import LLMError, call_with_retry
 from .models import DraftReply, EmailAddress, OutgoingAttachment, ParsedEmail, ThreadContext
 from .reminders import ReminderParseError, ReminderService
 from .telegram.bot import TelegramBot
@@ -167,12 +167,22 @@ class EmailAssistant:
             await self._bot.send_notice("No pude editar el borrador ahora; inténtalo otra vez.")
             return
         # Regenerate the display-only Spanish translation from the NEW German
-        # body, so the preview never shows a stale translation.
+        # body, so the preview never shows a stale translation. Bounded retry
+        # (one extra attempt) covers transient LLMEmptyResponse; the German
+        # body is NEVER regenerated here.
         try:
-            new_body_es = (await self._ai.translate_to_spanish(new_body)).strip()
+            new_body_es = (
+                await call_with_retry(
+                    lambda: self._ai.translate_to_spanish(new_body),
+                    max_attempts=2,
+                    base_backoff=self._settings.retry_backoff_base,
+                )
+            ).strip()
+            translation_failed = False
         except Exception:
-            logger.warning("draft translation failed; showing German-only preview")
+            logger.warning("draft translation failed after retry")
             new_body_es = ""
+            translation_failed = True
         updated = DraftReply(
             thread_id=pending.draft.thread_id,
             subject=pending.draft.subject,
@@ -183,6 +193,7 @@ class EmailAssistant:
             references=pending.draft.references,
             attachments=pending.draft.attachments,
             body_es=new_body_es,
+            translation_failed=translation_failed,
         )
         await self._bot.apply_draft_edit(pending.draft_id, updated)
         # Persisted draft row keeps the latest body (retry coherence).

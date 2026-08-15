@@ -2087,6 +2087,10 @@ class TelegramBot(TelegramNotifier):
             spanish_block = (
                 f"\n\n🇪🇸 Español · traducción\n{neutralize_links(draft.body_es)}"
             )
+        elif draft.translation_failed:
+            spanish_block = (
+                "\n\n🇪🇸 Español · traducción\n⚠️ No pude generar la traducción ahora."
+            )
         text = (
             f"Borrador ({kind})\n"
             f"Para: {to_line}{cc_line}\n"

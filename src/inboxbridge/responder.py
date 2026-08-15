@@ -39,6 +39,7 @@ from .config import Settings
 from .contracts import GmailClient, LLMProvider
 from .db import Storage
 from .gmail.client import AmbiguousSendError, SendingDisabledError
+from .llm.base import call_with_retry
 from .models import (
     DraftReply,
     DraftRequest,
@@ -155,17 +156,25 @@ class ReplyCoordinator:
         The translation is a display-only aid for the Telegram preview and is
         derived from the EXACT body that will be sent (never generated
         independently from the instruction). It is never persisted and never
-        included in the Gmail message; any failure just omits it.
+        included in the Gmail message. On failure (after a bounded retry) the
+        draft is marked ``translation_failed`` so the preview shows an explicit
+        state instead of silently dropping the Spanish section.
         """
-        if draft.body_es or not draft.body.strip():
+        if draft.body_es or draft.translation_failed or not draft.body.strip():
             return draft
         try:
-            translated = (await self._llm.translate_to_spanish(draft.body)).strip()
+            translated = (
+                await call_with_retry(
+                    lambda: self._llm.translate_to_spanish(draft.body),
+                    max_attempts=2,
+                    base_backoff=self._settings.retry_backoff_base,
+                )
+            ).strip()
             if translated:
                 return replace(draft, body_es=translated)
         except Exception:
-            logger.warning("draft translation failed; showing German-only preview")
-        return draft
+            logger.warning("draft translation failed after retry")
+        return replace(draft, translation_failed=True)
 
     async def _send_confirmed(self, draft_id: int, draft: DraftReply) -> None:
         """Drive one send attempt: sending → (verified | unverified | failed).

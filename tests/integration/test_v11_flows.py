@@ -81,6 +81,10 @@ class FakeAi:
         self.audio_responses: list[str] = []
         self.audio_calls = 0
         self.calls: list[tuple[str, str]] = []  # (task, model-ish)
+        # Translation retry simulation: first N translate calls raise
+        # LLMEmptyResponse (transient) — the caller must retry boundedly.
+        self.translate_failures = 0
+        self.translate_calls = 0
 
     async def text(self, messages: list[Any], *, max_tokens: int, task: str) -> str:
         self.calls.append((task, "deepseek-v4-flash"))
@@ -107,6 +111,12 @@ class FakeAi:
         return self.default_text
 
     async def translate_to_spanish(self, body: str) -> str:
+        self.translate_calls += 1
+        if self.translate_failures > 0:
+            self.translate_failures -= 1
+            from inboxbridge.llm.base import LLMEmptyResponse
+
+            raise LLMEmptyResponse("simulated empty translation")
         return "[ES] " + body
 
     async def vision(
@@ -985,6 +995,94 @@ async def test_flow_x_compose_subject_survives_to_gmail(stack: Stack) -> None:
     assert len(stack.gmail.sent) == 1
     # The subject generated at preview time is the one sent to Gmail.
     assert stack.gmail.sent[0].subject == "Vielen Dank"
+
+
+# ── Y. PROPORTIONAL EDIT + TRANSLATION RETRY ─────────────────────────────────
+
+
+async def test_flow_y_edit_preserves_subject_recipient(stack: Stack) -> None:
+    """A body-only edit keeps subject, recipient, attachments and thread."""
+    stack.contacts.create_contact("Roman", "femo@femo.ch")
+    await stack.send_bg("escribe a Roman y dile que hola")
+    await asyncio.sleep(0.05)
+    draft_messages = [
+        m for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    first = draft_messages[-1]
+    assert "Asunto: Vielen Dank" in first.text
+    assert "femo@femo.ch" in first.text
+
+    token = _button_data(first.reply_markup, 0, 0).split(":", 1)[1]
+    await stack.tap(CHAT_ID, f"edit:{token}", user_id=7)
+    await asyncio.sleep(0.05)
+    await stack.send("hazlo más corto")
+    await asyncio.sleep(0.05)
+
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews
+    edited = previews[-1]
+    assert "kurz und klar" in edited  # new German body
+    assert "Asunto: Vielen Dank" in edited  # subject preserved
+    assert "femo@femo.ch" in edited  # recipient preserved
+
+
+async def test_flow_y_edit_translation_retry_succeeds(stack: Stack) -> None:
+    """First translation returns LLMEmptyResponse; bounded retry succeeds →
+    bilingual preview. German body is generated exactly once."""
+    stack.ai.translate_failures = 1
+    token = await _compose_draft_token(stack)
+    await stack.tap(CHAT_ID, f"edit:{token}", user_id=7)
+    await asyncio.sleep(0.05)
+    await stack.send("hazlo más corto")
+    await asyncio.sleep(0.05)
+
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews
+    assert "kurz und klar" in previews[-1]  # German preserved
+    assert "[ES]" in previews[-1]  # retried translation present
+    assert stack.ai.translate_calls == 2  # one retry
+    draft_edit_calls = [c for c in stack.ai.calls if c[0] == "draft_edit"]
+    assert len(draft_edit_calls) == 1  # German NEVER regenerated during retry
+
+
+async def test_flow_y_edit_translation_retry_exhausted_shows_warning(
+    stack: Stack,
+) -> None:
+    """Retry exhausted → German preserved + explicit translation-unavailable
+    state (never silently omitted, never sent)."""
+    stack.ai.translate_failures = 5  # more than the retry budget
+    token = await _compose_draft_token(stack)
+    await stack.tap(CHAT_ID, f"edit:{token}", user_id=7)
+    await asyncio.sleep(0.05)
+    await stack.send("hazlo más corto")
+    await asyncio.sleep(0.05)
+
+    previews = [
+        m.text for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews
+    edited = previews[-1]
+    assert "kurz und klar" in edited  # German preserved
+    assert "⚠️ No pude generar la traducción ahora." in edited  # explicit state
+    assert stack.ai.translate_calls == 2  # bounded: exactly one retry
+
+
+async def test_flow_y_edit_spanish_never_in_gmail_body(stack: Stack) -> None:
+    token = await _compose_draft_token(stack)
+    await stack.tap(CHAT_ID, f"edit:{token}", user_id=7)
+    await asyncio.sleep(0.05)
+    await stack.send("hazlo más corto")
+    await asyncio.sleep(0.05)
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    assert "[ES]" not in stack.gmail.sent[0].body  # Spanish never sent
+    assert "⚠️" not in stack.gmail.sent[0].body
 
 
 # ── T. VOICE (EXPERIMENTAL) ──────────────────────────────────────────────────

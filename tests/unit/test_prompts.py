@@ -203,6 +203,25 @@ def test_draft_messages_structure() -> None:
     assert "Re: Proyecto" in cast(str, messages[1]["content"])
 
 
+def test_edit_prompt_requires_proportional_length_changes() -> None:
+    """'más largo' must be a proportional edit of the CURRENT draft, not an
+    unrestricted rewrite: the prompt contract spells out the modifiers and
+    forbids inventing facts to fill space."""
+    messages = prompts.edit_draft_messages("Kurzer Entwurf.", "más largo", _thread())
+    system = cast(str, messages[0]["content"])
+    assert "EDICIÓN PROPORCIONAL" in system
+    assert "«un poco más largo»" in system
+    assert "«más largo»" in system
+    assert "«mucho más largo»" in system
+    assert "«un poco más corto»" in system
+    assert "«muy corto»" in system
+    assert "NO inventes hechos nuevos" in system
+    # The current draft body is included as the baseline for the edit.
+    user = cast(str, messages[1]["content"])
+    assert "Kurzer Entwurf." in user
+    assert "más largo" in user
+
+
 # ── poke personality ─────────────────────────────────────────────────────
 
 
