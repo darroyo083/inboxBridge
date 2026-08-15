@@ -50,6 +50,7 @@ class FakeGmail:
     send_ok: bool = True
     send_error: str = ""
     fetched: list[str] = field(default_factory=list)
+    thread_context_calls: list[tuple[str, bool]] = field(default_factory=list)
     sent: list[DraftReply] = field(default_factory=list)
     sent_store: list[SentRecord] = field(default_factory=list)
     verify_error: bool = False
@@ -67,7 +68,10 @@ class FakeGmail:
         except KeyError as exc:
             raise RuntimeError(f"unknown message {message_id}") from exc
 
-    async def fetch_thread_context(self, thread_id: str) -> ThreadContext:
+    async def fetch_thread_context(
+        self, thread_id: str, *, with_attachments: bool = False
+    ) -> ThreadContext:
+        self.thread_context_calls.append((thread_id, with_attachments))
         try:
             return self.threads[thread_id]
         except KeyError as exc:

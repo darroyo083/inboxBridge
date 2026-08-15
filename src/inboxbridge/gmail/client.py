@@ -135,7 +135,15 @@ class GmailClient:
             attachments=attachments,
         )
 
-    async def fetch_thread_context(self, thread_id: str) -> ThreadContext:
+    async def fetch_thread_context(
+        self, thread_id: str, *, with_attachments: bool = False
+    ) -> ThreadContext:
+        """Fetch the recent thread messages for reply / Q&A context.
+
+        ``with_attachments`` additionally extracts bounded attachment text
+        (metadata + extracted text, never binaries) so Q&A and thread summaries
+        can answer from attachment-only facts.
+        """
         thread_resp: dict[str, Any] = await self._run(
             self._service.users().threads().get(
                 userId=self._user_id, id=thread_id, format="metadata"
@@ -160,6 +168,11 @@ class GmailClient:
                 _b64url_decode(str(msg_resp.get("raw") or "")),
                 internal_date_ms=_to_int(msg_resp.get("internalDate")),
             )
+            attachments = (
+                extract_attachments(parsed.attachments, self._settings)
+                if with_attachments
+                else []
+            )
             thread_messages.append(
                 ThreadMessage(
                     message_id=mid,
@@ -167,6 +180,7 @@ class GmailClient:
                     date_iso=parsed.date_iso,
                     body_text=parsed.body_text,
                     snippet=str(m.get("snippet") or ""),
+                    attachments=attachments,
                 )
             )
         return ThreadContext(

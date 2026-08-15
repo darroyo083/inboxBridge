@@ -95,13 +95,15 @@ class ParsedEmail:
 
 @dataclass(frozen=True)
 class ThreadMessage:
-    """A message within a Gmail thread, used as reply context."""
+    """A message within a Gmail thread, used as reply/Q&A context."""
 
     message_id: str
     from_: EmailAddress
     date_iso: str
     body_text: str
     snippet: str = ""
+    #: Bounded attachment metadata + extracted text (never the binaries).
+    attachments: list[AttachmentMeta] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

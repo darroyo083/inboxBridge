@@ -170,6 +170,50 @@ class TestFetchThreadContext:
         assert [m.message_id for m in ctx.messages] == ["m1", "m2"]
         assert ctx.messages[1].body_text == "Mensaje dos."
 
+    async def test_with_attachments_extracts_bounded_text(self) -> None:
+        raw = build_raw_email(
+            subject="Presupuesto",
+            body_text="Cuerpo.",
+            body_html=None,
+            attachments=[("rechnung.txt", "text", "plain", b"Rechnung: 125 CHF.")],
+        )
+        routes: dict[Route, object] = {
+            ("users", "threads", "get"): thread_response(
+                thread_message("m1", "100", subject="Presupuesto"), thread_id="t1"
+            ),
+            ("users", "messages", "get"): full_response(
+                raw, message_id="m1", thread_id="t1"
+            ),
+        }
+        client = GmailClient(make_settings(), service=FakeGmailService(routes))
+        ctx = await client.fetch_thread_context("t1", with_attachments=True)
+
+        assert len(ctx.messages) == 1
+        attachments = ctx.messages[0].attachments
+        assert len(attachments) == 1
+        assert attachments[0].filename == "rechnung.txt"
+        assert attachments[0].extracted_text == "Rechnung: 125 CHF."
+
+    async def test_without_attachments_skips_extraction(self) -> None:
+        raw = build_raw_email(
+            subject="Presupuesto",
+            body_text="Cuerpo.",
+            body_html=None,
+            attachments=[("rechnung.txt", "text", "plain", b"Rechnung: 125 CHF.")],
+        )
+        routes: dict[Route, object] = {
+            ("users", "threads", "get"): thread_response(
+                thread_message("m1", "100", subject="Presupuesto"), thread_id="t1"
+            ),
+            ("users", "messages", "get"): full_response(
+                raw, message_id="m1", thread_id="t1"
+            ),
+        }
+        client = GmailClient(make_settings(), service=FakeGmailService(routes))
+        ctx = await client.fetch_thread_context("t1", with_attachments=False)
+
+        assert ctx.messages[0].attachments == []
+
 
 class TestSendReply:
     async def test_reply_continues_thread(self) -> None:

@@ -53,6 +53,15 @@ _DELIVERABLE_TYPES = (
     "image/",
 )
 
+#: Sanitized MIME for logs (headers are untrusted): keep only the coarse
+#: ``type/subtype`` form, never raw header text (log-injection safe).
+_COARSE_MIME_RE = re.compile(r"^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$")
+
+
+def _coarse_mime(mime: str) -> str:
+    match = _COARSE_MIME_RE.match(mime)
+    return match.group(0) if match else "unknown"
+
 
 class AssistantError(RuntimeError):
     """User-safe flow failure (message shown as-is, no internals)."""
@@ -232,17 +241,32 @@ class EmailAssistant:
             await self._bot.send_notice("Sobre qué correo? Responde a un resumen de InboxBridge.")
             return
         try:
-            thread = await self._gmail.fetch_thread_context(thread_id)
-            await self._bot.send_typing()
-            answer = await self._ai.text(
-                prompts.ask_about_email_messages(question or "¿Qué me está pidiendo?", thread),
-                max_tokens=600,
-                task="qa",
+            thread = await self._gmail.fetch_thread_context(
+                thread_id, with_attachments=True
             )
-        except LLMError:
+            await self._bot.send_typing()
+            answer = await call_with_retry(
+                lambda: self._ai.text(
+                    prompts.ask_about_email_messages(
+                        question or "¿Qué me está pidiendo?", thread
+                    ),
+                    max_tokens=600,
+                    task="qa",
+                ),
+                max_attempts=2,
+                base_backoff=self._settings.retry_backoff_base,
+            )
+        except LLMError as exc:
+            logger.warning("qa outcome=failed error=%s", type(exc).__name__)
             await self._bot.send_notice("No pude responder ahora; inténtalo otra vez.")
             return
-        await self._bot.send_notice(_cap(answer, 1800))
+        attachment_count = sum(len(m.attachments) for m in thread.messages)
+        logger.info(
+            "qa outcome=success attachments=%d attachment_context=%s",
+            attachment_count,
+            ("true" if attachment_count else "false"),
+        )
+        await self._bot.send_rich_notice(_cap(answer, 1800))
 
     async def _act_summarize_thread(self, payload: dict[str, Any]) -> None:
         thread_id = str(payload.get("thread_id") or "")
@@ -250,15 +274,30 @@ class EmailAssistant:
             await self._bot.send_notice("¿Qué hilo? Responde a un resumen de InboxBridge.")
             return
         try:
-            thread = await self._gmail.fetch_thread_context(thread_id)
-            await self._bot.send_typing()
-            summary = await self._ai.text(
-                prompts.summarize_thread_messages(thread), max_tokens=600, task="thread_summary"
+            thread = await self._gmail.fetch_thread_context(
+                thread_id, with_attachments=True
             )
-        except LLMError:
+            await self._bot.send_typing()
+            summary = await call_with_retry(
+                lambda: self._ai.text(
+                    prompts.summarize_thread_messages(thread),
+                    max_tokens=600,
+                    task="thread_summary",
+                ),
+                max_attempts=2,
+                base_backoff=self._settings.retry_backoff_base,
+            )
+        except LLMError as exc:
+            logger.warning("thread_summary outcome=failed error=%s", type(exc).__name__)
             await self._bot.send_notice("No pude resumir el hilo ahora; inténtalo otra vez.")
             return
-        await self._bot.send_notice(_cap(summary, 1800))
+        attachment_count = sum(len(m.attachments) for m in thread.messages)
+        logger.info(
+            "thread_summary outcome=success attachments=%d attachment_context=%s",
+            attachment_count,
+            ("true" if attachment_count else "false"),
+        )
+        await self._bot.send_rich_notice(_cap(summary, 1800))
 
     # ── Gmail attachment delivery to Telegram ───────────────────────────────
 
@@ -315,6 +354,10 @@ class EmailAssistant:
             return
         data = await self._gmail.fetch_attachment_bytes(email.message_id, index)
         if data is None:
+            logger.warning(
+                "attachment_delivery outcome=failed error=%s",
+                "AttachmentUnreadable",
+            )
             await self._bot.send_notice("No pude leer ese adjunto.")
             return
         path = self._bot.write_temp_file(attachment.filename, data)
@@ -322,6 +365,11 @@ class EmailAssistant:
             await self._bot.send_document_file(path, attachment.filename)
         finally:
             _remove_file(path)
+        logger.info(
+            "attachment_delivery outcome=success mime=%s bytes=%d",
+            _coarse_mime(mime),
+            attachment.size_bytes,
+        )
 
     # ── mark read / archive ─────────────────────────────────────────────────
 

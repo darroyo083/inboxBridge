@@ -67,6 +67,8 @@ class FakeSender:
         self.files: dict[str, FakeFile] = {}
         self.downloaded: list[Any] = []
         self.files_delivered: list[tuple[str, bytes]] = []
+        self.parse_modes: list[ParseMode | None] = []
+        self.fail_html: bool = False  # True: formatted (HTML) sends raise
         self._next_id = 1
 
     async def send_message(
@@ -79,6 +81,9 @@ class FakeSender:
         link_preview_options: LinkPreviewOptions | None = None,
         reply_parameters: ReplyParameters | None = None,
     ) -> Message:
+        if self.fail_html and parse_mode == ParseMode.HTML:
+            raise RuntimeError("simulated formatted send failure")
+        self.parse_modes.append(parse_mode)
         message = Message(
             message_id=self._next_id,
             date=datetime.now(UTC),

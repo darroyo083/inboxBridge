@@ -28,8 +28,13 @@ class GmailClient(Protocol):
         """Fetch and parse one message (body cleaned, attachments extracted)."""
         ...
 
-    async def fetch_thread_context(self, thread_id: str) -> ThreadContext:
-        """Fetch full thread (recent messages) for reply context."""
+    async def fetch_thread_context(
+        self, thread_id: str, *, with_attachments: bool = False
+    ) -> ThreadContext:
+        """Fetch full thread (recent messages) for reply/Q&A context.
+
+        ``with_attachments`` also extracts bounded attachment text.
+        """
         ...
 
     async def send_reply(self, draft: DraftReply) -> str:

@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import json
 import logging
 import mimetypes
@@ -231,6 +232,34 @@ class _PendingDraft:
 def neutralize_links(text: str) -> str:
     """Make URLs non-clickable in Telegram display (https:// → hxxps://)."""
     return _URL_SCHEME_RE.sub(lambda match: f"hxxp{match.group(0)[4:]}", text)
+
+
+#: Emojis allowed as section-heading anchors in AI answers. A line starting
+#: with one of these is bolded; everything else stays escaped plain text.
+_RICH_HEADING_EMOJIS = frozenset(
+    "💰📍📅⏰🕐✈️🏠🏢📄📎🖇️✅⚠️ℹ️📞✉️👤📬📦🔔❓👋"
+)
+
+
+def render_rich_text(text: str) -> str:
+    """Render an AI answer with SAFE rich formatting (Telegram HTML).
+
+    The model output is treated as untrusted data: every character is
+    HTML-escaped, and the ONLY structure added is a bold heading on lines that
+    start with a whitelisted contextual emoji (e.g. ``💰 125 CHF`` →
+    ``💰 <b>125 CHF</b>``). Bullets and blank lines pass through as plain
+    text. The result is always well-formed HTML because only this function
+    emits tags.
+    """
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and stripped[0] in _RICH_HEADING_EMOJIS:
+            heading = html.escape(stripped[1:].strip())
+            lines.append(f"{stripped[0]} <b>{heading}</b>" if heading else stripped[0])
+        else:
+            lines.append(html.escape(line))
+    return "\n".join(lines)
 
 
 def _normalize_memory_text(text: str) -> str:
@@ -2045,6 +2074,25 @@ class TelegramBot(TelegramNotifier):
 
     async def send_notice(self, text: str) -> int:
         return await self._send(neutralize_links(text))
+
+    async def send_rich_notice(self, text: str) -> int:
+        """Send an informational answer (Q&A / summary) with SAFE rich
+        formatting: only emoji-led section headings are bolded, everything else
+        is HTML-escaped plain text. Falls back to plain text if the formatted
+        send fails (the answer is never lost)."""
+        rendered = render_rich_text(text)
+        try:
+            sender = self._ensure_sender()
+            message = await sender.send_message(
+                self._allowed_chat_id,
+                rendered,
+                parse_mode=ParseMode.HTML,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+            return message.message_id
+        except Exception:
+            logger.warning("rich-format send failed; falling back to plain text")
+            return await self._send(neutralize_links(text))
 
     async def send_typing(self) -> None:
         await self._ensure_sender().send_chat_action(self._allowed_chat_id, ChatAction.TYPING)

@@ -10,13 +10,14 @@ Q&A, thread summary, forward, mark read, archive, reminder, voice
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 from telegram import Chat, InlineKeyboardMarkup, Message, Voice
-from telegram.constants import ChatType
+from telegram.constants import ChatType, ParseMode
 
 from inboxbridge.assistant import EmailAssistant
 from inboxbridge.config import Settings
@@ -95,6 +96,15 @@ class FakeAi:
         self.compose_calls = 0
         self.forward_failures = 0
         self.forward_calls = 0
+        # Q&A / thread-summary retry simulation: first N calls raise
+        # LLMEmptyResponse (transient) — the caller must retry boundedly.
+        self.qa_failures = 0
+        self.qa_calls = 0
+        self.thread_summary_failures = 0
+        self.thread_summary_calls = 0
+        # Last prompt per Q&A / thread-summary call (content assertions).
+        self.qa_messages: list[list[Any]] = []
+        self.thread_summary_messages: list[list[Any]] = []
 
     async def text(
         self, messages: list[Any], *, max_tokens: int, task: str, require_complete: bool = False
@@ -140,6 +150,26 @@ class FakeAi:
 
                 raise LLMEmptyResponse("simulated empty edit")
             return "Sehr geehrte Frau Muster,\n\nkurz und klar.\n\nMit freundlichen Grüßen"
+        if task == "qa":
+            self.qa_calls += 1
+            self.qa_messages.append(messages)
+            if self.qa_failures > 0:
+                self.qa_failures -= 1
+                from inboxbridge.llm.base import LLMEmptyResponse
+
+                raise LLMEmptyResponse("simulated empty qa")
+            return (
+                "💰 Importe\n• Total: 500 EUR\n📍 Cita\n• Bahnhofstrasse 10, Zürich"
+            )
+        if task == "thread_summary":
+            self.thread_summary_calls += 1
+            self.thread_summary_messages.append(messages)
+            if self.thread_summary_failures > 0:
+                self.thread_summary_failures -= 1
+                from inboxbridge.llm.base import LLMEmptyResponse
+
+                raise LLMEmptyResponse("simulated empty thread summary")
+            return "📅 Resumen del hilo\n• Evento clave"
         return self.default_text
 
     async def translate_to_spanish(self, body: str) -> str:
@@ -626,6 +656,24 @@ async def test_flow_k_attachment_delivery(stack: Stack, tmp_path: Path) -> None:
     assert leftovers == []
 
 
+async def test_flow_k3_attachment_delivery_outcome_log(
+    stack: Stack, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="inboxbridge.assistant")
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    summary_id = await stack.bot.send_summary(
+        make_email_with_attachments(), EmailSummary(subject_es="Asunto")
+    )
+    await stack.send("mándame el pdf", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    # Outcome log: coarse mime + bytes only — never the filename.
+    assert any(
+        "attachment_delivery outcome=success mime=application/pdf bytes=1024" in r.message
+        for r in caplog.records
+    )
+    assert not any("presupuesto.pdf" in r.message for r in caplog.records)
+
+
 async def test_flow_k2_docx_attachment_delivery(stack: Stack, tmp_path: Path) -> None:
     """DOCX attachments (OpenXML mime) are deliverable to Telegram, not rejected
     as unsupported — matching the documented attachment types."""
@@ -759,7 +807,121 @@ async def test_flow_q_qa_without_button(stack: Stack) -> None:
     await stack.send("¿qué me está pidiendo?", reply_to=stack.bot_message(summary_id))
     await asyncio.sleep(0.05)
     texts = [m.text for m in stack.sender.messages]
-    assert any("Texto de prueba" in (t or "") for t in texts)  # AI answer posted
+    assert any("Bahnhofstrasse 10, Zürich" in (t or "") for t in texts)  # AI answer posted
+
+
+def _thread_with_attachment(
+    thread_id: str = "t-qa", filename: str = "rechnung.pdf", text: str = ""
+) -> ThreadContext:
+    from dataclasses import replace
+
+    base = make_thread(thread_id)
+    return replace(
+        base,
+        messages=[
+            replace(
+                base.messages[0],
+                attachments=[
+                    AttachmentMeta(
+                        filename=filename,
+                        mime_type="application/pdf",
+                        size_bytes=2048,
+                        extracted_text=text,
+                    )
+                ],
+            )
+        ],
+    )
+
+
+def _qa_prompt_content(stack: Stack) -> str:
+    assert stack.ai.qa_messages, "qa prompt was never recorded"
+    return str(stack.ai.qa_messages[-1][-1]["content"])
+
+
+async def test_flow_q_qa_attachment_context_and_rich_send(
+    stack: Stack, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="inboxbridge.assistant")
+    stack.gmail.threads["t-qa"] = _thread_with_attachment(
+        text="Rechnung Nr. 42: 125 CHF fällig am 20.08.2026."
+    )
+    summary_id = await stack.bot.send_summary(
+        make_email(thread_id="t-qa"), EmailSummary(subject_es="Asunto")
+    )
+    await stack.send(
+        "¿qué me está pidiendo? ¿cuánto hay que pagar y dónde es la cita?",
+        reply_to=stack.bot_message(summary_id),
+    )
+    await asyncio.sleep(0.05)
+
+    # The Q&A prompt carries the bounded, sealed attachment text.
+    content = _qa_prompt_content(stack)
+    assert "Adjunto «rechnung.pdf»" in content
+    assert "125 CHF" in content
+    # Bounded fetch: Q&A asks for attachments explicitly.
+    assert ("t-qa", True) in stack.gmail.thread_context_calls
+
+    # Rich formatting: emoji heading bolded, bullets plain, HTML parse mode.
+    rich = [m.text for m in stack.sender.messages if "Importe" in (m.text or "")]
+    assert rich and "💰 <b>Importe</b>" in rich[-1]
+    assert ParseMode.HTML in stack.sender.parse_modes
+
+    # Privacy-safe outcome log: counts/bools only, never bodies or question.
+    assert any(
+        "qa outcome=success attachments=1 attachment_context=true" in r.message
+        for r in caplog.records
+    )
+    assert not any("¿cuánto hay que pagar" in (r.message or "") for r in caplog.records)
+
+
+async def test_flow_q_qa_unreadable_attachment_flagged(stack: Stack) -> None:
+    stack.gmail.threads["t-qa"] = _thread_with_attachment(text="")
+    summary_id = await stack.bot.send_summary(
+        make_email(thread_id="t-qa"), EmailSummary(subject_es="Asunto")
+    )
+    await stack.send("¿qué me pide? ¿cuál es el importe?", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    content = _qa_prompt_content(stack)
+    assert "no legible" in content  # model must not invent facts from it
+
+
+async def test_flow_q_qa_retry_on_transient_failure(stack: Stack) -> None:
+    stack.gmail.threads["t1"] = make_thread("t1")
+    stack.ai.qa_failures = 1  # first call raises LLMEmptyResponse → bounded retry
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("¿qué me está pidiendo?", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    assert stack.ai.qa_calls == 2
+    assert any("Bahnhofstrasse 10, Zürich" in (m.text or "") for m in stack.sender.messages)
+
+
+async def test_flow_q_qa_failure_message_and_log(
+    stack: Stack, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="inboxbridge.assistant")
+    stack.gmail.threads["t1"] = make_thread("t1")
+    stack.ai.qa_failures = 5  # exceeds bounded retries → user-safe failure
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("¿qué me está pidiendo?", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    assert any(
+        "No pude responder ahora; inténtalo otra vez." in (m.text or "")
+        for m in stack.sender.messages
+    )
+    assert any("qa outcome=failed" in r.message for r in caplog.records)
+
+
+async def test_flow_q_qa_rich_fallback_plain(stack: Stack) -> None:
+    stack.gmail.threads["t1"] = make_thread("t1")
+    stack.sender.fail_html = True  # formatted send fails → plain fallback
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("¿qué me está pidiendo?", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    texts = [m.text for m in stack.sender.messages]
+    # The full answer arrives as plain text (no bold tags, no lost content).
+    assert any("Bahnhofstrasse 10, Zürich" in (t or "") for t in texts)
+    assert not any("<b>" in (t or "") for t in texts)
 
 
 # ── R. THREAD SUMMARY ────────────────────────────────────────────────────────
@@ -769,7 +931,29 @@ async def test_flow_r_thread_summary(stack: Stack) -> None:
     summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
     await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
     await asyncio.sleep(0.05)
-    assert any("Texto de prueba" in (m.text or "") for m in stack.sender.messages)
+    assert any("Resumen del hilo" in (m.text or "") for m in stack.sender.messages)
+
+
+async def test_flow_r_thread_summary_attachment_context(
+    stack: Stack, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="inboxbridge.assistant")
+    stack.gmail.threads["t-qa"] = _thread_with_attachment(
+        text="Frist: 31.08.2026, Zahlung 125 CHF."
+    )
+    summary_id = await stack.bot.send_summary(
+        make_email(thread_id="t-qa"), EmailSummary(subject_es="Asunto")
+    )
+    await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    assert stack.ai.thread_summary_messages
+    content = str(stack.ai.thread_summary_messages[-1][-1]["content"])
+    assert "Adjunto «rechnung.pdf»" in content
+    assert "125 CHF" in content
+    assert any(
+        "thread_summary outcome=success attachments=1 attachment_context=true" in r.message
+        for r in caplog.records
+    )
 
 
 # ── S. FORWARD ───────────────────────────────────────────────────────────────

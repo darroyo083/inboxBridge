@@ -116,6 +116,11 @@ class InboundPipeline:
             self._storage.mark_status(
                 message_id, MessageStatus.SENT_TELEGRAM, telegram_message_id
             )
+            logger.info(
+                "summary outcome=success attachments=%d attachment_context=%s",
+                len(email.attachments),
+                ("true" if email.attachment_texts else "false"),
+            )
             return PipelineResult(
                 message_id=message_id,
                 status=MessageStatus.SENT_TELEGRAM,
@@ -133,6 +138,9 @@ class InboundPipeline:
                 logger.exception("could not notify attachment error for %s", message_id)
             return PipelineResult(message_id=message_id, status=MessageStatus.FAILED)
         except Exception as exc:
+            logger.warning(
+                "summary outcome=failed error=%s", type(exc).__name__
+            )
             logger.exception("pipeline failed for message %s", message_id)
             self._mark_failed(message_id)
             return PipelineResult(
