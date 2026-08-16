@@ -55,6 +55,17 @@ class LLMIncompleteResponse(LLMError):
     """
 
 
+class StructuredOutputError(LLMError):
+    """Provider answered but the structured contract (JSON) did not parse.
+
+    Retryable: the SAME generation may produce a parseable contract on a
+    later attempt. Provider metadata (``finish_reason=stop``) alone is NOT
+    proof of a usable structured response — this error also covers
+    ``finish_reason=stop`` output that is syntactically broken. The raw
+    output must never be shown to the user.
+    """
+
+
 class LLMUnsupportedModality(LLMError):
     """Provider rejected the request on technical grounds (unsupported
     modality, bad format). Fallback-worthy: a different model may accept it."""

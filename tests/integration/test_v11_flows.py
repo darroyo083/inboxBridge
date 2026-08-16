@@ -103,6 +103,10 @@ class FakeAi:
         self.qa_calls = 0
         self.thread_summary_failures = 0
         self.thread_summary_calls = 0
+        # Leading MALFORMED (truncated/non-JSON) structured responses before
+        # the valid scripted one — structured parse failures must be retried.
+        self.qa_malformed = 0
+        self.thread_summary_malformed = 0
         # Override for the QA answer (malformed / compact scenarios).
         self.qa_override: str | None = None
         # Override for the thread-summary answer (malformed / simple / etc.).
@@ -163,6 +167,9 @@ class FakeAi:
                 from inboxbridge.llm.base import LLMEmptyResponse
 
                 raise LLMEmptyResponse("simulated empty qa")
+            if self.qa_malformed > 0:
+                self.qa_malformed -= 1
+                return '{"answer": "incompleto'  # truncated JSON
             if self.qa_override is not None:
                 return self.qa_override
             return json.dumps(
@@ -190,6 +197,12 @@ class FakeAi:
                 from inboxbridge.llm.base import LLMEmptyResponse
 
                 raise LLMEmptyResponse("simulated empty thread summary")
+            if self.thread_summary_malformed > 0:
+                self.thread_summary_malformed -= 1
+                return (
+                    '{"headline": "Resumen", "sections": [{"emoji": "📬", '
+                    '"title": "Resumen", "items": ['
+                )
             if self.thread_summary_override is not None:
                 return self.thread_summary_override
             return json.dumps(
@@ -1009,18 +1022,21 @@ async def test_flow_q_qa_compact_single_fact(stack: Stack) -> None:
     )
 
 
-async def test_flow_q_qa_malformed_structured_falls_back(stack: Stack) -> None:
-    """A malformed (non-JSON) structured response still posts the complete
-    answer with the safe rich formatter — information is never lost."""
+async def test_flow_q_qa_malformed_structured_safe_error(stack: Stack) -> None:
+    """Malformed structured Q&A output must NEVER leak to Telegram: bounded
+    retry, then a user-safe error (no raw JSON, no partial facts)."""
     stack.gmail.threads["t1"] = make_thread("t1")
-    stack.ai.qa_override = "💰 Importe\n• 500 EUR\n📍 Cita\n• Bahnhofstrasse 10, Zürich"
+    stack.ai.qa_override = '{"answer": "incompleto'  # truncated JSON every attempt
     summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
-    await stack.send("¿qué me pide? ¿cuánto hay que pagar?", reply_to=stack.bot_message(summary_id))
+    await stack.send("¿qué me está pidiendo?", reply_to=stack.bot_message(summary_id))
     await asyncio.sleep(0.05)
     texts = [m.text for m in stack.sender.messages]
-    assert any("500 EUR" in (t or "") for t in texts)
-    assert any("Bahnhofstrasse 10, Zürich" in (t or "") for t in texts)
-    assert any("💰 <b>Importe</b>" in (t or "") for t in texts)
+    assert any(
+        "No pude responder ahora; inténtalo otra vez." in (t or "") for t in texts
+    )
+    # Raw JSON / partial structured content never shown.
+    assert not any('{"answer"' in (t or "") for t in texts)
+    assert not any("incompleto" in (t or "") for t in texts)
 
 
 async def test_flow_q_qa_dynamic_values_escaped(stack: Stack) -> None:
@@ -1225,16 +1241,94 @@ async def test_flow_r_summary_no_action_not_fabricated(stack: Stack) -> None:
     assert "✅" not in rendered
 
 
-async def test_flow_r_summary_malformed_falls_back(stack: Stack) -> None:
-    """A malformed (non-JSON) summary still posts the complete text through the
-    safe rich renderer — nothing is lost."""
-    stack.ai.thread_summary_override = "📅 Cita\n• 18 de agosto de 2026, 14:30"
+async def test_flow_r_summary_malformed_structured_safe_error(
+    stack: Stack, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Malformed structured thread-summary output must NEVER leak to Telegram:
+    bounded retry, then a user-safe error (no raw JSON, no partial facts, no
+    outcome=success log)."""
+    caplog.set_level(logging.INFO, logger="inboxbridge.assistant")
+    stack.ai.thread_summary_override = (
+        '{"headline": "Resumen", "sections": [{"emoji": "📬", "title": "Resumen", "items": ['
+    )  # truncated JSON every attempt
     summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
     await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
     await asyncio.sleep(0.05)
     texts = [m.text for m in stack.sender.messages]
-    assert any("18 de agosto de 2026, 14:30" in (t or "") for t in texts)
-    assert any("📅 <b>Cita</b>" in (t or "") for t in texts)
+    assert any(
+        "No pude generar el resumen ahora; inténtalo otra vez." in (t or "")
+        for t in texts
+    )
+    # Raw JSON never shown; nothing leaked.
+    assert not any('{"headline"' in (t or "") for t in texts)
+    assert not any('"items": [' in (t or "") for t in texts)
+    # Structured failure logged; outcome=success ONLY after a successful parse.
+    assert any(
+        "thread_summary outcome=invalid_structure" in r.message for r in caplog.records
+    )
+    assert not any(
+        "thread_summary outcome=success" in r.message for r in caplog.records
+    )
+
+
+async def test_flow_r_summary_first_malformed_then_valid(
+    stack: Stack, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Attempt 1 truncated JSON → discarded; attempt 2 valid → rendered
+    EXACTLY once. The failure attempt never reaches Telegram."""
+    caplog.set_level(logging.INFO, logger="inboxbridge.assistant")
+    stack.ai.thread_summary_malformed = 1
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    assert stack.ai.thread_summary_calls == 2  # discarded attempt + valid attempt
+    texts = [m.text for m in stack.sender.messages]
+    assert not any('{"headline"' in (t or "") for t in texts)
+    # Exactly ONE rendered summary.
+    assert sum(1 for t in texts if "📬 <b>Resumen</b>" in (t or "")) == 1
+    # outcome=success logged exactly once, only after the parse succeeded.
+    successes = [
+        r.message for r in caplog.records if "thread_summary outcome=success" in r.message
+    ]
+    assert len(successes) == 1
+    assert not any(
+        "thread_summary outcome=invalid_structure" in r.message for r in caplog.records
+    )
+
+
+async def test_flow_q_qa_first_malformed_then_valid(stack: Stack) -> None:
+    """Q&A gets the same protection: attempt 1 truncated JSON discarded,
+    attempt 2 valid → structured answer rendered, no raw JSON."""
+    stack.gmail.threads["t1"] = make_thread("t1")
+    stack.ai.qa_malformed = 1
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("¿qué me está pidiendo?", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    assert stack.ai.qa_calls == 2
+    texts = [m.text for m in stack.sender.messages]
+    assert not any('{"answer"' in (t or "") for t in texts)
+    assert any("Bahnhofstrasse 10, Zürich" in (t or "") for t in texts)
+    assert any("💰 <b>Importe</b>" in (t or "") for t in texts)
+
+
+async def test_flow_q_qa_both_malformed_safe_error(
+    stack: Stack, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Both Q&A attempts malformed → user-safe error, no raw JSON, no
+    outcome=success log."""
+    caplog.set_level(logging.INFO, logger="inboxbridge.assistant")
+    stack.gmail.threads["t1"] = make_thread("t1")
+    stack.ai.qa_override = '{"answer": "incompleto'
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("¿qué me está pidiendo?", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    texts = [m.text for m in stack.sender.messages]
+    assert any(
+        "No pude responder ahora; inténtalo otra vez." in (t or "") for t in texts
+    )
+    assert not any('{"answer"' in (t or "") for t in texts)
+    assert any("qa outcome=invalid_structure" in r.message for r in caplog.records)
+    assert not any("qa outcome=success" in r.message for r in caplog.records)
 
 
 async def test_flow_r_summary_plain_fallback(stack: Stack) -> None:

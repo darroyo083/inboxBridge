@@ -511,6 +511,70 @@ async def test_complete_without_require_complete_keeps_tolerant_behavior(
     assert result == "cuerpo incompleto y"
 
 
+# ── structured contract completeness (thread summary / Q&A) ──────────────────
+
+
+_TRUNCATED_SUMMARY_JSON = (
+    '{"headline": "Resumen", "sections": [{"emoji": "📬", "title": "Resumen", "items": ['
+)
+
+
+async def test_complete_require_complete_rejects_truncated_structured_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """finish_reason=length with a truncated structured contract is rejected
+    by require_complete (the thread-summary/Q&A paths must request it)."""
+    provider = _provider(monkeypatch)
+    _fake_create_with_finish(provider, monkeypatch, [(_TRUNCATED_SUMMARY_JSON, "length")])
+    with pytest.raises(base.LLMIncompleteResponse):
+        await provider.complete(
+            [{"role": "user", "content": "x"}], max_tokens=100, require_complete=True
+        )
+
+
+async def test_complete_require_complete_does_not_catch_stop_with_broken_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider metadata alone is NOT enough: finish_reason=stop with
+    syntactically broken JSON passes require_complete — the structured parse
+    layer must catch it (call_structured → StructuredOutputError)."""
+    provider = _provider(monkeypatch)
+    _fake_create_with_finish(
+        provider, monkeypatch, [(_TRUNCATED_SUMMARY_JSON, "stop")] * 2
+    )
+    result = await provider.complete(
+        [{"role": "user", "content": "x"}], max_tokens=100, require_complete=True
+    )
+    assert result == _TRUNCATED_SUMMARY_JSON
+    # And the structured layer refuses it.
+    from inboxbridge.llm.qa import call_structured, parse_thread_summary
+
+    with pytest.raises(base.StructuredOutputError):
+        await call_structured(
+            lambda: provider.complete(
+                [{"role": "user", "content": "x"}], max_tokens=100, require_complete=True
+            ),
+            parse_thread_summary,
+            max_attempts=1,
+            base_backoff=0,
+        )
+
+
+async def test_complete_require_complete_accepts_valid_structured_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(monkeypatch)
+    valid = (
+        '{"headline": "Resumen", "sections": [{"emoji": "📬", "title": '
+        '"Resumen", "items": ["a"]}]}'
+    )
+    _fake_create_with_finish(provider, monkeypatch, [(valid, "stop")])
+    result = await provider.complete(
+        [{"role": "user", "content": "x"}], max_tokens=100, require_complete=True
+    )
+    assert result == valid
+
+
 async def test_draft_reply_retries_incomplete_then_succeeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

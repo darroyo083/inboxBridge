@@ -1,13 +1,31 @@
 """Structured Q&A contract: parser and safe deterministic renderer tests."""
 
+import asyncio
 import json
+from typing import Any
 
-from inboxbridge.llm.qa import QaSection, parse_qa_answer
+import pytest
+
+from inboxbridge.llm.base import LLMEmptyResponse, StructuredOutputError
+from inboxbridge.llm.qa import (
+    QaSection,
+    call_structured,
+    parse_qa_answer,
+    parse_thread_summary,
+)
 from inboxbridge.telegram.bot import (
     render_qa_answer,
     render_qa_plain,
     render_summary,
     render_summary_plain,
+)
+
+_VALID_SUMMARY = (
+    '{"headline": "Resumen", "sections": [{"emoji": "📬", "title": "Resumen", '
+    '"items": ["a"]}]}'
+)
+_TRUNCATED_SUMMARY = (
+    '{"headline": "Resumen", "sections": [{"emoji": "📬", "title": "Resumen", "items": ['
 )
 
 
@@ -324,3 +342,71 @@ def test_render_summary_plain_variant_no_tags() -> None:
 def test_render_summary_plain_simple_form() -> None:
     plain = render_summary_plain("Resumen", [QaSection("📬", "Resumen", ["a", "b"])])
     assert plain == "📬 Resumen\n• a\n• b"
+
+
+# ── call_structured: bounded structured-contract retry ───────────────────────
+
+
+def _run(coro: Any) -> Any:
+    return asyncio.run(coro)
+
+
+def test_call_structured_first_malformed_then_valid() -> None:
+    responses = iter([_TRUNCATED_SUMMARY, _VALID_SUMMARY])
+    calls: list[str] = []
+
+    async def fn() -> str:
+        calls.append("call")
+        return next(responses)
+
+    parsed = _run(
+        call_structured(fn, parse_thread_summary, max_attempts=2, base_backoff=0)
+    )
+    assert parsed is not None
+    assert parsed.headline == "Resumen"
+    assert len(calls) == 2  # discarded attempt + valid attempt
+
+
+def test_call_structured_both_malformed_raises() -> None:
+    async def fn() -> str:
+        return _TRUNCATED_SUMMARY
+
+    with pytest.raises(StructuredOutputError):
+        _run(call_structured(fn, parse_thread_summary, max_attempts=2, base_backoff=0))
+
+
+def test_call_structured_retries_transient_llm_failure() -> None:
+    responses = iter([LLMEmptyResponse("empty"), _VALID_SUMMARY])
+
+    async def fn() -> str:
+        item = next(responses)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    parsed = _run(
+        call_structured(fn, parse_thread_summary, max_attempts=2, base_backoff=0)
+    )
+    assert parsed is not None
+
+
+def test_call_structured_transient_exhausted_raises_last_error() -> None:
+    async def fn() -> str:
+        raise LLMEmptyResponse("always empty")
+
+    with pytest.raises(LLMEmptyResponse):
+        _run(call_structured(fn, parse_thread_summary, max_attempts=2, base_backoff=0))
+
+
+def test_call_structured_never_returns_raw_text() -> None:
+    """Even when parsing succeeds, the return value is the parsed contract,
+    never the raw model string."""
+
+    async def fn() -> str:
+        return _VALID_SUMMARY
+
+    result = _run(
+        call_structured(fn, parse_thread_summary, max_attempts=2, base_backoff=0)
+    )
+    assert not isinstance(result, str)
+    assert result.sections

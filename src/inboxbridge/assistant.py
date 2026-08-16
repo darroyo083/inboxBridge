@@ -31,8 +31,8 @@ from .db import Storage
 from .gmail.client import GmailClient
 from .llm import prompts
 from .llm.ai_service import AIService
-from .llm.base import LLMError, call_with_retry
-from .llm.qa import parse_qa_answer, parse_thread_summary
+from .llm.base import LLMError, StructuredOutputError, call_with_retry
+from .llm.qa import call_structured, parse_qa_answer, parse_thread_summary
 from .llm.signature import finalize_draft_body
 from .models import DraftReply, EmailAddress, OutgoingAttachment, ParsedEmail, ThreadContext
 from .reminders import ReminderParseError, ReminderService
@@ -246,17 +246,26 @@ class EmailAssistant:
                 thread_id, with_attachments=True
             )
             await self._bot.send_typing()
-            answer = await call_with_retry(
+            parsed = await call_structured(
                 lambda: self._ai.text(
                     prompts.ask_about_email_messages(
                         question or "¿Qué me está pidiendo?", thread
                     ),
                     max_tokens=800,
                     task="qa",
+                    require_complete=True,
                 ),
+                parse_qa_answer,
                 max_attempts=2,
                 base_backoff=self._settings.retry_backoff_base,
+                task="qa",
             )
+        except StructuredOutputError:
+            # Generation succeeded but the structured contract never parsed;
+            # the raw model output is an implementation detail, never shown.
+            logger.warning("qa outcome=invalid_structure")
+            await self._bot.send_notice("No pude responder ahora; inténtalo otra vez.")
+            return
         except LLMError as exc:
             logger.warning("qa outcome=failed error=%s", type(exc).__name__)
             await self._bot.send_notice("No pude responder ahora; inténtalo otra vez.")
@@ -267,13 +276,8 @@ class EmailAssistant:
             attachment_count,
             ("true" if attachment_count else "false"),
         )
-        parsed = parse_qa_answer(answer)
-        if parsed is not None:
-            # Structured contract → deterministic safe section formatting.
-            await self._bot.send_qa_answer(parsed.answer, parsed.sections)
-        else:
-            # Malformed/plain response: safe rich formatting, nothing lost.
-            await self._bot.send_rich_notice(_cap(answer, 1800))
+        # Structured contract → deterministic safe section formatting.
+        await self._bot.send_qa_answer(parsed.answer, parsed.sections)
 
     async def _act_summarize_thread(self, payload: dict[str, Any]) -> None:
         thread_id = str(payload.get("thread_id") or "")
@@ -285,18 +289,31 @@ class EmailAssistant:
                 thread_id, with_attachments=True
             )
             await self._bot.send_typing()
-            summary = await call_with_retry(
+            parsed = await call_structured(
                 lambda: self._ai.text(
                     prompts.summarize_thread_messages(thread),
                     max_tokens=800,
                     task="thread_summary",
+                    require_complete=True,
                 ),
+                parse_thread_summary,
                 max_attempts=2,
                 base_backoff=self._settings.retry_backoff_base,
+                task="thread_summary",
             )
+        except StructuredOutputError:
+            # Generation succeeded but the structured contract never parsed;
+            # the raw model output is an implementation detail, never shown.
+            logger.warning("thread_summary outcome=invalid_structure")
+            await self._bot.send_notice(
+                "No pude generar el resumen ahora; inténtalo otra vez."
+            )
+            return
         except LLMError as exc:
             logger.warning("thread_summary outcome=failed error=%s", type(exc).__name__)
-            await self._bot.send_notice("No pude resumir el hilo ahora; inténtalo otra vez.")
+            await self._bot.send_notice(
+                "No pude generar el resumen ahora; inténtalo otra vez."
+            )
             return
         attachment_count = sum(len(m.attachments) for m in thread.messages)
         logger.info(
@@ -304,13 +321,8 @@ class EmailAssistant:
             attachment_count,
             ("true" if attachment_count else "false"),
         )
-        parsed = parse_thread_summary(summary)
-        if parsed is not None:
-            # Structured contract → deterministic safe section formatting.
-            await self._bot.send_summary_answer(parsed.headline, parsed.sections)
-        else:
-            # Malformed/plain response: safe rich formatting, nothing lost.
-            await self._bot.send_rich_notice(_cap(summary, 1800))
+        # Structured contract → deterministic safe section formatting.
+        await self._bot.send_summary_answer(parsed.headline, parsed.sections)
 
     # ── Gmail attachment delivery to Telegram ───────────────────────────────
 

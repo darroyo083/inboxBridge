@@ -15,7 +15,15 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import TypeVar
+
+from .base import (
+    StructuredOutputError,
+    _default_retryable,
+    call_with_retry,
+)
 
 #: Emojis the model may use as section anchors. This is the SINGLE source of
 #: truth: the prompt lists them for the model and the renderer only honors
@@ -130,3 +138,42 @@ def parse_thread_summary(text: str) -> ThreadSummary | None:
     if not sections:
         return None
     return ThreadSummary(headline=headline, sections=sections)
+
+
+_T = TypeVar("_T")
+
+
+def _structured_retryable(exc: BaseException) -> bool:
+    return _default_retryable(exc) or isinstance(exc, StructuredOutputError)
+
+
+async def call_structured(
+    fn: Callable[[], Awaitable[str]],
+    parse: Callable[[str], _T | None],
+    *,
+    max_attempts: int = 2,
+    base_backoff: float = 2.0,
+    task: str = "structured",
+) -> _T:
+    """Bound generation of a structured contract (retry until parsed).
+
+    One standard bounded retry loop (jitter backoff, no nesting): transient
+    LLM failures AND structured-parse failures both retry the SAME operation
+    against the SAME input. Returns the first parseable contract; raises the
+    last LLM error, or :class:`StructuredOutputError` when every attempt
+    produced unparseable output. Raw model output is NEVER returned to the
+    caller as a success value.
+    """
+    async def attempt() -> _T:
+        raw = await fn()
+        parsed = parse(raw)
+        if parsed is None:
+            raise StructuredOutputError(f"task={task} structured output did not parse")
+        return parsed
+
+    return await call_with_retry(
+        attempt,
+        max_attempts=max_attempts,
+        base_backoff=base_backoff,
+        retryable=_structured_retryable,
+    )
