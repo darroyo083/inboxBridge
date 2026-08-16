@@ -333,6 +333,40 @@ def render_qa_plain(answer: str, sections: list[QaSection]) -> str:
     return "\n".join(lines)
 
 
+def render_summary(headline: str, sections: list[QaSection]) -> str:
+    """Deterministic, safe render of the structured thread-summary contract.
+
+    Layout: a fixed ``📬 <b>headline</b>`` header followed by the same
+    application-controlled section blocks as Q&A (emoji + bold title, single
+    item bare, multiple items as bullets). A single-section summary whose
+    title equals the headline renders as the header plus bullets only — the
+    compact form for simple threads, no repeated header. All values are
+    HTML-escaped; only this function emits tags.
+    """
+    headline = _cap_field(headline, 60)
+    header = f"📬 <b>{html.escape(headline)}</b>"
+    if not sections:
+        return header
+    if len(sections) == 1 and sections[0].title == headline:
+        items = [_cap_field(item, 300) for item in sections[0].items]
+        lines = [header] + [f"• {html.escape(item)}" for item in items]
+        return "\n".join(lines)
+    body = render_qa_answer("", sections)
+    return f"{header}\n{body}"
+
+
+def render_summary_plain(headline: str, sections: list[QaSection]) -> str:
+    """Plain-text variant of the structured summary (no markup at all)."""
+    lines = [f"📬 {headline}"]
+    if len(sections) == 1 and sections[0].title == headline:
+        lines.extend(f"• {item}" for item in sections[0].items)
+        return "\n".join(lines)
+    body = render_qa_plain("", sections)
+    if body:
+        lines.append(body)
+    return "\n".join(lines)
+
+
 def _normalize_memory_text(text: str) -> str:
     """Lowercase, drop punctuation, collapse whitespace (matching keys)."""
     stripped = re.sub(r"[^\w\s]", "", text.lower())
@@ -2200,6 +2234,29 @@ class TelegramBot(TelegramNotifier):
         except Exception:
             logger.warning("rich-format send failed; falling back to plain text")
             return await self._send(neutralize_links(render_qa_plain(answer, sections)))
+
+    async def send_summary_answer(
+        self, headline: str, sections: list[QaSection]
+    ) -> int:
+        """Send the structured thread-summary contract with the same safe,
+        deterministic formatting as Q&A (fixed 📬 header, section blocks).
+        Falls back to a plain-text rendering of the SAME content when the
+        formatted send fails — the summary is never lost."""
+        rendered = render_summary(headline, sections)
+        try:
+            sender = self._ensure_sender()
+            message = await sender.send_message(
+                self._allowed_chat_id,
+                rendered,
+                parse_mode=ParseMode.HTML,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+            return message.message_id
+        except Exception:
+            logger.warning("rich-format send failed; falling back to plain text")
+            return await self._send(
+                neutralize_links(render_summary_plain(headline, sections))
+            )
 
     async def send_typing(self) -> None:
         await self._ensure_sender().send_chat_action(self._allowed_chat_id, ChatAction.TYPING)

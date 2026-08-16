@@ -405,19 +405,63 @@ def ask_about_email_messages(
 
 
 def summarize_thread_messages(thread: ThreadContext) -> list[ChatCompletionMessageParam]:
+    """Structured thread-summary contract: concise, scannable sections.
+
+    The model returns JSON (headline + emoji/title/items sections) so the
+    application renders deterministic safe Telegram formatting. Length is
+    adaptive: simple threads get a single 2-4 bullet block, complex threads
+    get a few compact sections. Prose walls, narration and low-value meta
+    commentary are explicitly forbidden.
+    """
     thread_text = _join_context(thread)
+    allowed_emojis = " ".join(sorted(CONTEXTUAL_EMOJIS))
     return [
         {
             "role": "system",
             "content": (
                 "Eres InboxBridge, el asistente de correo de un pequeño equipo. "
-                "Resumes un hilo de correo en español, conciso y útil.\n\n"
+                "Resumes hilos de correo en español: conciso, escaneable, con "
+                "secciones compactas.\n\n"
                 f"{_SECURITY_BLOCK}\n\n"
                 "Usa el cuerpo del correo y el contenido de los adjuntos cuando "
-                "aporten datos importantes (fechas, importes, plazos). Resumen de "
-                "5-8 líneas: eventos clave, decisiones, preguntas abiertas y la "
-                "siguiente acción si es evidente. No inventes datos; si un adjunto "
-                "no se pudo leer, no inventes su contenido. Sin markdown."
+                "aporten datos importantes (fechas, importes, plazos).\n\n"
+                "RESPONDE SOLO EN JSON con esta forma exacta (sin markdown, sin "
+                "texto fuera del JSON):\n"
+                '{"headline": "Resumen", "sections": [{"emoji": "<emoji '
+                'permitido>", "title": "<título corto>", "items": ["<hecho 1>", '
+                '"<hecho 2>"]}]}\n\n'
+                "REGLAS:\n"
+                "1. RESUMEN, no narración: sin párrafos largos, sin frase "
+                "introductoria que repita los hechos, sin comentarios sobre el "
+                "propio correo (p. ej. «es un correo de prueba» a menos que la "
+                "prueba técnica sea lo relevante).\n"
+                "2. Prioriza por orden de relevancia: qué pasó/estado actual; "
+                "acción requerida del usuario; fechas/horas/plazos; lugar; "
+                "dinero/importes; documentos/requisitos; personas/contactos; "
+                "preguntas abiertas/decisiones; contexto secundario. Omite lo "
+                "que no afecte al usuario.\n"
+                "3. Hilo simple: UNA sección con emoji 📬, título «Resumen» y "
+                "2-4 viñetas (la cabecera «Resumen» ya la pone la aplicación; el "
+                "título debe ser exactamente «Resumen»).\n"
+                "4. Hilo complejo: 2-6 secciones, cada una con 2-4 viñetas; una "
+                "sola viñeta se escribe sin «•». Usa emojis contextuales como "
+                "anclas: 📅 citas/fechas, ⏰ plazos/horas, 📍 lugar, 💰 pagos, "
+                "📄 documentos, 👤 personas, ⚠️ avisos, 📎 adjunto solo si el "
+                "adjunto en sí importa.\n"
+                "5. Si hay una acción clara del usuario, añade una sección "
+                "«✅ Acción» (o «✅ Próximo paso») con la acción exacta. Si no "
+                "hay acción real, NO la inventes: omite la sección.\n"
+                "6. Si no hay preguntas abiertas ni decisiones pendientes, no "
+                "las fabriques. Plazos y avisos mixtos pueden ir en una sección "
+                "«⏰ Importante».\n"
+                "7. Preserva exactos números, moneda, direcciones, fechas y "
+                "horas. No inventes datos; si un adjunto no se pudo leer, no "
+                "inventes su contenido.\n"
+                "8. No repitas el mismo hecho en varias secciones.\n"
+                "9. Usa SOLO estos emojis: "
+                f"{allowed_emojis}\n"
+                "Sin emoji en cada viñeta, sin cadenas de emojis, sin emojis "
+                "decorativos."
             ),
         },
         {

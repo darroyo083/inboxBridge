@@ -32,7 +32,7 @@ from .gmail.client import GmailClient
 from .llm import prompts
 from .llm.ai_service import AIService
 from .llm.base import LLMError, call_with_retry
-from .llm.qa import parse_qa_answer
+from .llm.qa import parse_qa_answer, parse_thread_summary
 from .llm.signature import finalize_draft_body
 from .models import DraftReply, EmailAddress, OutgoingAttachment, ParsedEmail, ThreadContext
 from .reminders import ReminderParseError, ReminderService
@@ -288,7 +288,7 @@ class EmailAssistant:
             summary = await call_with_retry(
                 lambda: self._ai.text(
                     prompts.summarize_thread_messages(thread),
-                    max_tokens=600,
+                    max_tokens=800,
                     task="thread_summary",
                 ),
                 max_attempts=2,
@@ -304,7 +304,13 @@ class EmailAssistant:
             attachment_count,
             ("true" if attachment_count else "false"),
         )
-        await self._bot.send_rich_notice(_cap(summary, 1800))
+        parsed = parse_thread_summary(summary)
+        if parsed is not None:
+            # Structured contract → deterministic safe section formatting.
+            await self._bot.send_summary_answer(parsed.headline, parsed.sections)
+        else:
+            # Malformed/plain response: safe rich formatting, nothing lost.
+            await self._bot.send_rich_notice(_cap(summary, 1800))
 
     # ── Gmail attachment delivery to Telegram ───────────────────────────────
 

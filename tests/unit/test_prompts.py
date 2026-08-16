@@ -461,3 +461,85 @@ def test_thread_summary_context_without_attachments_unchanged() -> None:
     messages = prompts.summarize_thread_messages(_thread())
     content = str(messages[-1]["content"])
     assert "Adjunto" not in content
+
+
+# ── structured thread-summary prompt ────────────────────────────────────────
+
+
+def _summary_system() -> str:
+    messages = prompts.summarize_thread_messages(_thread())
+    return str(messages[0]["content"])
+
+
+def test_summary_prompt_structured_json_contract() -> None:
+    system = _summary_system()
+    assert "RESPONDE SOLO EN JSON" in system
+    assert '"headline"' in system
+    assert '"sections"' in system
+    assert '"emoji"' in system
+    assert '"title"' in system
+    assert '"items"' in system
+
+
+def test_summary_prompt_forbids_prose_wall() -> None:
+    system = _summary_system()
+    assert "no narración" in system
+    assert "sin párrafos largos" in system
+    assert "sin frase introductoria" in system
+    # The old rigid fixed-length rule is gone.
+    assert "5-8 líneas" not in system
+
+
+def test_summary_prompt_priority_order() -> None:
+    system = _summary_system()
+    assert "Prioriza por orden de relevancia" in system
+    assert "acción requerida del usuario" in system
+    assert "fechas/horas/plazos" in system
+    assert "dinero/importes" in system
+
+
+def test_summary_prompt_low_value_metadata_omittable() -> None:
+    system = _summary_system()
+    assert "«es un correo de prueba»" in system
+
+
+def test_summary_prompt_simple_and_complex_forms() -> None:
+    system = _summary_system()
+    assert "UNA sección con emoji 📬, título «Resumen»" in system
+    assert "2-4 viñetas" in system
+    assert "2-6 secciones" in system
+
+
+def test_summary_prompt_action_section_rules() -> None:
+    system = _summary_system()
+    assert "✅ Acción" in system
+    assert "NO la inventes" in system
+
+
+def test_summary_prompt_exact_values_and_no_invention() -> None:
+    system = _summary_system()
+    assert "Preserva exactos números, moneda" in system
+    assert "No inventes datos" in system
+
+
+def test_summary_prompt_no_repetition() -> None:
+    system = _summary_system()
+    assert "No repitas el mismo hecho en varias secciones" in system
+
+
+def test_summary_prompt_emoji_policy() -> None:
+    system = _summary_system()
+    assert "Usa SOLO estos emojis" in system
+    for emoji in ("📅", "⏰", "📍", "💰", "📄", "👤", "✅", "⚠️"):
+        assert emoji in system
+    assert "Sin emoji en cada viñeta" in system
+    assert "sin cadenas de emojis" in system
+
+
+def test_summary_prompt_keeps_untrusted_boundaries() -> None:
+    messages = prompts.summarize_thread_messages(_thread())
+    user_content = str(messages[-1]["content"])
+    assert user_content.index("cuerpo del hilo") > user_content.index(
+        prompts.UNTRUSTED_DATA_START
+    )
+    assert prompts.UNTRUSTED_DATA_END in user_content

@@ -105,6 +105,8 @@ class FakeAi:
         self.thread_summary_calls = 0
         # Override for the QA answer (malformed / compact scenarios).
         self.qa_override: str | None = None
+        # Override for the thread-summary answer (malformed / simple / etc.).
+        self.thread_summary_override: str | None = None
         # Last prompt per Q&A / thread-summary call (content assertions).
         self.qa_messages: list[list[Any]] = []
         self.thread_summary_messages: list[list[Any]] = []
@@ -188,7 +190,47 @@ class FakeAi:
                 from inboxbridge.llm.base import LLMEmptyResponse
 
                 raise LLMEmptyResponse("simulated empty thread summary")
-            return "📅 Resumen del hilo\n• Evento clave"
+            if self.thread_summary_override is not None:
+                return self.thread_summary_override
+            return json.dumps(
+                {
+                    "headline": "Resumen",
+                    "sections": [
+                        {
+                            "emoji": "📅",
+                            "title": "Cita",
+                            "items": [
+                                "18 de agosto de 2026, 14:30",
+                                "Bahnhofstrasse 10, Zürich",
+                                "Duración: 45 min",
+                            ],
+                        },
+                        {
+                            "emoji": "📄",
+                            "title": "Llevar",
+                            "items": [
+                                "Contrato firmado",
+                                "DNI o pasaporte",
+                                "Checklist, si está cumplimentada",
+                            ],
+                        },
+                        {
+                            "emoji": "⏰",
+                            "title": "Importante",
+                            "items": [
+                                "Avisar antes del 17 de agosto, 18:00 si no "
+                                "puede asistir",
+                                "Tasa: 125 CHF",
+                            ],
+                        },
+                        {
+                            "emoji": "👤",
+                            "title": "Contacto",
+                            "items": ["Markus Schneider"],
+                        },
+                    ],
+                }
+            )
         return self.default_text
 
     async def translate_to_spanish(self, body: str) -> str:
@@ -1022,7 +1064,7 @@ async def test_flow_q_button_summary_routes_rules_first(
     await asyncio.sleep(0.05)
     assert stack.ai.thread_summary_calls == 1
     assert stack.ai.qa_calls == 0
-    assert any("Resumen del hilo" in (m.text or "") for m in stack.sender.messages)
+    assert any("📬 <b>Resumen</b>" in (m.text or "") for m in stack.sender.messages)
     # The summary used attachment context and logged it privacy-safely.
     assert stack.ai.thread_summary_messages
     content = str(stack.ai.thread_summary_messages[-1][-1]["content"])
@@ -1049,7 +1091,11 @@ async def test_flow_r_thread_summary(stack: Stack) -> None:
     summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
     await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
     await asyncio.sleep(0.05)
-    assert any("Resumen del hilo" in (m.text or "") for m in stack.sender.messages)
+    # Structured summary posted: fixed header + section blocks (no prose wall).
+    texts = [m.text for m in stack.sender.messages]
+    assert any("📬 <b>Resumen</b>" in (t or "") for t in texts)
+    assert any("📅 <b>Cita</b>" in (t or "") for t in texts)
+    assert any("• Bahnhofstrasse 10, Zürich" in (t or "") for t in texts)
 
 
 async def test_flow_r_thread_summary_attachment_context(
@@ -1072,6 +1118,156 @@ async def test_flow_r_thread_summary_attachment_context(
         "thread_summary outcome=success attachments=1 attachment_context=true" in r.message
         for r in caplog.records
     )
+
+
+async def test_flow_r_summary_complex_sections_no_prose_wall(stack: Stack) -> None:
+    """The PDF-style thread summary renders as compact structured sections
+    (not a prose paragraph) while keeping every important fact exact."""
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    rendered = next(
+        (m.text or "") for m in stack.sender.messages if "📬" in (m.text or "")
+    )
+    # Important facts, exact, each inside its section.
+    assert "📅 <b>Cita</b>" in rendered
+    assert "• 18 de agosto de 2026, 14:30" in rendered
+    assert "• Bahnhofstrasse 10, Zürich" in rendered
+    assert "📄 <b>Llevar</b>" in rendered
+    assert "• Contrato firmado" in rendered
+    assert "⏰ <b>Importante</b>" in rendered
+    assert "Tasa: 125 CHF" in rendered
+    assert "👤 <b>Contacto</b>" in rendered
+    assert "Markus Schneider" in rendered
+    # No prose wall: every line is a header, a bullet, or a bare single item.
+    assert not any(
+        line and not line.startswith(("📬", "📅", "📄", "⏰", "👤", "•", "Markus"))
+        for line in rendered.splitlines()
+    )
+
+
+async def test_flow_r_summary_simple_thread_compact_bullets(stack: Stack) -> None:
+    """A simple thread renders as the fixed header + 2-4 bullets (no sections,
+    no repeated header)."""
+    stack.ai.thread_summary_override = json.dumps(
+        {
+            "headline": "Resumen",
+            "sections": [
+                {
+                    "emoji": "📬",
+                    "title": "Resumen",
+                    "items": [
+                        "Cita el 18 de agosto a las 14:30 en Zürich.",
+                        "Llevar contrato firmado y documento de identidad.",
+                        "Avisar antes del 17 de agosto a las 18:00.",
+                    ],
+                }
+            ],
+        }
+    )
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    rendered = next(
+        (m.text or "") for m in stack.sender.messages if "📬" in (m.text or "")
+    )
+    assert rendered == (
+        "📬 <b>Resumen</b>\n"
+        "• Cita el 18 de agosto a las 14:30 en Zürich.\n"
+        "• Llevar contrato firmado y documento de identidad.\n"
+        "• Avisar antes del 17 de agosto a las 18:00."
+    )
+    assert rendered.count("Resumen") == 1  # header never repeated
+
+
+async def test_flow_r_summary_action_section_when_present(stack: Stack) -> None:
+    """A clear next action renders as its own ✅ Acción section."""
+    stack.ai.thread_summary_override = json.dumps(
+        {
+            "headline": "Resumen",
+            "sections": [
+                {"emoji": "📅", "title": "Cita", "items": ["18 de agosto de 2026, 14:30"]},
+                {
+                    "emoji": "✅",
+                    "title": "Acción",
+                    "items": ["Confirmar asistencia antes del lunes."],
+                },
+            ],
+        }
+    )
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    rendered = next(
+        (m.text or "") for m in stack.sender.messages if "📬" in (m.text or "")
+    )
+    assert "✅ <b>Acción</b>" in rendered
+    assert "Confirmar asistencia antes del lunes." in rendered
+
+
+async def test_flow_r_summary_no_action_not_fabricated(stack: Stack) -> None:
+    """Without a real action the ✅ section is simply absent (the app never
+    invents it)."""
+    stack.ai.thread_summary_override = json.dumps(
+        {
+            "headline": "Resumen",
+            "sections": [
+                {"emoji": "👤", "title": "Contacto", "items": ["Markus Schneider"]}
+            ],
+        }
+    )
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    rendered = next(
+        (m.text or "") for m in stack.sender.messages if "📬" in (m.text or "")
+    )
+    assert "✅" not in rendered
+
+
+async def test_flow_r_summary_malformed_falls_back(stack: Stack) -> None:
+    """A malformed (non-JSON) summary still posts the complete text through the
+    safe rich renderer — nothing is lost."""
+    stack.ai.thread_summary_override = "📅 Cita\n• 18 de agosto de 2026, 14:30"
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    texts = [m.text for m in stack.sender.messages]
+    assert any("18 de agosto de 2026, 14:30" in (t or "") for t in texts)
+    assert any("📅 <b>Cita</b>" in (t or "") for t in texts)
+
+
+async def test_flow_r_summary_plain_fallback(stack: Stack) -> None:
+    """Formatted-send failure falls back to a plain-text rendering of the SAME
+    structured summary (no tags, no lost content)."""
+    stack.sender.fail_html = True
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    texts = [m.text for m in stack.sender.messages]
+    assert any("• Bahnhofstrasse 10, Zürich" in (t or "") for t in texts)
+    assert any("Tasa: 125 CHF" in (t or "") for t in texts)
+    assert not any("<b>" in (t or "") for t in texts)
+
+
+async def test_flow_r_summary_values_escaped(stack: Stack) -> None:
+    """HTML-special characters in summary fields stay escaped (no markup from
+    the model)."""
+    stack.ai.thread_summary_override = json.dumps(
+        {
+            "headline": "Resumen",
+            "sections": [
+                {"emoji": "💼", "title": "<b>fake</b> & off", "items": ["a < b & c > d"]}
+            ],
+        }
+    )
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    texts = [m.text for m in stack.sender.messages]
+    assert any("&lt;b&gt;fake&lt;/b&gt;" in (t or "") for t in texts)
+    assert not any("<b>fake" in (t or "") for t in texts)
+    assert any("a &lt; b &amp; c &gt; d" in (t or "") for t in texts)
 
 
 # ── S. FORWARD ───────────────────────────────────────────────────────────────

@@ -3,7 +3,12 @@
 import json
 
 from inboxbridge.llm.qa import QaSection, parse_qa_answer
-from inboxbridge.telegram.bot import render_qa_answer, render_qa_plain
+from inboxbridge.telegram.bot import (
+    render_qa_answer,
+    render_qa_plain,
+    render_summary,
+    render_summary_plain,
+)
 
 
 def _answer(
@@ -212,3 +217,110 @@ def test_json_roundtrip_render() -> None:
     assert "💰 <b>Importe</b>\n125 CHF" in rendered
     assert "📍 <b>Cita</b>" in rendered
     assert "• Bahnhofstrasse 10, Zürich" in rendered
+
+
+# ── thread-summary contract ─────────────────────────────────────────────────
+
+
+def test_parse_summary_valid() -> None:
+    from inboxbridge.llm.qa import parse_thread_summary
+
+    parsed = parse_thread_summary(
+        '{"headline": "Resumen", "sections": [{"emoji": "📅", "title": "Cita", '
+        '"items": ["18 de agosto de 2026, 14:30", "Zürich"]}, {"emoji": "💰", '
+        '"title": "Importe", "items": ["125 CHF"]}]}'
+    )
+    assert parsed is not None
+    assert parsed.headline == "Resumen"
+    assert len(parsed.sections) == 2
+    assert parsed.sections[0].emoji == "📅"
+    assert parsed.sections[0].items == ["18 de agosto de 2026, 14:30", "Zürich"]
+
+
+def test_parse_summary_default_headline() -> None:
+    from inboxbridge.llm.qa import parse_thread_summary
+
+    parsed = parse_thread_summary(
+        '{"sections": [{"emoji": "📬", "title": "Resumen", "items": ["a"]}]}'
+    )
+    assert parsed is not None
+    assert parsed.headline == "Resumen"
+
+
+def test_parse_summary_malformed_returns_none() -> None:
+    from inboxbridge.llm.qa import parse_thread_summary
+
+    assert parse_thread_summary("texto plano") is None
+    assert parse_thread_summary('{"headline": "Resumen", "sections": []}') is None
+    assert parse_thread_summary("{roto") is None
+
+
+def test_parse_summary_strips_fences() -> None:
+    from inboxbridge.llm.qa import parse_thread_summary
+
+    parsed = parse_thread_summary(
+        '```json\n{"headline": "Resumen", "sections": [{"emoji": "📬", '
+        '"title": "Resumen", "items": ["x"]}]}\n```'
+    )
+    assert parsed is not None
+    assert parsed.headline == "Resumen"
+
+
+def test_render_summary_header_and_sections() -> None:
+    rendered = render_summary(
+        "Resumen",
+        [
+            QaSection("📅", "Cita", ["18 de agosto de 2026, 14:30", "Zürich"]),
+            QaSection("👤", "Contacto", ["Markus Schneider"]),
+        ],
+    )
+    assert rendered == (
+        "📬 <b>Resumen</b>\n"
+        "📅 <b>Cita</b>\n• 18 de agosto de 2026, 14:30\n• Zürich\n"
+        "👤 <b>Contacto</b>\nMarkus Schneider"
+    )
+
+
+def test_render_summary_simple_form_dedupes_header() -> None:
+    rendered = render_summary(
+        "Resumen",
+        [QaSection("📬", "Resumen", ["a", "b", "c"])],
+    )
+    assert rendered == "📬 <b>Resumen</b>\n• a\n• b\n• c"
+    assert rendered.count("Resumen") == 1  # header never repeated
+
+
+def test_render_summary_single_item_section_bare() -> None:
+    rendered = render_summary("Resumen", [QaSection("💰", "Importe", ["125 CHF"])])
+    assert "💰 <b>Importe</b>\n125 CHF" in rendered
+
+
+def test_render_summary_escapes_values_and_blocks_injection() -> None:
+    rendered = render_summary(
+        "Resumen <b>x</b>",
+        [QaSection("📄", "Docs", ["<script>alert(1)</script>", "a < b"])],
+    )
+    assert "<script>" not in rendered
+    assert "&lt;b&gt;x&lt;/b&gt;" in rendered
+    assert "a &lt; b" in rendered
+    # Only the app's own tags: header + one section.
+    assert rendered.count("<b>") == rendered.count("</b>") == 2
+
+
+def test_render_summary_unknown_emoji_neutral() -> None:
+    rendered = render_summary("Resumen", [QaSection("🚀", "Tema", ["x"])])
+    assert "ℹ️ <b>Tema</b>" in rendered
+
+
+def test_render_summary_plain_variant_no_tags() -> None:
+    plain = render_summary_plain(
+        "Resumen",
+        [QaSection("📅", "Cita", ["18 de agosto", "Zürich"])],
+    )
+    assert "<b>" not in plain
+    assert plain == "📬 Resumen\n📅 Cita\n• 18 de agosto\n• Zürich"
+
+
+def test_render_summary_plain_simple_form() -> None:
+    plain = render_summary_plain("Resumen", [QaSection("📬", "Resumen", ["a", "b"])])
+    assert plain == "📬 Resumen\n• a\n• b"
