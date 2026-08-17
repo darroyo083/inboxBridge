@@ -76,10 +76,13 @@ class LLMProvider(Protocol):
         """Draft a professional German reply using thread context."""
         ...
 
-    async def translate_to_spanish(self, body: str) -> str:
+    async def translate_to_spanish(
+        self, body: str, *, model: str | None = None
+    ) -> str:
         """Translate a German draft body to Spanish for the Telegram preview.
 
-        Display-only: the Spanish text is never sent to Gmail."""
+        Display-only: the Spanish text is never sent to Gmail. ``model``
+        overrides the model for this call (``None`` = primary)."""
         ...
 
 

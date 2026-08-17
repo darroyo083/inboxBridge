@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from .llm.base import LLMError
+from .llm.base import LLMError, alternate_text_models, call_with_retry
 from .llm.prompts import UNTRUSTED_DATA_END, UNTRUSTED_DATA_START, _seal
 
 # ── action vocabulary ────────────────────────────────────────────────────────
@@ -530,11 +530,25 @@ class IntentClassifier:
             return intent
         if not allow_llm or self._ai is None:
             return intent
+        ai = self._ai
         try:
-            content = await self._ai.text(
-                _llm_classify_messages(text, context),
-                max_tokens=150,
+            # Bounded 2-attempt loop: primary model, then the configured
+            # fallback model on technical failures (same provider). Rules
+            # already handled deterministically above and never reach here.
+            models = alternate_text_models(
+                ai.text_model,
+                ai.text_fallback_model,
                 task="intent",
+            )
+            content = await call_with_retry(
+                lambda: ai.text(
+                    _llm_classify_messages(text, context),
+                    max_tokens=150,
+                    task="intent",
+                    model=models(),
+                ),
+                max_attempts=2,
+                base_backoff=0.5,
             )
         except LLMError:
             return Intent(action=IntentAction.UNKNOWN, confidence=0.2, source="llm")

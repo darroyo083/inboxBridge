@@ -193,7 +193,22 @@ class FakeAi:
         self._content = content
         self.calls = 0
 
-    async def text(self, messages: list[Any], *, max_tokens: int, task: str) -> str:
+    @property
+    def text_model(self) -> str:
+        return "primary-model"
+
+    @property
+    def text_fallback_model(self) -> str:
+        return ""  # disabled in these unit tests
+
+    async def text(
+        self,
+        messages: list[Any],
+        *,
+        max_tokens: int,
+        task: str,
+        model: str | None = None,
+    ) -> str:
         self.calls += 1
         return self._content
 
@@ -248,7 +263,22 @@ class TestLlmFallback:
         from inboxbridge.llm.base import LLMError
 
         class BrokenAi:
-            async def text(self, messages: list[Any], *, max_tokens: int, task: str) -> str:
+            @property
+            def text_model(self) -> str:
+                return "primary-model"
+
+            @property
+            def text_fallback_model(self) -> str:
+                return ""
+
+            async def text(
+                self,
+                messages: list[Any],
+                *,
+                max_tokens: int,
+                task: str,
+                model: str | None = None,
+            ) -> str:
                 raise LLMError("boom")
 
         intent = run(IntentClassifier(BrokenAi()).classify("haz algo", context=""))
@@ -267,3 +297,72 @@ class TestLlmFallback:
         intent = run(IntentClassifier(ai).classify("márcalo como leído", context=""))
         assert intent.action == IntentAction.MARK_READ  # rule, not LLM
         assert ai.calls == 0
+
+
+# ── intent LLM technical fallback (AI_TEXT_FALLBACK_MODEL) ──────────────────
+
+
+def test_rules_first_intent_never_calls_llm() -> None:
+    ai = FakeAi('{"action": "unknown", "recipient": "", "instruction": ""}')
+    intent = run(
+        IntentClassifier(ai).classify("respóndele que muchas gracias", context="")
+    )
+    assert intent.action == IntentAction.REPLY_TO_EMAIL
+    assert ai.calls == 0  # deterministic routing: no fallback call at all
+
+
+def test_ambiguous_intent_primary_technical_failure_uses_fallback() -> None:
+    class FailOnceAi(FakeAi):
+        @property
+        def text_fallback_model(self) -> str:
+            return "fb-model"
+
+        async def text(
+            self,
+            messages: list[Any],
+            *,
+            max_tokens: int,
+            task: str,
+            model: str | None = None,
+        ) -> str:
+            self.calls += 1
+            self.models.append(model)
+            if self.calls == 1:
+                from inboxbridge.llm.base import LLMUnavailable
+
+                raise LLMUnavailable("primary down")
+            return self._content
+
+    ai = FailOnceAi(
+        '{"action": "summarize_thread", "recipient": "", "instruction": "", '
+        '"needs_clarification": false}'
+    )
+    ai.models = []
+    intent = run(IntentClassifier(ai).classify("haz algo", context=""))
+    assert intent.action == IntentAction.SUMMARIZE_THREAD
+    assert ai.models == [None, "fb-model"]  # primary, then fallback model
+
+
+def test_both_intent_classifiers_fail_keeps_clarification() -> None:
+    class AlwaysDownAi(FakeAi):
+        @property
+        def text_fallback_model(self) -> str:
+            return "fb-model"
+
+        async def text(
+            self,
+            messages: list[Any],
+            *,
+            max_tokens: int,
+            task: str,
+            model: str | None = None,
+        ) -> str:
+            self.calls += 1
+            from inboxbridge.llm.base import LLMUnavailable
+
+            raise LLMUnavailable("down")
+
+    ai = AlwaysDownAi("x")
+    intent = run(IntentClassifier(ai).classify("haz algo", context=""))
+    assert intent.action == IntentAction.UNKNOWN
+    assert ai.calls == 2  # bounded: primary + fallback, no explosion

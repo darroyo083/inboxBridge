@@ -31,7 +31,12 @@ from .db import Storage
 from .gmail.client import GmailClient
 from .llm import prompts
 from .llm.ai_service import AIService
-from .llm.base import LLMError, StructuredOutputError, call_with_retry
+from .llm.base import (
+    LLMError,
+    StructuredOutputError,
+    alternate_text_models,
+    call_with_retry,
+)
 from .llm.qa import call_structured, parse_qa_answer, parse_thread_summary
 from .llm.signature import finalize_draft_body
 from .models import DraftReply, EmailAddress, OutgoingAttachment, ParsedEmail, ThreadContext
@@ -169,6 +174,11 @@ class EmailAssistant:
                 )
             await self._bot.send_typing()
             messages = prompts.edit_draft_messages(pending.draft.body, instruction, thread)
+            models = alternate_text_models(
+                self._settings.effective_text_model,
+                self._settings.effective_text_fallback_model,
+                task="draft_edit",
+            )
             # Bounded retry (one extra attempt) covers transient LLMEmptyResponse
             # on the edit generation itself. The retry runs the SAME operation
             # against the SAME current German draft; recipient/subject/thread/
@@ -180,6 +190,7 @@ class EmailAssistant:
                     max_tokens=self._settings.llm_max_tokens_draft,
                     task="draft_edit",
                     require_complete=True,
+                    model=models(),
                 ),
                 max_attempts=2,
                 base_backoff=self._settings.retry_backoff_base,
@@ -200,9 +211,16 @@ class EmailAssistant:
         # (one extra attempt) covers transient LLMEmptyResponse; the German
         # body is NEVER regenerated here.
         try:
+            models = alternate_text_models(
+                self._settings.effective_text_model,
+                self._settings.effective_text_fallback_model,
+                task="translate",
+            )
             new_body_es = (
                 await call_with_retry(
-                    lambda: self._ai.translate_to_spanish(new_body),
+                    lambda: self._ai.translate_to_spanish(
+                        new_body, model=models()
+                    ),
                     max_attempts=2,
                     base_backoff=self._settings.retry_backoff_base,
                 )
@@ -246,6 +264,11 @@ class EmailAssistant:
                 thread_id, with_attachments=True
             )
             await self._bot.send_typing()
+            models = alternate_text_models(
+                self._settings.effective_text_model,
+                self._settings.effective_text_fallback_model,
+                task="qa",
+            )
             parsed = await call_structured(
                 lambda: self._ai.text(
                     prompts.ask_about_email_messages(
@@ -254,11 +277,11 @@ class EmailAssistant:
                     max_tokens=800,
                     task="qa",
                     require_complete=True,
+                    model=models(),
                 ),
                 parse_qa_answer,
                 max_attempts=2,
                 base_backoff=self._settings.retry_backoff_base,
-                task="qa",
             )
         except StructuredOutputError:
             # Generation succeeded but the structured contract never parsed;
@@ -295,6 +318,15 @@ class EmailAssistant:
             return
         attachment_count = sum(len(m.attachments) for m in thread.messages)
         attachment_context = "true" if attachment_count else "false"
+        # HARD total budget for ONE user request: 3 provider generations.
+        # Model alternation: attempt 1 primary, attempt 2 fallback model (or
+        # primary again when unset), attempt 3 plain summary on the next
+        # model in the alternation. Never 2+2+2+2.
+        models = alternate_text_models(
+            self._settings.effective_text_model,
+            self._settings.effective_text_fallback_model,
+            task="thread_summary",
+        )
         try:
             parsed = await call_structured(
                 lambda: self._ai.text(
@@ -302,6 +334,7 @@ class EmailAssistant:
                     max_tokens=800,
                     task="thread_summary",
                     require_complete=True,
+                    model=models(),
                 ),
                 parse_thread_summary,
                 max_attempts=2,
@@ -331,8 +364,9 @@ class EmailAssistant:
                 "thread_summary structured outcome=failed error=%s", type(exc).__name__
             )
 
-        # Layer B: ONE plain-summary generation (no JSON contract) so a useful
-        # summary still reaches the user when the structured path is exhausted.
+        # Layer B (attempt 3 of the hard budget): ONE plain-summary generation
+        # (no JSON contract) so a useful summary still reaches the user when
+        # the structured path is exhausted.
         try:
             plain = await call_with_retry(
                 lambda: self._ai.text(
@@ -340,8 +374,9 @@ class EmailAssistant:
                     max_tokens=600,
                     task="thread_summary_plain",
                     require_complete=True,
+                    model=models(),
                 ),
-                max_attempts=2,
+                max_attempts=1,
                 base_backoff=self._settings.retry_backoff_base,
             )
         except LLMError as exc:
@@ -675,6 +710,11 @@ class EmailAssistant:
                 contact["display_name"],
                 instruction or "Saluda y presenta el asunto.",
             )
+            models = alternate_text_models(
+                self._settings.effective_text_model,
+                self._settings.effective_text_fallback_model,
+                task="compose",
+            )
             # Bounded retry (one extra attempt) covers transient LLMEmptyResponse.
             # The retry uses the SAME recipient + instruction, and the draft is
             # only built/presented after one AI call succeeds (never two drafts).
@@ -684,6 +724,7 @@ class EmailAssistant:
                     max_tokens=self._settings.llm_max_tokens_draft,
                     task="compose",
                     require_complete=True,
+                    model=models(),
                 ),
                 max_attempts=2,
                 base_backoff=self._settings.retry_backoff_base,
@@ -728,6 +769,11 @@ class EmailAssistant:
             original = await self._gmail.fetch_message(gmail_message_id)
             await self._bot.send_typing()
             messages = prompts.forward_body_messages(original)
+            models = alternate_text_models(
+                self._settings.effective_text_model,
+                self._settings.effective_text_fallback_model,
+                task="forward",
+            )
             # Bounded retry (one extra attempt) covers transient LLMEmptyResponse.
             # The retry reuses the SAME fetched original; attachments are only
             # collected AFTER the body succeeds, so no duplicate temp files.
@@ -737,6 +783,7 @@ class EmailAssistant:
                     max_tokens=self._settings.llm_max_tokens_draft,
                     task="forward",
                     require_complete=True,
+                    model=models(),
                 ),
                 max_attempts=2,
                 base_backoff=self._settings.retry_backoff_base,

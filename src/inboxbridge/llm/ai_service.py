@@ -71,6 +71,7 @@ class AIService:
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()
         self._text_llm: OpenAICompatLLM | None = None
+        self._text_fallback_llm: OpenAICompatLLM | None = None
         self._vision_llm: OpenAICompatLLM | None = None
         self._vision_fallback_llm: OpenAICompatLLM | None = None
         self.calls: list[AiCall] = []  # test-visible observability log
@@ -82,6 +83,10 @@ class AIService:
         return self._settings.effective_text_model
 
     @property
+    def text_fallback_model(self) -> str:
+        return self._settings.effective_text_fallback_model
+
+    @property
     def vision_model(self) -> str:
         return self._settings.ai_vision_model
 
@@ -89,10 +94,16 @@ class AIService:
     def vision_fallback_model(self) -> str:
         return self._settings.ai_vision_fallback_model
 
-    def _text_client(self) -> OpenAICompatLLM:
-        if self._text_llm is None:
-            self._text_llm = OpenAICompatLLM(self._settings, model=self.text_model)
-        return self._text_llm
+    def _text_client(self, model: str | None = None) -> OpenAICompatLLM:
+        """Lazy client for the primary text model (``model`` = None/primary)
+        or a configured fallback model — SAME provider, SAME credentials."""
+        if model is None or model == self.text_model:
+            if self._text_llm is None:
+                self._text_llm = OpenAICompatLLM(self._settings, model=self.text_model)
+            return self._text_llm
+        if self._text_fallback_llm is None:
+            self._text_fallback_llm = OpenAICompatLLM(self._settings, model=model)
+        return self._text_fallback_llm
 
     def _vision_client(self, fallback: bool = False) -> OpenAICompatLLM:
         model = self.vision_fallback_model if fallback else self.vision_model
@@ -113,33 +124,62 @@ class AIService:
         max_tokens: int = 1000,
         task: str = "text",
         require_complete: bool = False,
+        model: str | None = None,
     ) -> str:
         """Text-only completion on the configured text model.
 
         ``require_complete`` (sendable content paths) rejects truncated/
         incomplete outputs (see :meth:`OpenAICompatLLM.complete`).
+
+        ``model`` overrides the model for THIS call (``None`` = primary). It
+        is used by the bounded model-alternation helper — the fallback model
+        is a technical-resilience attempt on the SAME provider, never a
+        quality/judging switch.
         """
-        record = AiCall(task=task, model=self.text_model)
+        active = model or self.text_model
+        fallback_used = model is not None and model != self.text_model
+        record = AiCall(
+            task=task,
+            model=active,
+            fallback_used=fallback_used,
+            fallback_model=(model or "") if fallback_used else "",
+        )
         started = time.monotonic()
         try:
-            result = await self._text_client().complete(
+            result = await self._text_client(model).complete(
                 messages, max_tokens=max_tokens, require_complete=require_complete
             )
             record.success = True
             self._finish(record, started)
+            if fallback_used:
+                logger.info(
+                    "text_fallback task=%s model=%s outcome=success fallback_used=true",
+                    task,
+                    active,
+                )
             return result
         except LLMError as exc:
             record.success = False
             self._finish(record, started, error=exc)
+            if fallback_used:
+                logger.warning(
+                    "text_fallback task=%s model=%s outcome=failed error=%s",
+                    task,
+                    active,
+                    type(exc).__name__,
+                )
             raise
 
-    async def translate_to_spanish(self, body: str) -> str:
+    async def translate_to_spanish(
+        self, body: str, *, model: str | None = None
+    ) -> str:
         """Translate a German draft body to Spanish (display-only, never sent)."""
         return await self.text(
             prompts.translate_to_spanish_messages(body),
             max_tokens=self._settings.llm_max_tokens_draft,
             task="translate",
             require_complete=True,
+            model=model,
         )
 
     # ── vision ──────────────────────────────────────────────────────────────
@@ -267,6 +307,11 @@ class AIService:
             )
 
     async def close(self) -> None:
-        for client in (self._text_llm, self._vision_llm, self._vision_fallback_llm):
+        for client in (
+            self._text_llm,
+            self._text_fallback_llm,
+            self._vision_llm,
+            self._vision_fallback_llm,
+        ):
             if client is not None:
                 await client.close()

@@ -93,6 +93,7 @@ docker compose up -d
 | `TELEGRAM_BOT_TOKEN` | bot token from @BotFather |
 | `TELEGRAM_ALLOWED_CHAT_ID` | numeric id of the private group (only this chat is processed) |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | OpenAI-compatible endpoint (OpenCode Go, DeepSeek, OpenRouter…) |
+| `AI_TEXT_FALLBACK_MODEL` | OPTIONAL second text model on the SAME provider (same base URL/API key). Used ONLY as a bounded technical-reliability fallback: transient failures (empty/incomplete output, rate limit, provider unavailable/timeout) and unparseable structured contracts (Q&A / thread-summary JSON) retry on this model with the same logical input. Never a quality/judging switch. Empty → disabled; equal to `LLM_MODEL` → treated as disabled. No hardcoded model ids; changing it needs only a config reload + container recreate. |
 | `GOOGLE_CLOUD_PROJECT` | Cloud project hosting topic/subscription |
 | `GMAIL_PUBSUB_TOPIC` / `GMAIL_PUBSUB_SUBSCRIPTION` | short names (path built as `projects/<proj>/topics/<topic>`) |
 | `SEND_EMAILS` | `false` in dev; `true` only when you want real sending |

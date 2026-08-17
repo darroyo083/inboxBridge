@@ -39,7 +39,11 @@ from .config import Settings
 from .contracts import GmailClient, LLMProvider
 from .db import Storage
 from .gmail.client import AmbiguousSendError, SendingDisabledError
-from .llm.base import LLMIncompleteResponse, call_with_retry
+from .llm.base import (
+    LLMIncompleteResponse,
+    alternate_text_models,
+    call_with_retry,
+)
 from .models import (
     DraftReply,
     DraftRequest,
@@ -169,9 +173,16 @@ class ReplyCoordinator:
         if draft.body_es or draft.translation_failed or not draft.body.strip():
             return draft
         try:
+            models = alternate_text_models(
+                self._settings.effective_text_model,
+                self._settings.effective_text_fallback_model,
+                task="translate",
+            )
             translated = (
                 await call_with_retry(
-                    lambda: self._llm.translate_to_spanish(draft.body),
+                    lambda: self._llm.translate_to_spanish(
+                        draft.body, model=models()
+                    ),
                     max_attempts=2,
                     base_backoff=self._settings.retry_backoff_base,
                 )

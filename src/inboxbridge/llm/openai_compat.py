@@ -44,6 +44,7 @@ from .base import (
     LLMRateLimited,
     LLMUnavailable,
     LLMUnsupportedModality,
+    alternate_text_models,
     call_with_retry,
 )
 from .signature import finalize_draft_body
@@ -131,9 +132,16 @@ class OpenAICompatLLM:
         )
 
     async def summarize_email(self, email: ParsedEmail) -> EmailSummary:
+        models = alternate_text_models(
+            self._model,
+            self._settings.effective_text_fallback_model,
+            task="incoming_summary",
+        )
         content = await call_with_retry(
             lambda: self._complete(
-                prompts.summary_messages(email), self._settings.llm_max_tokens_summary
+                prompts.summary_messages(email),
+                self._settings.llm_max_tokens_summary,
+                model=models(),
             ),
             max_attempts=self._settings.llm_max_retries,
             base_backoff=self._settings.retry_backoff_base,
@@ -141,11 +149,17 @@ class OpenAICompatLLM:
         return _parse_summary(content)
 
     async def draft_reply(self, request: DraftRequest, thread: ThreadContext) -> DraftReply:
+        models = alternate_text_models(
+            self._model,
+            self._settings.effective_text_fallback_model,
+            task="reply",
+        )
         body = await call_with_retry(
             lambda: self._complete(
                 prompts.draft_messages(request, thread),
                 self._settings.llm_max_tokens_draft,
                 require_complete=True,
+                model=models(),
             ),
             max_attempts=self._settings.llm_max_retries,
             base_backoff=self._settings.retry_backoff_base,
@@ -171,17 +185,24 @@ class OpenAICompatLLM:
         max_tokens: int,
         *,
         require_complete: bool = False,
+        model: str | None = None,
     ) -> str:
         return await self.complete(
-            messages, max_tokens=max_tokens, require_complete=require_complete
+            messages,
+            max_tokens=max_tokens,
+            require_complete=require_complete,
+            model=model,
         )
 
-    async def translate_to_spanish(self, body: str) -> str:
+    async def translate_to_spanish(
+        self, body: str, *, model: str | None = None
+    ) -> str:
         """Translate a German draft body to Spanish (display-only, never sent)."""
         return await self.complete(
             prompts.translate_to_spanish_messages(body),
             max_tokens=self._settings.llm_max_tokens_draft,
             require_complete=True,
+            model=model,
         )
 
     async def complete(
@@ -190,8 +211,13 @@ class OpenAICompatLLM:
         *,
         max_tokens: int,
         require_complete: bool = False,
+        model: str | None = None,
     ) -> str:
-        """One chat completion against THIS instance's model.
+        """One chat completion against THIS instance's provider.
+
+        ``model`` overrides the model for this call (``None`` = the instance's
+        configured model); the provider/gateway/credentials are always the
+        SAME (no second API provider or key).
 
         ``require_complete`` (sendable content paths) additionally rejects
         truncated/incomplete outputs: ``finish_reason=length``, a content
@@ -199,9 +225,10 @@ class OpenAICompatLLM:
         error so a cut-off draft can never become sendable. Incoming summaries
         keep the tolerant behavior (``require_complete=False``).
         """
+        active = model or self._model
         try:
             response = await self._client.chat.completions.create(
-                model=self._model,
+                model=active,
                 messages=messages,
                 temperature=self._settings.llm_temperature,
                 max_tokens=max_tokens,

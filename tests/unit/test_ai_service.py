@@ -7,12 +7,13 @@ validation lives in the opt-in ``test_llm_real.py`` suite.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import pytest
 
 from inboxbridge.llm.ai_service import AIService
-from inboxbridge.llm.base import LLMUnavailable, LLMUnsupportedModality
+from inboxbridge.llm.base import LLMEmptyResponse, LLMUnavailable, LLMUnsupportedModality
 
 
 def make_settings(**overrides: object) -> Any:
@@ -167,3 +168,111 @@ class TestAudioGating:
         result = run(service.audio("audio/ogg", b"data"))
         assert result == "transcripción"
         assert fake.calls == [("transcribe_audio", "")]
+
+
+# ── text fallback model (AI_TEXT_FALLBACK_MODEL) ────────────────────────────
+
+
+class TestTextFallbackConfig:
+    def test_fallback_empty_disabled(self) -> None:
+        settings = make_settings()
+        assert settings.effective_text_fallback_model == ""
+
+    def test_fallback_configured(self) -> None:
+        settings = make_settings(AI_TEXT_FALLBACK_MODEL="fb-model")
+        assert settings.effective_text_fallback_model == "fb-model"
+
+    def test_fallback_same_as_primary_disabled(self) -> None:
+        settings = make_settings(AI_TEXT_FALLBACK_MODEL="deepseek-v4-flash")
+        assert settings.effective_text_fallback_model == ""
+
+    def test_lazy_fallback_client_uses_same_provider_config(self) -> None:
+        service = AIService(
+            make_settings(AI_TEXT_FALLBACK_MODEL="fb-model")
+        )
+        client = service._text_client("fb-model")
+        assert client._model == "fb-model"
+        assert str(client._client.base_url) == "https://api.test/v1/"
+        assert client._client.api_key == "test-key"
+        # Primary client is untouched by the fallback request.
+        assert service._text_llm is None
+
+
+class TestTextWithModelOverride:
+    def test_primary_call_has_no_fallback_markers(self) -> None:
+        service = AIService(make_settings(AI_TEXT_FALLBACK_MODEL="fb-model"))
+        text_fake = FakeClient(["hola"])
+        service._text_llm = text_fake  # type: ignore[assignment]
+        result = run(service.text([{"role": "user", "content": "hi"}], max_tokens=10))
+        assert result == "hola"
+        record = service.calls[-1]
+        assert record.model == "deepseek-v4-flash"
+        assert record.fallback_used is False
+        assert record.fallback_model == ""
+
+    def test_fallback_model_call_marks_fallback_used(self) -> None:
+        service = AIService(make_settings(AI_TEXT_FALLBACK_MODEL="fb-model"))
+        fallback_fake = FakeClient(["hola fb"])
+        service._text_fallback_llm = fallback_fake  # type: ignore[assignment]
+        result = run(
+            service.text(
+                [{"role": "user", "content": "hi"}],
+                max_tokens=10,
+                model="fb-model",
+            )
+        )
+        assert result == "hola fb"
+        record = service.calls[-1]
+        assert record.model == "fb-model"
+        assert record.fallback_used is True
+        assert record.fallback_model == "fb-model"
+
+    def test_fallback_failure_records_and_logs_safely(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO, logger="inboxbridge.llm.ai_service")
+        service = AIService(make_settings(AI_TEXT_FALLBACK_MODEL="fb-model"))
+        fallback_fake = FakeClient([LLMUnavailable("down")])
+        service._text_fallback_llm = fallback_fake  # type: ignore[assignment]
+        with pytest.raises(LLMUnavailable):
+            run(
+                service.text(
+                    [{"role": "user", "content": "hi"}],
+                    max_tokens=10,
+                    task="qa",
+                    model="fb-model",
+                )
+            )
+        record = service.calls[-1]
+        assert record.success is False
+        assert record.model == "fb-model"
+        assert any(
+            "text_fallback task=qa model=fb-model outcome=failed error=LLMUnavailable"
+            in r.message
+            for r in caplog.records
+        )
+        # Privacy-safe: no prompt text ever logged.
+        assert not any("hi" in (r.message or "") for r in caplog.records)
+
+    def test_fallback_success_logs_outcome(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.INFO, logger="inboxbridge.llm.ai_service")
+        service = AIService(make_settings(AI_TEXT_FALLBACK_MODEL="fb-model"))
+        fallback_fake = FakeClient(["ok"])
+        service._text_fallback_llm = fallback_fake  # type: ignore[assignment]
+        run(service.text([{"role": "user", "content": "hi"}], task="compose", model="fb-model"))
+        assert any(
+            "text_fallback task=compose model=fb-model outcome=success fallback_used=true"
+            in r.message
+            for r in caplog.records
+        )
+
+    def test_primary_transient_failure_does_not_auto_fallback_inside_text(self) -> None:
+        """AIService.text is a SINGLE transport call: model diversity is
+        orchestrated by the bounded alternation at the retry layer, never
+        silently here (no retry multiplication)."""
+        service = AIService(make_settings(AI_TEXT_FALLBACK_MODEL="fb-model"))
+        text_fake = FakeClient([LLMEmptyResponse("empty")])
+        service._text_llm = text_fake  # type: ignore[assignment]
+        with pytest.raises(LLMEmptyResponse):
+            run(service.text([{"role": "user", "content": "hi"}], max_tokens=10))
+        assert len(service.calls) == 1  # exactly one provider call

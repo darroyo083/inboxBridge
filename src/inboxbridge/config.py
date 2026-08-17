@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     # AI routing (V1.1): text vs vision vs audio, configuration-driven.
     # Model IDs come from the environment; business logic never hardcodes them.
     ai_text_model: str = Field(default="", alias="AI_TEXT_MODEL")
+    #: Optional SECOND text model on the SAME provider/gateway, used ONLY as a
+    #: bounded technical-reliability fallback (never for quality preferences).
+    ai_text_fallback_model: str = Field(default="", alias="AI_TEXT_FALLBACK_MODEL")
     ai_vision_model: str = Field(default="", alias="AI_VISION_MODEL")
     ai_vision_fallback_model: str = Field(default="", alias="AI_VISION_FALLBACK_MODEL")
     ai_audio_enabled: bool = Field(default=False, alias="AI_AUDIO_ENABLED")
@@ -54,6 +57,18 @@ class Settings(BaseSettings):
     @property
     def effective_text_model(self) -> str:
         return self.ai_text_model or self.llm_model
+
+    @property
+    def effective_text_fallback_model(self) -> str:
+        """Optional second text model on the same provider; ``""`` = disabled.
+
+        Disabled when unset OR equal to the primary (a duplicate call would be
+        pointless). Never a hardcoded model: the owner configures it.
+        """
+        fallback = self.ai_text_fallback_model
+        if not fallback or fallback == self.effective_text_model:
+            return ""
+        return fallback
 
     # Gmail / Google
     google_client_secret_file: str = "credentials/client_secret.json"

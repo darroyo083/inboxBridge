@@ -731,5 +731,7 @@ class MockLLM:
             references="",
         )
 
-    async def translate_to_spanish(self, body: str) -> str:
+    async def translate_to_spanish(
+        self, body: str, *, model: str | None = None
+    ) -> str:
         return "[ES] " + body

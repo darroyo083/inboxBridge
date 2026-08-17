@@ -78,12 +78,16 @@ class FakeAi:
     def __init__(self) -> None:
         self.text_responses: dict[str, str] = {}
         self.default_text = "Texto de prueba"
+        self._text_fallback_model = ""
         self.vision_responses: list[str] = []
         self.vision_fail: str = ""  # "primary" | "both"
         self.vision_calls: list[str] = []
         self.audio_responses: list[str] = []
         self.audio_calls = 0
         self.calls: list[tuple[str, str]] = []  # (task, model-ish)
+        #: Model requested per text call (None = primary; fallback model name
+        #: when the bounded alternation used the configured fallback).
+        self.models: list[str | None] = []
         # Translation retry simulation: first N translate calls raise
         # LLMEmptyResponse (transient) — the caller must retry boundedly.
         self.translate_failures = 0
@@ -120,10 +124,25 @@ class FakeAi:
         self.qa_messages: list[list[Any]] = []
         self.thread_summary_messages: list[list[Any]] = []
 
+    @property
+    def text_model(self) -> str:
+        return "deepseek-v4-flash"
+
+    @property
+    def text_fallback_model(self) -> str:
+        return self._text_fallback_model
+
     async def text(
-        self, messages: list[Any], *, max_tokens: int, task: str, require_complete: bool = False
+        self,
+        messages: list[Any],
+        *,
+        max_tokens: int,
+        task: str,
+        require_complete: bool = False,
+        model: str | None = None,
     ) -> str:
         self.calls.append((task, "deepseek-v4-flash"))
+        self.models.append(model)
         if task == "intent":
             # Extract the user text from the message and return scripted JSON.
             content = str(messages[-1]["content"])
@@ -269,7 +288,9 @@ class FakeAi:
             )
         return self.default_text
 
-    async def translate_to_spanish(self, body: str) -> str:
+    async def translate_to_spanish(
+        self, body: str, *, model: str | None = None
+    ) -> str:
         self.translate_calls += 1
         if self.translate_failures > 0:
             self.translate_failures -= 1
@@ -341,7 +362,9 @@ class FakeCoordinatorLLM:
             references="",
         )
 
-    async def translate_to_spanish(self, body: str) -> str:
+    async def translate_to_spanish(
+        self, body: str, *, model: str | None = None
+    ) -> str:
         return "[ES] " + body
 
 
@@ -2075,3 +2098,178 @@ async def test_flow_t_voice_disabled_falls_back_gracefully(stack: Stack) -> None
     texts = [m.text for m in stack.sender.messages]
     assert any("notas de voz aún no están activadas" in (t or "") for t in texts)
     assert stack.ai.audio_calls == 0
+
+
+# ── text-model technical fallback (AI_TEXT_FALLBACK_MODEL) ───────────────────
+
+
+def _enable_text_fallback(stack: Stack) -> None:
+    stack.settings.ai_text_fallback_model = "fb-model"
+
+
+async def test_flow_fallback_compose_primary_empty_fallback_valid_one_draft(
+    stack: Stack,
+) -> None:
+    """Compose: primary returns empty (transient) → the bounded retry uses the
+    configured fallback model → exactly ONE draft, exactly 2 provider calls
+    (never 4)."""
+    _enable_text_fallback(stack)
+    stack.contacts.create_contact("Daniel", "daniel@fb.ch")
+    stack.ai.compose_failures = 1
+    await stack.send_bg("escríbele a Daniel que muchas gracias")
+    previews = [
+        m.text
+        for m in stack.sender.messages
+        if (m.text or "").startswith("Borrador (Nuevo correo)")
+    ]
+    assert previews  # exactly one draft preview
+    assert stack.ai.compose_calls == 2
+    assert stack.ai.models[-2:] == [None, "fb-model"]  # primary, then fallback
+
+
+async def test_flow_fallback_qa_primary_malformed_fallback_structured_succeeds(
+    stack: Stack,
+) -> None:
+    """Q&A: primary returns malformed structured JSON → retry uses the fallback
+    model with the SAME question/context → structured answer rendered."""
+    _enable_text_fallback(stack)
+    stack.gmail.threads["t1"] = make_thread("t1")
+    stack.ai.qa_malformed = 1
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("¿qué me está pidiendo?", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    assert stack.ai.qa_calls == 2
+    assert stack.ai.models[-2:] == [None, "fb-model"]
+    texts = [m.text for m in stack.sender.messages]
+    assert any("💰 <b>Importe</b>" in (t or "") for t in texts)
+    assert not any('{"answer"' in (t or "") for t in texts)
+
+
+async def test_flow_fallback_qa_both_fail_safe_error(stack: Stack) -> None:
+    """Q&A: BOTH models produce unusable structured output → safe error, no
+    raw JSON, bounded 2 calls."""
+    _enable_text_fallback(stack)
+    stack.gmail.threads["t1"] = make_thread("t1")
+    stack.ai.qa_override = '{"answer": "incompleto'
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("¿qué me está pidiendo?", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    assert stack.ai.qa_calls == 2
+    texts = [m.text for m in stack.sender.messages]
+    assert any(
+        "No pude responder ahora; inténtalo otra vez." in (t or "") for t in texts
+    )
+    assert not any('{"answer"' in (t or "") for t in texts)
+
+
+async def test_flow_fallback_summary_primary_malformed_fallback_structured_succeeds(
+    stack: Stack,
+) -> None:
+    """Thread summary: primary malformed JSON → fallback model produces the
+    structured contract → rendered once, no plain layer used."""
+    _enable_text_fallback(stack)
+    stack.ai.thread_summary_malformed = 1
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    assert stack.ai.thread_summary_calls == 2
+    assert stack.ai.plain_summary_calls == 0
+    assert stack.ai.models[-2:] == [None, "fb-model"]
+    texts = [m.text for m in stack.sender.messages]
+    assert sum(1 for t in texts if "📬 <b>Resumen</b>" in (t or "")) == 1
+    assert not any('{"headline"' in (t or "") for t in texts)
+
+
+async def test_flow_fallback_summary_hard_budget_three_calls(stack: Stack) -> None:
+    """Thread summary HARD budget: structured primary + structured fallback +
+    ONE plain generation = exactly 3 provider calls, never more."""
+    _enable_text_fallback(stack)
+    stack.ai.thread_summary_malformed = 5  # both structured models unusable
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    assert stack.ai.thread_summary_calls == 2
+    assert stack.ai.plain_summary_calls == 1
+    # Alternation: primary, fallback, primary (plain) — total 3 generations.
+    assert stack.ai.models[-3:] == [None, "fb-model", None]
+    assert len(stack.ai.models) == 3
+    texts = [m.text for m in stack.sender.messages]
+    assert any("• Tasa: 125 CHF." in (t or "") for t in texts)
+    assert not any('{"headline"' in (t or "") for t in texts)
+
+
+async def test_flow_fallback_translation_retry_uses_fallback(stack: Stack) -> None:
+    """DE→ES translation: primary transient failure → fallback model translates
+    the EXACT German body; the German draft is never altered."""
+    _enable_text_fallback(stack)
+    stack.contacts.create_contact("Daniel", "daniel@fb.ch")
+    stack.ai.compose_failures = 1
+    await stack.send_bg("escríbele a Daniel que muchas gracias")
+    previews = [
+        m.text
+        for m in stack.sender.messages
+        if (m.text or "").startswith("Borrador (Nuevo correo)")
+    ]
+    assert previews and "[ES]" in previews[-1]
+    # Compose generation: primary failed once → the retry used the fallback
+    # model; the Spanish preview still covers the exact German body.
+    assert stack.ai.models[-2:] == [None, "fb-model"]
+    assert "Sehr geehrte Frau Muster" in previews[-1]
+
+
+async def test_flow_fallback_forward_retry_no_duplicate_attachments(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """Forward: primary transient failure → fallback model body succeeds;
+    attachments collected once, one draft, temp files cleaned."""
+    _enable_text_fallback(stack)
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.contacts.create_contact("Daniel", "daniel@forward.ch")
+    original = email_with_attachments(make_email(message_id="m-fwd", subject="Presupuesto"))
+    stack.gmail.messages["m-fwd"] = original
+    stack.gmail.attachment_bytes[("m-fwd", 0)] = b"%PDF-1.4 fake pdf content"
+    stack.ai.forward_failures = 1
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    await stack.send_bg("reenvíaselo a Daniel", reply_to=stack.bot_message(summary_id))
+    previews = [
+        m.text
+        for m in stack.sender.messages
+        if (m.text or "").startswith("Borrador (Nuevo correo)")
+    ]
+    assert previews and "presupuesto.pdf" in previews[-1]
+    assert stack.ai.models[-2:] == [None, "fb-model"]
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    assert len(stack.gmail.sent[0].attachments) == 1
+    delivery_dir = Path(str(tmp_path / "tmp" / "delivery"))
+    leftovers = list(delivery_dir.iterdir()) if delivery_dir.is_dir() else []
+    assert leftovers == []
+
+
+async def test_flow_fallback_edit_preserves_draft_metadata(stack: Stack) -> None:
+    """Draft edit: primary transient failure → fallback edits the SAME draft;
+    recipient/subject/thread/attachments preserved, one preview."""
+    _enable_text_fallback(stack)
+    stack.contacts.create_contact("Roman", "femo@femo.ch")
+    await stack.send_bg("escríbele a Roman que gracias")
+    previews = [
+        m.text
+        for m in stack.sender.messages
+        if (m.text or "").startswith("Borrador (Nuevo correo)")
+    ]
+    assert previews
+    stack.ai.draft_edit_failures = 1
+    await stack.send("hazlo más corto")
+    await asyncio.sleep(0.05)
+    assert stack.ai.draft_edit_calls == 2  # primary failed → fallback model
+    assert stack.ai.models[-2:] == [None, "fb-model"]
+    previews2 = [
+        m.text
+        for m in stack.sender.messages
+        if (m.text or "").startswith("Borrador (Nuevo correo)")
+    ]
+    assert len(previews2) == 2  # one original + one edited preview, no duplicates
+    assert "femo@femo.ch" in previews2[-1]
+    assert "kurz und klar" in previews2[-1]

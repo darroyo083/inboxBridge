@@ -651,3 +651,110 @@ async def test_draft_reply_signature_change_affects_new_drafts_only(
     second = await provider_b.draft_reply(request, _thread())
     assert second.body.endswith("Grüßen\n\nOtro Nombre")
     assert first.body.endswith("Grüßen\n\nDaniel")  # frozen draft untouched
+
+
+# ── text model alternation (AI_TEXT_FALLBACK_MODEL) ─────────────────────────
+
+
+def test_alternate_models_disabled_when_unset() -> None:
+    models = base.alternate_text_models("primary", None, task="t")
+    assert [models() for _ in range(3)] == [None, None, None]
+
+
+def test_alternate_models_disabled_when_same_as_primary() -> None:
+    models = base.alternate_text_models("primary", "primary", task="t")
+    assert [models() for _ in range(3)] == [None, None, None]
+
+
+def test_alternate_models_primary_then_fallback_then_primary() -> None:
+    models = base.alternate_text_models("primary", "fb-model", task="t")
+    assert [models() for _ in range(3)] == [None, "fb-model", None]
+
+
+async def test_summarize_email_uses_fallback_after_transient_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OpenAICompatLLM(
+        _settings(monkeypatch, LLM_MAX_RETRIES="2", AI_TEXT_FALLBACK_MODEL="fb-model")
+    )
+    captured: list[dict[str, object]] = []
+    responses = iter(
+        [
+            _error(openai.APIConnectionError),  # → LLMUnavailable (retryable)
+            '{"subject_es": "Plan", "summary_es": "Resumen breve."}',
+        ]
+    )
+
+    async def fake_create(**kwargs: object) -> SimpleNamespace:
+        captured.append(kwargs)
+        item = next(responses)
+        if isinstance(item, Exception):
+            raise item
+        message = SimpleNamespace(content=item)
+        choice = SimpleNamespace(message=message)
+        return SimpleNamespace(choices=[choice])
+
+    monkeypatch.setattr(provider._client.chat.completions, "create", fake_create)
+    result = await provider.summarize_email(_email())
+    assert result.summary_es == "Resumen breve."
+    # Attempt 1 on the primary model, attempt 2 on the configured fallback.
+    assert [c["model"] for c in captured] == ["test-model", "fb-model"]
+
+
+async def test_summarize_email_no_fallback_on_permanent_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OpenAICompatLLM(
+        _settings(monkeypatch, LLM_MAX_RETRIES="2", AI_TEXT_FALLBACK_MODEL="fb-model")
+    )
+    captured: list[dict[str, object]] = []
+
+    async def fake_create(**kwargs: object) -> SimpleNamespace:
+        captured.append(kwargs)
+        raise _error(openai.AuthenticationError)  # → permanent LLMError
+
+    monkeypatch.setattr(provider._client.chat.completions, "create", fake_create)
+    with pytest.raises(base.LLMError):
+        await provider.summarize_email(_email())
+    assert len(captured) == 1  # fail closed: no fallback burn on auth/policy
+
+
+async def test_draft_reply_primary_incomplete_fallback_valid_one_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OpenAICompatLLM(
+        _settings(monkeypatch, LLM_MAX_RETRIES="2", AI_TEXT_FALLBACK_MODEL="fb-model")
+    )
+    captured: list[dict[str, object]] = []
+    responses = iter(
+        [
+            # Primary: truncated (finish_reason=length) → LLMIncompleteResponse.
+            ("Sehr geehrte Frau Muster,\n\nvielen Dank für die", "length"),
+            # Fallback: valid complete body.
+            (
+                "Sehr geehrte Frau Muster,\n\nvielen Dank für Ihre Nachricht.\n\n"
+                "Mit freundlichen Grüßen\nDaniel",
+                "stop",
+            ),
+        ]
+    )
+
+    async def fake_create(**kwargs: object) -> SimpleNamespace:
+        captured.append(kwargs)
+        content, finish_reason = next(responses)
+        message = SimpleNamespace(content=content)
+        choice = SimpleNamespace(message=message, finish_reason=finish_reason)
+        return SimpleNamespace(choices=[choice])
+
+    monkeypatch.setattr(provider._client.chat.completions, "create", fake_create)
+    draft = await provider.draft_reply(
+        DraftRequest(
+            thread_id="t1",
+            user_instructions="sag einfach danke",
+            memory=(),
+        ),
+        _thread(),
+    )
+    assert [c["model"] for c in captured] == ["test-model", "fb-model"]
+    assert draft.body.endswith("Daniel")  # trusted signature normalized
+    assert draft.to == [EmailAddress("Ana", "ana@example.com")]
