@@ -274,7 +274,7 @@ class EmailAssistant:
                     prompts.ask_about_email_messages(
                         question or "¿Qué me está pidiendo?", thread
                     ),
-                    max_tokens=800,
+                    max_tokens=self._settings.llm_max_tokens_qa,
                     task="qa",
                     require_complete=True,
                     model=models(),
@@ -331,7 +331,7 @@ class EmailAssistant:
             parsed = await call_structured(
                 lambda: self._ai.text(
                     prompts.summarize_thread_messages(thread),
-                    max_tokens=800,
+                    max_tokens=self._settings.llm_max_tokens_thread_summary,
                     task="thread_summary",
                     require_complete=True,
                     model=models(),
@@ -371,7 +371,7 @@ class EmailAssistant:
             plain = await call_with_retry(
                 lambda: self._ai.text(
                     prompts.plain_summarize_thread_messages(thread),
-                    max_tokens=600,
+                    max_tokens=self._settings.llm_max_tokens_thread_summary_plain,
                     task="thread_summary_plain",
                     require_complete=True,
                     model=models(),

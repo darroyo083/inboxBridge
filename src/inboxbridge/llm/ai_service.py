@@ -34,7 +34,7 @@ from .base import (
     LLMUnavailable,
     LLMUnsupportedModality,
 )
-from .openai_compat import OpenAICompatLLM
+from .openai_compat import CompletionMeta, OpenAICompatLLM
 from .pdf_render import PdfRenderError, render_pdf_pages
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,12 @@ _FALLBACK_EXCEPTIONS = (
 
 @dataclass
 class AiCall:
-    """Observability record for one AI invocation (safe metadata only)."""
+    """Observability record for one AI invocation (safe metadata only).
+
+    Token fields are COUNTS only — never content, prompts or reasoning text.
+    ``reasoning_available`` marks whether the provider exposed
+    ``reasoning_tokens`` (MiMo-style usage details); DeepSeek may not.
+    """
 
     task: str
     model: str
@@ -63,6 +68,11 @@ class AiCall:
     success: bool = False
     fallback_used: bool = False
     fallback_model: str = ""
+    finish_reason: str = ""
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
+    reasoning_available: bool = False
+    max_tokens: int = 0
 
 
 class AIService:
@@ -85,6 +95,12 @@ class AIService:
     @property
     def text_fallback_model(self) -> str:
         return self._settings.effective_text_fallback_model
+
+    @property
+    def intent_max_tokens(self) -> int:
+        """Bounded intent-classification budget: rules-first routing means the
+        LLM classifier only reasons briefly, so it stays deliberately small."""
+        return self._settings.llm_max_tokens_intent
 
     @property
     def vision_model(self) -> str:
@@ -143,12 +159,21 @@ class AIService:
             model=active,
             fallback_used=fallback_used,
             fallback_model=(model or "") if fallback_used else "",
+            max_tokens=max_tokens,
         )
+        meta = CompletionMeta()
         started = time.monotonic()
         try:
             result = await self._text_client(model).complete(
-                messages, max_tokens=max_tokens, require_complete=require_complete
+                messages,
+                max_tokens=max_tokens,
+                require_complete=require_complete,
+                meta=meta,
             )
+            record.finish_reason = meta.finish_reason
+            record.completion_tokens = meta.completion_tokens
+            record.reasoning_tokens = meta.reasoning_tokens
+            record.reasoning_available = meta.reasoning_available
             record.success = True
             self._finish(record, started)
             if fallback_used:
@@ -176,7 +201,7 @@ class AIService:
         """Translate a German draft body to Spanish (display-only, never sent)."""
         return await self.text(
             prompts.translate_to_spanish_messages(body),
-            max_tokens=self._settings.llm_max_tokens_draft,
+            max_tokens=self._settings.llm_max_tokens_translation,
             task="translate",
             require_complete=True,
             model=model,
@@ -292,17 +317,28 @@ class AIService:
     ) -> None:
         record.duration_ms = int((time.monotonic() - started) * 1000)
         self.calls.append(record)
+        reasoning = (
+            str(record.reasoning_tokens) if record.reasoning_available else "unavailable"
+        )
         if record.success:
             logger.info(
-                "ai provider=%s task=%s model=%s duration_ms=%d fallback_used=%s",
+                "ai provider=%s task=%s model=%s duration_ms=%d fallback_used=%s "
+                "finish_reason=%s completion_tokens=%d reasoning_tokens=%s "
+                "max_tokens=%d",
                 record.provider, record.task, record.model,
                 record.duration_ms, record.fallback_used,
+                record.finish_reason, record.completion_tokens, reasoning,
+                record.max_tokens,
             )
         else:
             logger.warning(
-                "ai provider=%s task=%s model=%s duration_ms=%d fallback_used=%s error=%s",
+                "ai provider=%s task=%s model=%s duration_ms=%d fallback_used=%s "
+                "finish_reason=%s completion_tokens=%d reasoning_tokens=%s "
+                "max_tokens=%d error=%s",
                 record.provider, record.task, record.model,
                 record.duration_ms, record.fallback_used,
+                record.finish_reason, record.completion_tokens, reasoning,
+                record.max_tokens,
                 type(error).__name__ if error else "unknown",
             )
 

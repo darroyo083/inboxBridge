@@ -33,8 +33,22 @@ class Settings(BaseSettings):
     llm_base_url: str = Field(default="", alias="LLM_BASE_URL")
     llm_api_key: SecretStr = Field(default=SecretStr(""), alias="LLM_API_KEY")
     llm_model: str = "deepseek-v4-flash"
-    llm_max_tokens_summary: int = 700
-    llm_max_tokens_draft: int = 1000
+    # Task-aware output budgets (CEILINGS, not consumption). Reasoning-capable
+    # models consume part of max_tokens internally, so each task gets enough
+    # headroom to reliably reach its visible output while staying bounded.
+    llm_max_tokens_summary: int = Field(default=1000, alias="LLM_MAX_TOKENS_SUMMARY")
+    llm_max_tokens_draft: int = Field(default=1600, alias="LLM_MAX_TOKENS_DRAFT")
+    llm_max_tokens_intent: int = Field(default=400, alias="LLM_MAX_TOKENS_INTENT")
+    llm_max_tokens_qa: int = Field(default=1600, alias="LLM_MAX_TOKENS_QA")
+    llm_max_tokens_thread_summary: int = Field(
+        default=2000, alias="LLM_MAX_TOKENS_THREAD_SUMMARY"
+    )
+    llm_max_tokens_thread_summary_plain: int = Field(
+        default=1500, alias="LLM_MAX_TOKENS_THREAD_SUMMARY_PLAIN"
+    )
+    llm_max_tokens_translation: int = Field(
+        default=1200, alias="LLM_MAX_TOKENS_TRANSLATION"
+    )
     llm_temperature: float = 0.4
     llm_max_retries: int = 3
 

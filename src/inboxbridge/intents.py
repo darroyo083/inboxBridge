@@ -543,7 +543,7 @@ class IntentClassifier:
             content = await call_with_retry(
                 lambda: ai.text(
                     _llm_classify_messages(text, context),
-                    max_tokens=150,
+                    max_tokens=ai.intent_max_tokens,
                     task="intent",
                     model=models(),
                 ),

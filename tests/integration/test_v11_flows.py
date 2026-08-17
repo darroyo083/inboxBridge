@@ -88,6 +88,8 @@ class FakeAi:
         #: Model requested per text call (None = primary; fallback model name
         #: when the bounded alternation used the configured fallback).
         self.models: list[str | None] = []
+        #: (task, max_tokens) per text call — task-aware budget assertions.
+        self.max_tokens_calls: list[tuple[str, int]] = []
         # Translation retry simulation: first N translate calls raise
         # LLMEmptyResponse (transient) — the caller must retry boundedly.
         self.translate_failures = 0
@@ -143,6 +145,7 @@ class FakeAi:
     ) -> str:
         self.calls.append((task, "deepseek-v4-flash"))
         self.models.append(model)
+        self.max_tokens_calls.append((task, max_tokens))
         if task == "intent":
             # Extract the user text from the message and return scripted JSON.
             content = str(messages[-1]["content"])
@@ -2273,3 +2276,50 @@ async def test_flow_fallback_edit_preserves_draft_metadata(stack: Stack) -> None
     assert len(previews2) == 2  # one original + one edited preview, no duplicates
     assert "femo@femo.ch" in previews2[-1]
     assert "kurz und klar" in previews2[-1]
+
+
+# ── task-aware output budgets (reasoning-capable models) ─────────────────────
+
+
+async def test_budget_thread_summary_structured(stack: Stack) -> None:
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    assert ("thread_summary", 2000) in stack.ai.max_tokens_calls
+
+
+async def test_budget_thread_summary_plain(stack: Stack) -> None:
+    stack.ai.thread_summary_override = (
+        '{"headline": "Resumen", "sections": [{"emoji": "📬", "title": "Resumen", "items": ['
+    )  # structured unusable → plain layer
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    assert ("thread_summary_plain", 1500) in stack.ai.max_tokens_calls
+
+
+async def test_budget_qa(stack: Stack) -> None:
+    stack.gmail.threads["t1"] = make_thread("t1")
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("¿qué me está pidiendo?", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    assert ("qa", 1600) in stack.ai.max_tokens_calls
+
+
+async def test_budget_compose_and_forward_and_edit(stack: Stack) -> None:
+    stack.contacts.create_contact("Roman", "femo@femo.ch")
+    await stack.send_bg("escríbele a Roman que gracias")
+    assert ("compose", 1600) in stack.ai.max_tokens_calls
+    await stack.send("hazlo más corto")
+    await asyncio.sleep(0.05)
+    assert ("draft_edit", 1600) in stack.ai.max_tokens_calls
+
+
+async def test_budget_forward(stack: Stack) -> None:
+    stack.contacts.create_contact("Daniel", "daniel@forward.ch")
+    original = email_with_attachments(make_email(message_id="m-fwd", subject="Presupuesto"))
+    stack.gmail.messages["m-fwd"] = original
+    stack.gmail.attachment_bytes[("m-fwd", 0)] = b"%PDF-1.4 fake pdf content"
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    await stack.send_bg("reenvíaselo a Daniel", reply_to=stack.bot_message(summary_id))
+    assert ("forward", 1600) in stack.ai.max_tokens_calls

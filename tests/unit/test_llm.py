@@ -5,6 +5,7 @@ No network: the OpenAI client is monkeypatched; ``asyncio.sleep`` is stubbed.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -14,6 +15,7 @@ import pytest
 
 from inboxbridge.config import Settings
 from inboxbridge.llm import OpenAICompatLLM, base, prompts
+from inboxbridge.llm.openai_compat import CompletionMeta
 from inboxbridge.models import (
     DraftRequest,
     EmailAddress,
@@ -758,3 +760,138 @@ async def test_draft_reply_primary_incomplete_fallback_valid_one_draft(
     assert [c["model"] for c in captured] == ["test-model", "fb-model"]
     assert draft.body.endswith("Daniel")  # trusted signature normalized
     assert draft.to == [EmailAddress("Ana", "ana@example.com")]
+
+
+# ── completion telemetry + task-aware budgets ───────────────────────────────
+
+
+def _fake_create_with_usage(
+    provider: OpenAICompatLLM,
+    monkeypatch: pytest.MonkeyPatch,
+    content: str,
+    *,
+    finish_reason: str = "stop",
+    completion_tokens: int | None = 118,
+    reasoning_tokens: int | None = 114,
+    reasoning_text: str = "",
+) -> list[dict[str, object]]:
+    captured: list[dict[str, object]] = []
+
+    async def fake_create(**kwargs: object) -> SimpleNamespace:
+        captured.append(kwargs)
+        message = SimpleNamespace(content=content, reasoning=reasoning_text or None)
+        choice = SimpleNamespace(message=message, finish_reason=finish_reason)
+        details = None
+        if reasoning_tokens is not None:
+            details = SimpleNamespace(reasoning_tokens=reasoning_tokens)
+        usage = SimpleNamespace(
+            completion_tokens=completion_tokens,
+            completion_tokens_details=details,
+        )
+        return SimpleNamespace(choices=[choice], usage=usage)
+
+    monkeypatch.setattr(provider._client.chat.completions, "create", fake_create)
+    return captured
+
+
+async def test_completion_meta_captures_safe_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(monkeypatch)
+    _fake_create_with_usage(provider, monkeypatch, "Resumen breve.", finish_reason="stop")
+    meta = CompletionMeta()
+    result = await provider.complete(
+        [{"role": "user", "content": "x"}], max_tokens=2000, meta=meta
+    )
+    assert result == "Resumen breve."
+    assert meta.finish_reason == "stop"
+    assert meta.completion_tokens == 118
+    assert meta.reasoning_tokens == 114
+    assert meta.reasoning_available is True
+    assert meta.max_tokens == 2000
+
+
+async def test_completion_meta_missing_reasoning_handled_safely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(monkeypatch)
+    # DeepSeek-like: completion_tokens_details is absent/empty.
+    _fake_create_with_usage(
+        provider, monkeypatch, "ok", completion_tokens=27, reasoning_tokens=None
+    )
+    meta = CompletionMeta()
+    result = await provider.complete([{"role": "user", "content": "x"}], max_tokens=2000, meta=meta)
+    assert result == "ok"
+    assert meta.reasoning_available is False
+    assert meta.reasoning_tokens == 0
+    assert meta.completion_tokens == 27
+
+
+async def test_completion_meta_missing_usage_tolerated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(monkeypatch)
+    # Provider omitted usage entirely.
+    _fake_create_with_usage(
+        provider, monkeypatch, "ok", completion_tokens=None, reasoning_tokens=None
+    )
+    meta = CompletionMeta()
+    result = await provider.complete([{"role": "user", "content": "x"}], max_tokens=100, meta=meta)
+    assert result == "ok"
+    assert meta.completion_tokens == 0
+    assert meta.reasoning_available is False
+
+
+async def test_reasoning_content_never_read_or_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="inboxbridge.llm.openai_compat")
+    provider = _provider(monkeypatch)
+    _fake_create_with_usage(
+        provider, monkeypatch, "visible ok", reasoning_text="REASONING-SECRET-42"
+    )
+    result = await provider.complete(
+        [{"role": "user", "content": "x"}], max_tokens=2000
+    )
+    assert result == "visible ok"
+    assert not any("REASONING-SECRET-42" in (r.message or "") for r in caplog.records)
+
+
+async def test_direct_completion_logs_safe_telemetry(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="inboxbridge.llm.openai_compat")
+    provider = _provider(monkeypatch)
+    _fake_create_with_usage(provider, monkeypatch, "ok", finish_reason="stop")
+    await provider.complete([{"role": "user", "content": "x"}], max_tokens=2000)
+    assert any(
+        "llm provider=opencode_go model=test-model finish_reason=stop "
+        "completion_tokens=118 reasoning_tokens=114 max_tokens=2000" in r.message
+        for r in caplog.records
+    )
+
+
+async def test_larger_budget_does_not_bypass_completeness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(monkeypatch)
+    _fake_create_with_usage(
+        provider, monkeypatch, "truncado", finish_reason="length"
+    )
+    with pytest.raises(base.LLMIncompleteResponse):
+        await provider.complete(
+            [{"role": "user", "content": "x"}], max_tokens=2000, require_complete=True
+        )
+
+
+async def test_summarize_email_uses_summary_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OpenAICompatLLM(
+        _settings(monkeypatch, LLM_MAX_TOKENS_SUMMARY="1000")
+    )
+    captured = _fake_create(
+        provider, monkeypatch, '{"subject_es": "Plan", "summary_es": "Resumen breve."}'
+    )
+    await provider.summarize_email(_email())
+    assert captured[0]["max_tokens"] == 1000

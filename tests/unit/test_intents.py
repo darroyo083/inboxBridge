@@ -192,6 +192,7 @@ class FakeAi:
     def __init__(self, content: str) -> None:
         self._content = content
         self.calls = 0
+        self.max_tokens_used: list[int] = []
 
     @property
     def text_model(self) -> str:
@@ -200,6 +201,10 @@ class FakeAi:
     @property
     def text_fallback_model(self) -> str:
         return ""  # disabled in these unit tests
+
+    @property
+    def intent_max_tokens(self) -> int:
+        return 400
 
     async def text(
         self,
@@ -210,6 +215,7 @@ class FakeAi:
         model: str | None = None,
     ) -> str:
         self.calls += 1
+        self.max_tokens_used.append(max_tokens)
         return self._content
 
 
@@ -271,6 +277,10 @@ class TestLlmFallback:
             def text_fallback_model(self) -> str:
                 return ""
 
+            @property
+            def intent_max_tokens(self) -> int:
+                return 400
+
             async def text(
                 self,
                 messages: list[Any],
@@ -317,6 +327,10 @@ def test_ambiguous_intent_primary_technical_failure_uses_fallback() -> None:
         def text_fallback_model(self) -> str:
             return "fb-model"
 
+        @property
+        def intent_max_tokens(self) -> int:
+            return 400
+
         async def text(
             self,
             messages: list[Any],
@@ -349,6 +363,10 @@ def test_both_intent_classifiers_fail_keeps_clarification() -> None:
         def text_fallback_model(self) -> str:
             return "fb-model"
 
+        @property
+        def intent_max_tokens(self) -> int:
+            return 400
+
         async def text(
             self,
             messages: list[Any],
@@ -366,3 +384,13 @@ def test_both_intent_classifiers_fail_keeps_clarification() -> None:
     intent = run(IntentClassifier(ai).classify("haz algo", context=""))
     assert intent.action == IntentAction.UNKNOWN
     assert ai.calls == 2  # bounded: primary + fallback, no explosion
+
+
+def test_intent_classifier_uses_small_budget() -> None:
+    ai = FakeAi(
+        '{"action": "summarize_thread", "recipient": "", "instruction": "", '
+        '"needs_clarification": false}'
+    )
+    intent = run(IntentClassifier(ai).classify("haz algo", context=""))
+    assert intent.action == IntentAction.SUMMARIZE_THREAD
+    assert ai.max_tokens_used == [400]  # intent stays deliberately small

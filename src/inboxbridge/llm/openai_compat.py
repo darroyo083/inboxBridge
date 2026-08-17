@@ -15,6 +15,8 @@ import base64
 import json
 import logging
 import re
+import time
+from dataclasses import dataclass
 
 import httpx
 from openai import (
@@ -92,6 +94,48 @@ def _looks_incomplete(text: str) -> bool:
 #: httpx timeouts for LLM calls (long reads: summaries/drafts can be slow).
 _CONNECT_TIMEOUT = 10.0
 _READ_TIMEOUT = 120.0
+
+_PROVIDER = "opencode_go"
+
+
+@dataclass
+class CompletionMeta:
+    """SAFE telemetry from one completion response.
+
+    Never carries content: no visible text, no reasoning text — only counts
+    and status the provider exposed. ``reasoning_available`` distinguishes
+    "provider did not report reasoning tokens" from a real zero.
+    """
+
+    finish_reason: str = ""
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
+    max_tokens: int = 0
+    reasoning_available: bool = False
+
+
+def _capture_meta(meta: CompletionMeta, response: object, max_tokens: int) -> None:
+    """Defensively copy response metadata into ``meta``.
+
+    Provider response shapes differ (MiMo reports reasoning_tokens, DeepSeek
+    may not); a shape difference must NEVER break the completion, so every
+    access is guarded and the whole block is fail-open.
+    """
+    try:
+        choice = getattr(response, "choices", [None])[0]
+        meta.finish_reason = str(getattr(choice, "finish_reason", "") or "")
+        meta.max_tokens = max_tokens
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            meta.completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+            details = getattr(usage, "completion_tokens_details", None)
+            reasoning = getattr(details, "reasoning_tokens", None)
+            if reasoning is not None:
+                meta.reasoning_tokens = int(reasoning or 0)
+                meta.reasoning_available = True
+    except Exception:
+        # Response-shape variance must never break the completion.
+        pass
 
 _RETRYABLE = (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError)
 _PERMANENT = (
@@ -200,7 +244,7 @@ class OpenAICompatLLM:
         """Translate a German draft body to Spanish (display-only, never sent)."""
         return await self.complete(
             prompts.translate_to_spanish_messages(body),
-            max_tokens=self._settings.llm_max_tokens_draft,
+            max_tokens=self._settings.llm_max_tokens_translation,
             require_complete=True,
             model=model,
         )
@@ -212,12 +256,18 @@ class OpenAICompatLLM:
         max_tokens: int,
         require_complete: bool = False,
         model: str | None = None,
+        meta: CompletionMeta | None = None,
     ) -> str:
         """One chat completion against THIS instance's provider.
 
         ``model`` overrides the model for this call (``None`` = the instance's
         configured model); the provider/gateway/credentials are always the
         SAME (no second API provider or key).
+
+        ``meta`` receives SAFE response telemetry (finish_reason, token
+        counts, max_tokens) — never content. When ``meta`` is None (direct
+        provider users without an AIService), the same privacy-safe metadata
+        line is logged here.
 
         ``require_complete`` (sendable content paths) additionally rejects
         truncated/incomplete outputs: ``finish_reason=length``, a content
@@ -226,6 +276,8 @@ class OpenAICompatLLM:
         keep the tolerant behavior (``require_complete=False``).
         """
         active = model or self._model
+        local_meta = CompletionMeta() if meta is None else meta
+        started = time.monotonic()
         try:
             response = await self._client.chat.completions.create(
                 model=active,
@@ -245,11 +297,29 @@ class OpenAICompatLLM:
             raise LLMError(f"LLM request rejected: {exc}") from exc
         except APIError as exc:
             raise LLMError(f"LLM API error: {exc}") from exc
-        content = response.choices[0].message.content
+        _capture_meta(local_meta, response, max_tokens)
+        if meta is None:
+            logger.info(
+                "llm provider=%s model=%s finish_reason=%s completion_tokens=%d "
+                "reasoning_tokens=%s max_tokens=%d duration_ms=%d",
+                _PROVIDER,
+                active,
+                local_meta.finish_reason,
+                local_meta.completion_tokens,
+                (
+                    str(local_meta.reasoning_tokens)
+                    if local_meta.reasoning_available
+                    else "unavailable"
+                ),
+                local_meta.max_tokens,
+                int((time.monotonic() - started) * 1000),
+            )
+        choice = response.choices[0]
+        content = choice.message.content
         if not content:
             raise LLMEmptyResponse("LLM returned an empty response")
         if require_complete:
-            finish_reason = getattr(response.choices[0], "finish_reason", None)
+            finish_reason = getattr(choice, "finish_reason", None)
             if finish_reason == "length":
                 raise LLMIncompleteResponse(
                     "LLM output truncated (finish_reason=length)"
