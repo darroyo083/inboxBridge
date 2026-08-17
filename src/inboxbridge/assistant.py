@@ -289,6 +289,13 @@ class EmailAssistant:
                 thread_id, with_attachments=True
             )
             await self._bot.send_typing()
+        except Exception as exc:
+            logger.warning("thread_summary structured outcome=failed error=%s", type(exc).__name__)
+            await self._bot.send_notice("No pude generar el resumen ahora; inténtalo otra vez.")
+            return
+        attachment_count = sum(len(m.attachments) for m in thread.messages)
+        attachment_context = "true" if attachment_count else "false"
+        try:
             parsed = await call_structured(
                 lambda: self._ai.text(
                     prompts.summarize_thread_messages(thread),
@@ -301,28 +308,61 @@ class EmailAssistant:
                 base_backoff=self._settings.retry_backoff_base,
                 task="thread_summary",
             )
+            logger.info(
+                "thread_summary structured outcome=success attachments=%d "
+                "attachment_context=%s",
+                attachment_count,
+                attachment_context,
+            )
+            # Structured contract → deterministic safe section formatting.
+            await self._bot.send_summary_answer(parsed.headline, parsed.sections)
+            return
         except StructuredOutputError:
             # Generation succeeded but the structured contract never parsed;
             # the raw model output is an implementation detail, never shown.
-            logger.warning("thread_summary outcome=invalid_structure")
-            await self._bot.send_notice(
-                "No pude generar el resumen ahora; inténtalo otra vez."
+            logger.warning(
+                "thread_summary structured outcome=invalid_structure attachments=%d "
+                "attachment_context=%s",
+                attachment_count,
+                attachment_context,
             )
-            return
         except LLMError as exc:
-            logger.warning("thread_summary outcome=failed error=%s", type(exc).__name__)
+            logger.warning(
+                "thread_summary structured outcome=failed error=%s", type(exc).__name__
+            )
+
+        # Layer B: ONE plain-summary generation (no JSON contract) so a useful
+        # summary still reaches the user when the structured path is exhausted.
+        try:
+            plain = await call_with_retry(
+                lambda: self._ai.text(
+                    prompts.plain_summarize_thread_messages(thread),
+                    max_tokens=600,
+                    task="thread_summary_plain",
+                    require_complete=True,
+                ),
+                max_attempts=2,
+                base_backoff=self._settings.retry_backoff_base,
+            )
+        except LLMError as exc:
+            logger.warning(
+                "thread_summary fallback=plain outcome=failed error=%s",
+                type(exc).__name__,
+            )
             await self._bot.send_notice(
                 "No pude generar el resumen ahora; inténtalo otra vez."
             )
             return
-        attachment_count = sum(len(m.attachments) for m in thread.messages)
         logger.info(
-            "thread_summary outcome=success attachments=%d attachment_context=%s",
+            "thread_summary fallback=plain outcome=success attachments=%d "
+            "attachment_context=%s",
             attachment_count,
-            ("true" if attachment_count else "false"),
+            attachment_context,
         )
-        # Structured contract → deterministic safe section formatting.
-        await self._bot.send_summary_answer(parsed.headline, parsed.sections)
+        # Safe rich rendering (escaped, emoji-led headings) → plain-text
+        # fallback if the formatted send fails. Raw model text is never shown
+        # as JSON, and malformed structured output never reached this point.
+        await self._bot.send_rich_notice(_cap(plain, 1800))
 
     # ── Gmail attachment delivery to Telegram ───────────────────────────────
 

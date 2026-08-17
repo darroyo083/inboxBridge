@@ -107,6 +107,11 @@ class FakeAi:
         # the valid scripted one — structured parse failures must be retried.
         self.qa_malformed = 0
         self.thread_summary_malformed = 0
+        # Plain-summary fallback (task thread_summary_plain) simulation.
+        self.plain_summary_failures = 0
+        self.plain_summary_calls = 0
+        self.plain_summary_override: str | None = None
+        self.plain_summary_messages: list[list[Any]] = []
         # Override for the QA answer (malformed / compact scenarios).
         self.qa_override: str | None = None
         # Override for the thread-summary answer (malformed / simple / etc.).
@@ -243,6 +248,24 @@ class FakeAi:
                         },
                     ],
                 }
+            )
+        if task == "thread_summary_plain":
+            self.plain_summary_calls += 1
+            self.plain_summary_messages.append(messages)
+            if self.plain_summary_failures > 0:
+                self.plain_summary_failures -= 1
+                from inboxbridge.llm.base import LLMEmptyResponse
+
+                raise LLMEmptyResponse("simulated empty plain summary")
+            if self.plain_summary_override is not None:
+                return self.plain_summary_override
+            return (
+                "• Cita el 18 de agosto de 2026 a las 14:30 en Zürich "
+                "(Bahnhofstrasse 10).\n"
+                "• Llevar contrato firmado y documento de identidad.\n"
+                "• Avisar antes del 17 de agosto a las 18:00 si no puede asistir.\n"
+                "• Tasa: 125 CHF.\n"
+                "• Contacto: Markus Schneider."
             )
         return self.default_text
 
@@ -1086,7 +1109,8 @@ async def test_flow_q_button_summary_routes_rules_first(
     content = str(stack.ai.thread_summary_messages[-1][-1]["content"])
     assert "Adjunto «rechnung.pdf»" in content
     assert any(
-        "thread_summary outcome=success attachments=1 attachment_context=true" in r.message
+        "thread_summary structured outcome=success attachments=1 "
+        "attachment_context=true" in r.message
         for r in caplog.records
     )
 
@@ -1131,7 +1155,8 @@ async def test_flow_r_thread_summary_attachment_context(
     assert "Adjunto «rechnung.pdf»" in content
     assert "125 CHF" in content
     assert any(
-        "thread_summary outcome=success attachments=1 attachment_context=true" in r.message
+        "thread_summary structured outcome=success attachments=1 "
+        "attachment_context=true" in r.message
         for r in caplog.records
     )
 
@@ -1241,16 +1266,63 @@ async def test_flow_r_summary_no_action_not_fabricated(stack: Stack) -> None:
     assert "✅" not in rendered
 
 
-async def test_flow_r_summary_malformed_structured_safe_error(
+async def test_flow_r_summary_structured_exhausted_plain_fallback_succeeds(
     stack: Stack, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Malformed structured thread-summary output must NEVER leak to Telegram:
-    bounded retry, then a user-safe error (no raw JSON, no partial facts, no
-    outcome=success log)."""
+    """Structured path exhausted (truncated JSON on both attempts) → ONE plain
+    fallback generation succeeds → the user gets exactly one summary; raw
+    JSON never reaches Telegram and the fallback receives attachment context
+    with exact facts."""
+    caplog.set_level(logging.INFO, logger="inboxbridge.assistant")
+    stack.gmail.threads["t-qa"] = _thread_with_attachment(
+        text="Frist: 31.08.2026, Zahlung 125 CHF."
+    )
+    stack.ai.thread_summary_override = (
+        '{"headline": "Resumen", "sections": [{"emoji": "📬", "title": "Resumen", "items": ['
+    )  # truncated JSON every structured attempt
+    summary_id = await stack.bot.send_summary(
+        make_email(thread_id="t-qa"), EmailSummary(subject_es="Asunto")
+    )
+    await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    assert stack.ai.thread_summary_calls == 2  # structured bounded retry
+    assert stack.ai.plain_summary_calls == 1  # exactly one plain attempt
+    texts = [m.text for m in stack.sender.messages]
+    # The user gets the plain summary, rendered safely (bullets preserved).
+    assert any("• Tasa: 125 CHF." in (t or "") for t in texts)
+    assert any("• Cita el 18 de agosto de 2026 a las 14:30" in (t or "") for t in texts)
+    # Raw JSON never shown.
+    assert not any('{"headline"' in (t or "") for t in texts)
+    # The fallback generation received the SAME attachment context.
+    assert stack.ai.plain_summary_messages
+    content = str(stack.ai.plain_summary_messages[-1][-1]["content"])
+    assert "Adjunto «rechnung.pdf»" in content
+    assert "125 CHF" in content
+    # Logs: structured failure and fallback success, clearly distinct.
+    assert any(
+        "thread_summary structured outcome=invalid_structure" in r.message
+        for r in caplog.records
+    )
+    assert any(
+        "thread_summary fallback=plain outcome=success attachments=1 "
+        "attachment_context=true" in r.message
+        for r in caplog.records
+    )
+    assert not any(
+        "thread_summary structured outcome=success" in r.message for r in caplog.records
+    )
+
+
+async def test_flow_r_summary_both_paths_fail_safe_error(
+    stack: Stack, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Structured AND plain fallback exhausted → final user-safe error; no raw
+    JSON, no partial content, no success logs at all."""
     caplog.set_level(logging.INFO, logger="inboxbridge.assistant")
     stack.ai.thread_summary_override = (
         '{"headline": "Resumen", "sections": [{"emoji": "📬", "title": "Resumen", "items": ['
-    )  # truncated JSON every attempt
+    )
+    stack.ai.plain_summary_failures = 5  # plain fallback also fails
     summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
     await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
     await asyncio.sleep(0.05)
@@ -1259,40 +1331,90 @@ async def test_flow_r_summary_malformed_structured_safe_error(
         "No pude generar el resumen ahora; inténtalo otra vez." in (t or "")
         for t in texts
     )
-    # Raw JSON never shown; nothing leaked.
+    # Raw JSON and partial plain content never shown.
     assert not any('{"headline"' in (t or "") for t in texts)
-    assert not any('"items": [' in (t or "") for t in texts)
-    # Structured failure logged; outcome=success ONLY after a successful parse.
-    assert any(
-        "thread_summary outcome=invalid_structure" in r.message for r in caplog.records
+    assert not any("Tasa" in (t or "") for t in texts)
+    # No false success before a usable summary exists.
+    assert not any(
+        "thread_summary structured outcome=success" in r.message for r in caplog.records
     )
     assert not any(
-        "thread_summary outcome=success" in r.message for r in caplog.records
+        "thread_summary fallback=plain outcome=success" in r.message
+        for r in caplog.records
     )
+    assert any(
+        "thread_summary structured outcome=invalid_structure" in r.message
+        for r in caplog.records
+    )
+    assert any(
+        "thread_summary fallback=plain outcome=failed error=LLMEmptyResponse" in r.message
+        for r in caplog.records
+    )
+
+
+async def test_flow_r_summary_structured_success_skips_plain_fallback(
+    stack: Stack, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A successful structured summary never triggers the plain fallback."""
+    caplog.set_level(logging.INFO, logger="inboxbridge.assistant")
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    assert stack.ai.thread_summary_calls == 1
+    assert stack.ai.plain_summary_calls == 0
+    assert any(
+        "thread_summary structured outcome=success" in r.message for r in caplog.records
+    )
+    assert not any(
+        "thread_summary fallback=plain" in r.message for r in caplog.records
+    )
+
+
+async def test_flow_r_summary_plain_fallback_rich_send_fails_plain_text(
+    stack: Stack,
+) -> None:
+    """Plain fallback + Telegram rich-send failure → the plain summary still
+    arrives as plain text (no tags, no information loss)."""
+    stack.sender.fail_html = True
+    stack.ai.thread_summary_override = (
+        '{"headline": "Resumen", "sections": [{"emoji": "📬", "title": "Resumen", "items": ['
+    )
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
+    await asyncio.sleep(0.05)
+    texts = [m.text for m in stack.sender.messages]
+    assert any("• Tasa: 125 CHF." in (t or "") for t in texts)
+    assert any("• Cita el 18 de agosto de 2026 a las 14:30" in (t or "") for t in texts)
+    assert not any("<b>" in (t or "") for t in texts)
 
 
 async def test_flow_r_summary_first_malformed_then_valid(
     stack: Stack, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Attempt 1 truncated JSON → discarded; attempt 2 valid → rendered
-    EXACTLY once. The failure attempt never reaches Telegram."""
+    EXACTLY once, no plain fallback. The failure attempt never reaches
+    Telegram."""
     caplog.set_level(logging.INFO, logger="inboxbridge.assistant")
     stack.ai.thread_summary_malformed = 1
     summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
     await stack.send("resume toda la conversación", reply_to=stack.bot_message(summary_id))
     await asyncio.sleep(0.05)
     assert stack.ai.thread_summary_calls == 2  # discarded attempt + valid attempt
+    assert stack.ai.plain_summary_calls == 0  # structured retry succeeded
     texts = [m.text for m in stack.sender.messages]
     assert not any('{"headline"' in (t or "") for t in texts)
     # Exactly ONE rendered summary.
     assert sum(1 for t in texts if "📬 <b>Resumen</b>" in (t or "")) == 1
     # outcome=success logged exactly once, only after the parse succeeded.
     successes = [
-        r.message for r in caplog.records if "thread_summary outcome=success" in r.message
+        r.message
+        for r in caplog.records
+        if "thread_summary structured outcome=success" in r.message
     ]
     assert len(successes) == 1
     assert not any(
-        "thread_summary outcome=invalid_structure" in r.message for r in caplog.records
+        "thread_summary structured outcome=invalid_structure" in r.message
+        for r in caplog.records
     )
 
 

@@ -543,3 +543,45 @@ def test_summary_prompt_keeps_untrusted_boundaries() -> None:
         prompts.UNTRUSTED_DATA_START
     )
     assert prompts.UNTRUSTED_DATA_END in user_content
+
+
+# ── plain-summary fallback prompt (no JSON) ─────────────────────────────────
+
+
+def _plain_summary_system() -> str:
+    messages = prompts.plain_summarize_thread_messages(_thread())
+    return str(messages[0]["content"])
+
+
+def test_plain_summary_prompt_requests_no_json() -> None:
+    system = _plain_summary_system()
+    assert "RESPONDE SOLO EN JSON" not in system
+    assert '"sections"' not in system
+    assert "viñetas" in system
+    assert "4-6" in system
+
+
+def test_plain_summary_prompt_keeps_security_and_priorities() -> None:
+    system = _plain_summary_system()
+    assert "NO CONFIABLE" in system
+    assert "Prioriza" in system
+    assert "acción requerida" in system
+    assert "fechas/horas/plazos" in system
+    assert "importes" in system
+
+
+def test_plain_summary_prompt_exact_values_no_invention() -> None:
+    system = _plain_summary_system()
+    assert "Preserva exactos números, moneda, direcciones, fechas y horas" in system
+    assert "No inventes datos" in system
+
+
+def test_plain_summary_prompt_includes_attachment_context() -> None:
+    messages = prompts.plain_summarize_thread_messages(_thread_with_attachment())
+    content = str(messages[-1]["content"])
+    assert "Adjunto «rechnung.pdf»" in content
+    assert "125 CHF" in content
+    assert content.index("Adjunto «rechnung.pdf»") > content.index(
+        prompts.UNTRUSTED_DATA_START
+    )
+    assert prompts.UNTRUSTED_DATA_END in content

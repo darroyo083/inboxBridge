@@ -475,6 +475,45 @@ def summarize_thread_messages(thread: ThreadContext) -> list[ChatCompletionMessa
     ]
 
 
+def plain_summarize_thread_messages(
+    thread: ThreadContext,
+) -> list[ChatCompletionMessageParam]:
+    """Plain-summary fallback contract (NO JSON): used only when the
+    structured summary path is exhausted, so a useful summary still reaches
+    the user. Same bounded untrusted context (bodies + attachments), same
+    security boundaries; the model returns concise bullets, not a contract."""
+    thread_text = _join_context(thread)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Eres InboxBridge, el asistente de correo de un pequeño equipo. "
+                "Resumes hilos de correo en español de forma MUY concisa.\n\n"
+                f"{_SECURITY_BLOCK}\n\n"
+                "Máximo 4-6 viñetas «•». Sin introducción, sin párrafos largos, "
+                "sin comentarios sobre el propio correo (p. ej. «es un correo de "
+                "prueba»).\n"
+                "Prioriza: acción requerida del usuario; fechas/horas/plazos; "
+                "lugar; importes; documentos/requisitos; persona de contacto.\n"
+                "Preserva exactos números, moneda, direcciones, fechas y horas. "
+                "No inventes datos; si un adjunto no se pudo leer, no inventes su "
+                "contenido.\n"
+                "Puedes poner un emoji contextual al inicio de una viñeta solo "
+                "si ayuda a escanear (💰 importe, 📅 fecha, 📍 lugar, ⏰ plazo, "
+                "📄 documentos, 👤 contacto, ✅ acción)."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"{UNTRUSTED_DATA_START}\nAsunto del hilo: {thread.subject}\n\n"
+                f"{thread_text}\n{UNTRUSTED_DATA_END}\n\n"
+                "Resume la conversación."
+            ),
+        },
+    ]
+
+
 def compose_messages(
     recipient: str,
     instruction: str,
