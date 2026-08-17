@@ -328,7 +328,7 @@ async def test_summarize_email_sends_prompt_and_parses_json(
     )
     request = cast(dict[str, Any], captured[0])
     assert request["model"] == "test-model"
-    assert request["max_tokens"] == 700
+    assert request["max_tokens"] == provider._settings.llm_max_tokens_summary
     assert request["temperature"] == 0.4
     assert request["messages"][0]["role"] == "system"
     assert prompts.UNTRUSTED_DATA_START in request["messages"][1]["content"]
