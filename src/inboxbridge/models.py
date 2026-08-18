@@ -185,6 +185,12 @@ class DraftRequest:
     #: Explicit facts the requesting member asked the bot to remember
     #: (untrusted context for the LLM; capped inside the draft prompt).
     memory: tuple[str, ...] = ()
+    #: TRUSTED reply recipient, resolved by the application from the exact
+    #: incoming Gmail message being replied to. The LLM never chooses it.
+    reply_to: EmailAddress | None = None
+    #: Exact incoming Gmail message id this reply targets (in_reply_to).
+    #: Frozen application state, never derived from LLM output.
+    in_reply_to: str = ""
 
 
 @dataclass(frozen=True)

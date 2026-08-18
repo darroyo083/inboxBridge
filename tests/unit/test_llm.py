@@ -432,16 +432,24 @@ async def test_draft_reply_builds_draft_from_trusted_thread_data(
     provider = _provider(monkeypatch)
     content = "  Sehr geehrte Frau Ana,\n\nDanke.\n\nMit freundlichen Grüßen  "
     _fake_create(provider, monkeypatch, content=content)
-    request = DraftRequest(thread_id="t1", user_instructions="Danke sagen", language="de")
+    request = DraftRequest(
+        thread_id="t1",
+        user_instructions="Danke sagen",
+        language="de",
+        reply_to=EmailAddress("Ana", "ana@example.com"),
+        in_reply_to="m1",
+    )
     reply = await provider.draft_reply(request, _thread())
     assert reply.body == (
         "Sehr geehrte Frau Ana,\n\nDanke.\n\nMit freundlichen Grüßen\n\nDaniel"
     )
     assert reply.thread_id == "t1"
     assert reply.subject == "Re: Proyecto"
+    # Recipient/in_reply_to come from the TRUSTED request, never thread
+    # heuristics (thread.messages[0] may be our own sent message).
     assert reply.to == [EmailAddress("Ana", "ana@example.com")]
     assert reply.cc == []
-    assert reply.in_reply_to == "m2"
+    assert reply.in_reply_to == "m1"
 
 
 async def test_draft_reply_empty_thread_has_no_recipients(
@@ -593,9 +601,15 @@ async def test_draft_reply_retries_incomplete_then_succeeds(
             ),
         ],
     )
-    request = DraftRequest(thread_id="t1", user_instructions="Danke", language="de")
+    request = DraftRequest(
+        thread_id="t1",
+        user_instructions="Danke",
+        language="de",
+        reply_to=EmailAddress("Ana", "ana@example.com"),
+    )
     reply = await provider.draft_reply(request, _thread())
     assert "vielen Dank für Ihre Nachricht" in reply.body
+    assert reply.to == [EmailAddress("Ana", "ana@example.com")]
     assert len(captured) == 2  # truncated attempt retried once
 
 
@@ -606,7 +620,12 @@ async def test_draft_reply_all_incomplete_raises(
     captured = _fake_create_with_finish(
         provider, monkeypatch, [("...die", "length"), ("...die", "length")]
     )
-    request = DraftRequest(thread_id="t1", user_instructions="Danke", language="de")
+    request = DraftRequest(
+        thread_id="t1",
+        user_instructions="Danke",
+        language="de",
+        reply_to=EmailAddress("Ana", "ana@example.com"),
+    )
     with pytest.raises(base.LLMIncompleteResponse):
         await provider.draft_reply(request, _thread())
     assert len(captured) == 2  # bounded retries exhausted
@@ -754,11 +773,13 @@ async def test_draft_reply_primary_incomplete_fallback_valid_one_draft(
             thread_id="t1",
             user_instructions="sag einfach danke",
             memory=(),
+            reply_to=EmailAddress("Ana", "ana@example.com"),
         ),
         _thread(),
     )
     assert [c["model"] for c in captured] == ["test-model", "fb-model"]
     assert draft.body.endswith("Daniel")  # trusted signature normalized
+    # Recipient comes from the trusted request, never from thread heuristics.
     assert draft.to == [EmailAddress("Ana", "ana@example.com")]
 
 

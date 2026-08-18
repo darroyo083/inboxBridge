@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from inboxbridge.config import Settings
@@ -65,6 +66,30 @@ def make_coordinator(
 
 
 def run_request(coordinator: ReplyCoordinator, request: ReplyRequest) -> None:
+    # The reply target must resolve: seed a fetchable incoming message for the
+    # request's thread when none was given (the bot freezes it in production).
+    if not request.target_message_id and request.thread_id:
+        from inboxbridge.models import (
+            EmailAddress,
+            MessageStatus,
+            ParsedEmail,
+        )
+
+        email = ParsedEmail(
+            message_id="m1",
+            thread_id=request.thread_id,
+            history_id=10,
+            subject="Re: Projektbericht",
+            sender=EmailAddress("Anna Muster", "anna@example.com"),
+            recipients=[EmailAddress("Daniel", "daniel@example.com")],
+            date_iso="2026-08-07T10:00:00+00:00",
+            body_text="Hallo.",
+        )
+        coordinator._gmail.messages["m1"] = email
+        coordinator._storage.upsert_message(
+            "m1", request.thread_id, 10, MessageStatus.SENT_TELEGRAM
+        )
+        request = replace(request, target_message_id="m1")
     asyncio.run(coordinator._handle_request(request))
 
 

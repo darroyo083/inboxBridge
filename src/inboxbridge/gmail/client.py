@@ -509,6 +509,11 @@ class GmailClient:
             checked_ok=True,
         )
 
+    async def get_account_email(self) -> str:
+        """The authenticated Gmail account's own address (profile source of
+        truth, cached). Used to guard against self-addressed replies."""
+        return await self._my_email_address()
+
     async def _my_email_address(self) -> str:
         """Cache the account's own address (one profile call per process)."""
         if self._my_email is None:

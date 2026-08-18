@@ -49,14 +49,18 @@ class FakeLLM:
 
     async def draft_reply(self, request: DraftRequest, thread: ThreadContext) -> DraftReply:
         self.draft_calls.append((request, thread))
-        recipients = self.draft_to or ([thread.messages[0].from_] if thread.messages else [])
+        recipients = (
+            [request.reply_to]
+            if request.reply_to is not None
+            else (self.draft_to or [])
+        )
         return DraftReply(
             thread_id=request.thread_id,
             subject=thread.subject,
             to=recipients,
             cc=[],
             body=self.draft_body,
-            in_reply_to=thread.messages[-1].message_id if thread.messages else "",
+            in_reply_to=request.in_reply_to,
             references="",
         )
 

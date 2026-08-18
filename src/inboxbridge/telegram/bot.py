@@ -211,6 +211,10 @@ class ReplyRequest:
     #: Telegram-supplied files (documents/photos) downloaded to a temporary
     #: directory; the responder attaches them to the outgoing reply.
     attachments: tuple[OutgoingAttachment, ...] = ()
+    #: EXACT incoming Gmail message this reply targets, FROZEN at queue time
+    #: (the Telegram summary the user replied to, or the resolved "al último"
+    #: message). The recipient and in_reply_to come only from this message.
+    target_message_id: str = ""
 
 
 @dataclass
@@ -515,7 +519,10 @@ class TelegramBot(TelegramNotifier):
         self._pending_drafts: dict[str, _PendingDraft] = {}
         #: user_id -> (tg summary message_id, thread_id, mode)
         #: mode: "reply" (Responder) | "question" (Preguntar)
-        self._pending_replies: dict[int, tuple[int, str, str]] = {}
+        #: user_id -> (tg summary message_id, thread_id, mode, target Gmail
+        #: message_id). mode: "reply" (Responder) | "question" (Preguntar).
+        #: The target Gmail message is FROZEN here (summary -> Gmail mapping).
+        self._pending_replies: dict[int, tuple[int, str, str, str]] = {}
         #: user_id -> pending multi-step UI state (compose, contact ops)
         self._pending_flows: dict[int, dict[str, Any]] = {}
         #: media_group_id -> seen-at timestamp: only the first member of a
@@ -786,7 +793,7 @@ class TelegramBot(TelegramNotifier):
         # "Responder"/"Preguntar" button flows: next message is the intent.
         pending = self._pending_replies.pop(user.id, None)
         if pending is not None:
-            tg_message_id, thread_id, mode = pending
+            tg_message_id, thread_id, mode, target_message_id = pending
             if mode == "question":
                 if is_thread_summary_request(text):
                     # Natural "resume este hilo" phrases route rules-first to
@@ -821,6 +828,7 @@ class TelegramBot(TelegramNotifier):
                     memory=memory,
                     user_id=user.id,
                     attachments=attachments,
+                    target_message_id=target_message_id,
                 )
             )
             return
@@ -944,6 +952,11 @@ class TelegramBot(TelegramNotifier):
                 else:
                     attachments = ()
                 memory = tuple(m["value"] for m in self._storage.list_memories(user_id))
+                target_message_id = ""
+                if tg_message_id:
+                    target_message_id = (
+                        self._storage.get_meta(f"{_TG_GMAIL_PREFIX}{tg_message_id}") or ""
+                    )
                 self._queue.put_nowait(
                     ReplyRequest(
                         thread_id=thread_id,
@@ -956,6 +969,7 @@ class TelegramBot(TelegramNotifier):
                         memory=memory,
                         user_id=user_id,
                         attachments=attachments,
+                        target_message_id=target_message_id,
                     )
                 )
                 return
@@ -1020,12 +1034,14 @@ class TelegramBot(TelegramNotifier):
                         "No tengo ningún correo recibido reciente al que responder."
                     )
                     return
+                # Freeze the exact incoming message id NOW (never re-resolved).
                 await self._queue_reply(
                     user_id,
                     strip_latest_reference(text) or text,
                     latest["thread_id"],
                     message=message,
                     tg_message_id=tg_message_id,
+                    target_message_id=latest["message_id"],
                 )
                 return
             # No target yet: remember the instruction and ask for the target.
@@ -1072,12 +1088,15 @@ class TelegramBot(TelegramNotifier):
         *,
         message: Message | None = None,
         tg_message_id: int = 0,
+        target_message_id: str = "",
     ) -> None:
         """Put a ReplyRequest on the coordinator queue (classic reply flow).
 
         A failed Telegram attachment download aborts the reply (notice already
         sent) — the queue never receives a request whose attachment silently
-        vanished.
+        vanished. The reply target Gmail message is FROZEN here: the exact
+        message mapped to the Telegram summary (``tgm:`` meta) or the explicit
+        resolved target ("al último").
         """
         if message is not None and (message.document is not None or message.photo):
             try:
@@ -1086,6 +1105,10 @@ class TelegramBot(TelegramNotifier):
                 return
         else:
             attachments = ()
+        if not target_message_id and tg_message_id:
+            target_message_id = (
+                self._storage.get_meta(f"{_TG_GMAIL_PREFIX}{tg_message_id}") or ""
+            )
         memory = tuple(m["value"] for m in self._storage.list_memories(user_id))
         self._queue.put_nowait(
             ReplyRequest(
@@ -1097,6 +1120,7 @@ class TelegramBot(TelegramNotifier):
                 memory=memory,
                 user_id=user_id,
                 attachments=attachments,
+                target_message_id=target_message_id,
             )
         )
 
@@ -1255,7 +1279,13 @@ class TelegramBot(TelegramNotifier):
                 return
             self._pending_flows.pop(user_id, None)
             instruction = str(flow.get("instruction") or "")
-            await self._queue_reply(user_id, instruction, latest["thread_id"])
+            # Freeze the exact incoming message id NOW (never re-resolved).
+            await self._queue_reply(
+                user_id,
+                instruction,
+                latest["thread_id"],
+                target_message_id=latest["message_id"],
+            )
             return
         await self._send(
             "Dime «al último» para responder al correo recibido más reciente, "
@@ -2139,7 +2169,16 @@ class TelegramBot(TelegramNotifier):
             await self._send("No puedo asociar eso a ningún hilo.")
             return
         sender_name = self._storage.get_meta(f"{_TG_SENDER_PREFIX}{tg_message_id}") or ""
-        self._pending_replies[query.from_user.id] = (tg_message_id, thread_id, mode)
+        # Freeze the exact Gmail message the summary maps to (reply target).
+        target_message_id = self._storage.get_meta(
+            f"{_TG_GMAIL_PREFIX}{tg_message_id}"
+        ) or ""
+        self._pending_replies[query.from_user.id] = (
+            tg_message_id,
+            thread_id,
+            mode,
+            target_message_id,
+        )
         if mode == "question":
             await self._send("¿Qué quieres saber sobre este correo?")
         elif sender_name:

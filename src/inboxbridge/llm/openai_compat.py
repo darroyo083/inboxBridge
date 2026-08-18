@@ -208,10 +208,10 @@ class OpenAICompatLLM:
             max_attempts=self._settings.llm_max_retries,
             base_backoff=self._settings.retry_backoff_base,
         )
-        # Recipients come from trusted Gmail data, never from LLM output.
-        # The original sender is the first message of the thread; the
-        # coordinator may override via the Gmail client if needed.
-        recipients = [thread.messages[0].from_] if thread.messages else []
+        # Recipients NEVER come from the LLM or from thread heuristics: the
+        # exact incoming Gmail message being replied to is resolved by the
+        # application (coordinator) and carried in DraftRequest.reply_to.
+        recipients = [request.reply_to] if request.reply_to is not None else []
         body = finalize_draft_body(body, self._settings.email_signature_name)
         return DraftReply(
             thread_id=request.thread_id,
@@ -219,7 +219,7 @@ class OpenAICompatLLM:
             to=recipients,
             cc=[],
             body=body,
-            in_reply_to=thread.messages[-1].message_id if thread.messages else "",
+            in_reply_to=request.in_reply_to,
             references="",
         )
 

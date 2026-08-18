@@ -47,6 +47,7 @@ class FakeGmail:
 
     messages: dict[str, ParsedEmail] = field(default_factory=dict)
     threads: dict[str, ThreadContext] = field(default_factory=dict)
+    account_email: str = ""  # empty → self-reply guard skipped in tests
     send_ok: bool = True
     send_error: str = ""
     fetched: list[str] = field(default_factory=list)
@@ -67,6 +68,9 @@ class FakeGmail:
             return self.messages[message_id]
         except KeyError as exc:
             raise RuntimeError(f"unknown message {message_id}") from exc
+
+    async def get_account_email(self) -> str:
+        return self.account_email
 
     async def fetch_thread_context(
         self, thread_id: str, *, with_attachments: bool = False

@@ -50,6 +50,7 @@ from .models import (
     DraftStatus,
     EmailAddress,
     OutgoingAttachment,
+    ParsedEmail,
     SendVerification,
 )
 from .telegram.bot import ReplyRequest, TelegramBot
@@ -109,16 +110,34 @@ class ReplyCoordinator:
             return
         try:
             await self._bot.send_typing()
+            target, source = await self._resolve_reply_target(request)
+            if target is None:
+                return  # notice already sent
+            # Defense in depth: a normal reply must never target our own mailbox.
+            account_email = await self._gmail.get_account_email()
+            if (
+                account_email
+                and target.sender.email.casefold() == account_email.casefold()
+            ):
+                logger.warning("reply_target outcome=rejected reason=self_recipient")
+                await self._bot.send_notice(
+                    "No pude resolver el destinatario de forma segura; "
+                    "no respondo a mi propia cuenta."
+                )
+                return
             thread = await self._gmail.fetch_thread_context(request.thread_id)
             draft_request = DraftRequest(
                 thread_id=request.thread_id,
                 user_instructions=request.user_instructions,
                 language="de",
                 memory=request.memory,
+                reply_to=target.sender,
+                in_reply_to=target.message_id,
             )
             draft: DraftReply = await self._llm.draft_reply(draft_request, thread)
             if request.attachments:
                 draft = replace(draft, attachments=request.attachments)
+            logger.info("reply_target outcome=resolved source=%s", source)
             await self._present_draft(draft, user_id=request.user_id)
         except LLMIncompleteResponse:
             logger.warning(
@@ -129,6 +148,45 @@ class ReplyCoordinator:
         except Exception:
             logger.exception("reply flow failed for thread %s", request.thread_id)
             await self._bot.send_notice("No pude preparar la respuesta. Inténtalo de nuevo.")
+
+    async def _resolve_reply_target(
+        self, request: ReplyRequest
+    ) -> tuple[ParsedEmail | None, str]:
+        """Frozen reply target: the EXACT incoming Gmail message mapped to the
+        Telegram summary the user replied to (or, defensively, the most recent
+        persisted incoming message of the thread).
+
+        The recipient and ``in_reply_to`` come ONLY from this message — never
+        from LLM output or thread heuristics. Returns (target, source) or
+        (None, "") after a user-facing notice.
+        """
+        target_id = request.target_message_id
+        source = "telegram_summary"
+        if not target_id:
+            row = self._storage.latest_incoming_message()
+            if row and str(row.get("thread_id") or "") == request.thread_id:
+                target_id = str(row.get("message_id") or "")
+                source = "latest_incoming"
+        if not target_id:
+            await self._bot.send_notice(
+                "No pude resolver el correo al que responder; inténtalo otra vez."
+            )
+            return None, ""
+        try:
+            target = await self._gmail.fetch_message(target_id)
+        except Exception:
+            logger.exception("reply target fetch failed for %s", target_id)
+            await self._bot.send_notice(
+                "No pude resolver el correo al que responder; inténtalo otra vez."
+            )
+            return None, ""
+        if target.thread_id != request.thread_id:
+            logger.warning("reply_target outcome=rejected reason=thread_mismatch")
+            await self._bot.send_notice(
+                "No pude resolver el correo al que responder; inténtalo otra vez."
+            )
+            return None, ""
+        return target, source
 
     async def _present_draft(self, draft: DraftReply, *, user_id: int = 0) -> None:
         """Show recipients/attachments/body and wait for explicit confirmation.
@@ -216,14 +274,21 @@ class ReplyCoordinator:
         """Send attempt for a draft already atomically claimed as SENDING.
 
         The passed draft may predate attach/edit flows; the LATEST persisted
-        state (body + attachments) is always used for the actual send.
+        state (body + attachments) is always used for the actual send, while
+        the FROZEN reply target (in_reply_to/references) is preserved — it is
+        immutable application state, never stored in the row.
         """
         row = self._storage.get_draft(draft_id)
         if row is not None:
             latest = self._draft_from_row(row)
             attachments = [a for a in self._load_attachments(row) if a is not None]
             if attachments:
-                draft = replace(latest, attachments=tuple(attachments))
+                latest = replace(latest, attachments=tuple(attachments))
+            draft = replace(
+                latest,
+                in_reply_to=draft.in_reply_to or latest.in_reply_to,
+                references=draft.references or latest.references,
+            )
         started_ms = int(time.time() * 1000)
         self._storage.set_draft_send_started(draft_id, started_ms)
         try:

@@ -362,13 +362,13 @@ class FakeCoordinatorLLM:
         return DraftReply(
             thread_id=thread.thread_id,
             subject=thread.subject,
-            to=[thread.messages[0].from_] if thread.messages else [],
+            to=[request.reply_to] if request.reply_to is not None else [],
             cc=[],
             body=(
                 "Sehr geehrte Frau Muster,\n\nvielen Dank für Ihre Nachricht. "
                 "Ich melde mich am Freitag.\n\nMit freundlichen Grüßen"
             ),
-            in_reply_to=thread.messages[-1].message_id if thread.messages else "",
+            in_reply_to=request.in_reply_to,
             references="",
         )
 
@@ -1551,7 +1551,16 @@ async def test_flow_s_forward(stack: Stack) -> None:
 
 
 def _seed_incoming(stack: Stack, message_id: str, thread_id: str, history_id: int) -> None:
+    """Persist an incoming message (SENT_TELEGRAM) AND make it fetchable —
+    the reply target resolution fetches the exact message by id."""
+    from dataclasses import replace
+
     stack.storage.upsert_message(message_id, thread_id, history_id, MessageStatus.SENT_TELEGRAM)
+    if message_id not in stack.gmail.messages:
+        stack.gmail.messages[message_id] = replace(
+            make_email(message_id=message_id, thread_id=thread_id),
+            sender=EmailAddress("Ana Muster", "anna@example.com"),
+        )
 
 
 async def test_flow_v_reply_latest_two_turn(stack: Stack) -> None:
@@ -2849,3 +2858,117 @@ async def test_flow_download_target_inside_tmp_dir(stack: Stack, tmp_path: Path)
     incoming = Path(str(tmp_path / "tmp" / "incoming"))
     if incoming.is_dir():
         assert list(incoming.iterdir()) == []
+
+
+# ── frozen reply target: Telegram summary → exact Gmail message ──────────────
+
+
+async def test_flow_reply_target_frozen_from_summary_mapping(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """The recipient/in_reply_to come from the EXACT Gmail message mapped to
+    the Telegram summary, never from thread heuristics."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("respóndele que muchas gracias", reply_to=stack.bot_message(summary_id))
+    await stack.pump()
+    await asyncio.sleep(0.15)
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    assert stack.gmail.sent[0].to[0].email == "anna@example.com"  # external sender
+    assert stack.gmail.sent[0].in_reply_to == "gm-orig"  # mapped target message
+    assert stack.gmail.sent[0].thread_id == "t1"
+
+
+async def test_flow_reply_target_self_started_thread_external_recipient(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """Thread OUR account started: reply targets the external sender of the
+    mapped incoming message, never the first thread sender."""
+    from inboxbridge.models import ThreadMessage
+
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    self_first = make_thread("t1")
+    self_first = ThreadContext(
+        thread_id="t1",
+        subject=self_first.subject,
+        history_id=self_first.history_id,
+        messages=[
+            ThreadMessage(
+                message_id="our-message",
+                from_=EmailAddress("Daniel", "daniel@example.com"),
+                date_iso="2026-08-05T09:00:00+00:00",
+                body_text="Hallo.",
+            ),
+            *self_first.messages,
+        ],
+    )
+    stack.gmail.threads["t1"] = self_first
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    await stack.send("respóndele que gracias", reply_to=stack.bot_message(summary_id))
+    await stack.pump()
+    await asyncio.sleep(0.15)
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    assert stack.gmail.sent[0].to[0].email == "anna@example.com"  # NOT ourselves
+    assert stack.gmail.sent[0].in_reply_to == "gm-orig"
+
+
+async def test_flow_reply_al_ultimo_freezes_exact_incoming(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """"al último" freezes the exact persisted incoming message id BEFORE
+    drafting (a later incoming message must not change the target)."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.gmail.threads["t-a"] = make_thread("t-a")
+    _seed_incoming(stack, "m-a", "t-a", 100)
+    await stack.send("respóndele que gracias al último correo recibido")
+    await stack.pump()
+    await asyncio.sleep(0.15)
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    assert stack.gmail.sent[0].thread_id == "t-a"
+    assert stack.gmail.sent[0].in_reply_to == "m-a"  # frozen target message
+    assert stack.gmail.sent[0].to[0].email == "anna@example.com"
+
+
+async def test_flow_reply_summary_with_pdf_external_recipient(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """Direct summary reply + PDF: external recipient, same thread, exactly
+    one attachment (the frozen-target + attachment paths combined)."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.sender.files["file-1"] = FakeFile(b"%PDF-1.4 fake")
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    message = _document_message(
+        800,
+        file_id="file-1",
+        file_name="solicitado.pdf",
+        caption="respóndele que le adjunto el documento solicitado",
+        reply_to=stack.bot_message(summary_id),
+    )
+    await stack.bot.process_update(_update(message))
+    await stack.pump()
+    await asyncio.sleep(0.15)
+    previews = [
+        m.text
+        for m in stack.sender.messages
+        if (m.text or "").startswith("Borrador (Respuesta)")
+    ]
+    assert previews and "solicitado.pdf" in previews[-1]
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    sent = stack.gmail.sent[0]
+    assert sent.to[0].email == "anna@example.com"  # external sender, never self
+    assert sent.thread_id == "t1"
+    assert sent.in_reply_to == "gm-orig"
+    assert len(sent.attachments) == 1
+    assert sent.attachments[0].filename == "solicitado.pdf"

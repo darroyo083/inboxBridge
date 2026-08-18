@@ -37,6 +37,11 @@ class GmailClient(Protocol):
         """
         ...
 
+    async def get_account_email(self) -> str:
+        """The authenticated Gmail account's own address (profile source of
+        truth). Guards against self-addressed replies."""
+        ...
+
     async def send_reply(self, draft: DraftReply) -> str:
         """Send a reply in the existing thread. Returns the new message_id.
 
