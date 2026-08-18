@@ -2703,3 +2703,149 @@ async def test_flow_media_group_only_first_processed(
         if (m.text or "").startswith("Borrador (Nuevo correo)")
     ]
     assert len(previews) == 1  # never two drafts from one album
+
+
+# ── Telegram download API (PTB >=20: download_to_drive) ──────────────────────
+
+
+async def test_fakefile_has_no_obsolete_download_api() -> None:
+    """The mock mirrors PTB >=20: ``File.download`` does not exist, so the
+    production path can never silently depend on the removed API."""
+    f = FakeFile(b"x")
+    assert not hasattr(f, "download")
+    assert hasattr(f, "download_to_drive")
+
+
+async def test_flow_document_download_failure_aborts_compose(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """A download failure must NOT produce a misleading attachment-bearing
+    draft: the compose action aborts with the user-facing notice."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    file = FakeFile(b"%PDF-1.4 fake")
+    file.fail_download = True
+    stack.sender.files["file-1"] = file
+    message = _document_message(
+        720,
+        file_id="file-1",
+        file_name="prueba.pdf",
+        caption="Envía un correo a darroyo083@gmail.com diciendo que "
+        "adjunto el documento de prueba.",
+    )
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    assert stack.storage.get_draft(1) is None  # no misleading draft
+    assert any(
+        "No pude descargar un adjunto; vuelve a intentarlo." in (m.text or "")
+        for m in stack.sender.messages
+    )
+    incoming = Path(str(tmp_path / "tmp" / "incoming"))
+    if incoming.is_dir():
+        assert list(incoming.iterdir()) == []  # partial target cleaned
+
+
+async def test_flow_photo_download_failure_aborts_compose(
+    stack: Stack, tmp_path: Path
+) -> None:
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    file = FakeFile(b"jpeg-bytes")
+    file.fail_download = True
+    stack.sender.files["photo-1"] = file
+    message = _photo_message(
+        721, caption="Envía un correo a darroyo083@gmail.com con esta foto"
+    )
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    assert stack.storage.get_draft(1) is None
+    assert any(
+        "No pude descargar un adjunto; vuelve a intentarlo." in (m.text or "")
+        for m in stack.sender.messages
+    )
+
+
+async def test_flow_download_failure_cleans_prior_siblings(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """Multi-file batch: the first succeeds, the second fails → the first's
+    temp file is removed too (no orphans)."""
+    from datetime import UTC, datetime
+
+    from telegram import Document, PhotoSize
+
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    good = FakeFile(b"a" * 10)
+    bad = FakeFile(b"b" * 10)
+    bad.fail_download = True
+    stack.sender.files["file-1"] = good
+    stack.sender.files["photo-1"] = bad
+    message = Message(
+        message_id=722,
+        date=datetime.now(UTC),
+        chat=Chat(id=CHAT_ID, type=ChatType.GROUP),
+        from_user=_user(7),
+        document=Document(
+            file_id="file-1", file_unique_id="u1", file_name="a.pdf",
+            mime_type="application/pdf", file_size=5,
+        ),
+        photo=[PhotoSize(file_id="photo-1", file_unique_id="u2", width=1, height=1, file_size=5)],
+        caption="Envía un correo a darroyo083@gmail.com con ambos",
+        reply_to_message=stack.bot_message(
+            await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+        ),
+    )
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    assert stack.storage.get_draft(1) is None
+    incoming = Path(str(tmp_path / "tmp" / "incoming"))
+    if incoming.is_dir():
+        assert list(incoming.iterdir()) == []  # both files cleaned
+
+
+async def test_flow_oversized_notice_shows_filename_not_file_id(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """The oversized rejection notice names the sanitized FILENAME, never the
+    Telegram file id (tuple shape: (file_id, name, size, mime))."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.settings.outgoing_attachment_max_bytes = 10
+    stack.sender.files["file-1"] = FakeFile(b"x" * 100)
+    message = _document_message(
+        723,
+        file_id="file-1",
+        file_name="factura.pdf",
+        caption="Envía un correo a darroyo083@gmail.com adjuntando esto",
+    )
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    notices = " ".join(m.text or "" for m in stack.sender.messages)
+    assert "factura.pdf" in notices
+    assert "file-1" not in notices  # the Telegram file id is never shown
+
+
+async def test_flow_download_target_inside_tmp_dir(stack: Stack, tmp_path: Path) -> None:
+    """download_to_drive receives a CONTROLLED target path inside tmp_dir."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.sender.files["file-1"] = FakeFile(b"%PDF-1.4 fake")
+    message = _document_message(
+        724,
+        file_id="file-1",
+        file_name="prueba.pdf",
+        caption="Envía un correo a darroyo083@gmail.com adjuntando esto",
+    )
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    previews = [
+        m.text
+        for m in stack.sender.messages
+        if (m.text or "").startswith("Borrador (Nuevo correo)")
+    ]
+    assert previews and "prueba.pdf" in previews[-1]
+    row = stack.draft_row(1)
+    import json as _json
+
+    attachments = _json.loads(row["attachments_json"])
+    assert [a["filename"] for a in attachments] == ["prueba.pdf"]
+    # No leftover download in tmp/incoming: files were claimed by the draft.
+    incoming = Path(str(tmp_path / "tmp" / "incoming"))
+    if incoming.is_dir():
+        assert list(incoming.iterdir()) == []

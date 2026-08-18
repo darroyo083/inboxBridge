@@ -241,6 +241,15 @@ def neutralize_links(text: str) -> str:
     return _URL_SCHEME_RE.sub(lambda match: f"hxxp{match.group(0)[4:]}", text)
 
 
+class TelegramAttachmentError(RuntimeError):
+    """A Telegram file could not be downloaded/validated.
+
+    Raised (after a user-facing notice) so attachment-bearing actions abort
+    instead of silently presenting a draft that implies an attachment is
+    included when it is not. The user is never left with a misleading draft.
+    """
+
+
 #: Neutral fallback emoji for sections whose model-provided emoji is not in
 #: the shared allowlist (``llm.qa.CONTEXTUAL_EMOJIS``).
 _NEUTRAL_EMOJI = "ℹ️"
@@ -799,7 +808,10 @@ class TelegramBot(TelegramNotifier):
                     force=IntentAction.ASK_ABOUT_EMAIL,
                 )
                 return
-            attachments = await self._collect_outgoing_attachments(message)
+            try:
+                attachments = await self._collect_outgoing_attachments(message)
+            except TelegramAttachmentError:
+                return  # notice already sent; never a misleading draft
             memory = tuple(m["value"] for m in self._storage.list_memories(user.id))
             self._queue.put_nowait(
                 ReplyRequest(
@@ -922,11 +934,15 @@ class TelegramBot(TelegramNotifier):
             if fallback_to_reply:
                 # Classic reply flow: the member's message is the reply intent
                 # (empty thread → the coordinator asks for context).
-                attachments = (
-                    await self._collect_outgoing_attachments(message)
-                    if message is not None
-                    else ()
-                )
+                if message is not None and (
+                    message.document is not None or message.photo
+                ):
+                    try:
+                        attachments = await self._collect_outgoing_attachments(message)
+                    except TelegramAttachmentError:
+                        return  # notice already sent; never a misleading draft
+                else:
+                    attachments = ()
                 memory = tuple(m["value"] for m in self._storage.list_memories(user_id))
                 self._queue.put_nowait(
                     ReplyRequest(
@@ -981,7 +997,10 @@ class TelegramBot(TelegramNotifier):
             and message is not None
             and (message.document is not None or message.photo)
         ):
-            attachments = await self._collect_outgoing_attachments(message)
+            try:
+                attachments = await self._collect_outgoing_attachments(message)
+            except TelegramAttachmentError:
+                return  # notice already sent; never a misleading draft
             if attachments:
                 payload["attachments"] = attachments
 
@@ -1054,12 +1073,19 @@ class TelegramBot(TelegramNotifier):
         message: Message | None = None,
         tg_message_id: int = 0,
     ) -> None:
-        """Put a ReplyRequest on the coordinator queue (classic reply flow)."""
-        attachments = (
-            await self._collect_outgoing_attachments(message)
-            if message is not None
-            else ()
-        )
+        """Put a ReplyRequest on the coordinator queue (classic reply flow).
+
+        A failed Telegram attachment download aborts the reply (notice already
+        sent) — the queue never receives a request whose attachment silently
+        vanished.
+        """
+        if message is not None and (message.document is not None or message.photo):
+            try:
+                attachments = await self._collect_outgoing_attachments(message)
+            except TelegramAttachmentError:
+                return
+        else:
+            attachments = ()
         memory = tuple(m["value"] for m in self._storage.list_memories(user_id))
         self._queue.put_nowait(
             ReplyRequest(
@@ -1560,7 +1586,7 @@ class TelegramBot(TelegramNotifier):
         try:
             file = await self._ensure_sender().get_file(voice.file_id)
             target = self._outgoing_tmp_path(f"voice_{voice.file_unique_id}.ogg")
-            await asyncio.to_thread(file.download, target)  # type: ignore[attr-defined]
+            await file.download_to_drive(custom_path=target)
         except Exception:
             logger.exception("voice download failed")
             await self._send("No pude descargar la nota de voz.")
@@ -1595,8 +1621,11 @@ class TelegramBot(TelegramNotifier):
         """Download Telegram documents/photos to the temp dir (bounded, safe).
 
         Limits: ``outgoing_attachment_max_count`` files and
-        ``outgoing_attachment_max_bytes`` each. Violations reject the whole
-        batch with a notice; filenames are sanitized to display metadata only.
+        ``outgoing_attachment_max_bytes`` each. Any rejection (too many,
+        oversized, download failure) sends a user-facing notice and raises
+        :class:`TelegramAttachmentError` so the attachment-bearing action
+        ABORTS — a draft must never silently imply an attachment is included
+        when it is not. Filenames are sanitized to display metadata only.
         """
         kind = "document" if message.document is not None else "photo" if message.photo else "none"
         entries: list[tuple[str, str, int, str]] = []
@@ -1622,8 +1651,11 @@ class TelegramBot(TelegramNotifier):
             await self.send_notice(
                 f"Demasiados adjuntos (máximo {max_count}); no los añado. Vuelve a intentarlo."
             )
-            return ()
-        oversized = [name for name, _, size, _ in entries if size > max_bytes]
+            raise TelegramAttachmentError("attachment count exceeds the limit")
+        # Entries shape: (file_id, sanitized_name, reported_size, mime). The
+        # rejection notice must name the SANITIZED FILENAME, never the
+        # Telegram file id (the file id is an internal identifier).
+        oversized = [n for _file_id, n, size, _mime in entries if size > max_bytes]
         if oversized:
             logger.info("telegram_attachment type=%s count=%d outcome=rejected", kind, len(entries))
             await self.send_notice(
@@ -1631,14 +1663,15 @@ class TelegramBot(TelegramNotifier):
                 "no los añado: "
                 + ", ".join(oversized)
             )
-            return ()
+            raise TelegramAttachmentError("attachment reported oversized")
         results: list[OutgoingAttachment] = []
         for file_id, name, _reported_size, mime in entries:
+            target: Path | None = None
             try:
                 file = await self._ensure_sender().get_file(file_id)
                 target = self._outgoing_tmp_path(name)
-                # PTB File.download is the blocking variant; run it off the loop.
-                await asyncio.to_thread(file.download, target)  # type: ignore[attr-defined]
+                # PTB >=20 async download API (File.download was removed).
+                await file.download_to_drive(custom_path=target)
             except Exception:
                 logger.exception("downloading telegram attachment %s failed", name)
                 logger.info(
@@ -1648,8 +1681,10 @@ class TelegramBot(TelegramNotifier):
                 )
                 for r in results:
                     _remove_file(r.path)
+                if target is not None:
+                    _remove_file(str(target))
                 await self.send_notice("No pude descargar un adjunto; vuelve a intentarlo.")
-                return ()
+                raise TelegramAttachmentError("telegram download failed") from None
             # Re-validate against the REAL downloaded size (Telegram's reported
             # size is client-supplied metadata and must not be trusted).
             actual_size = target.stat().st_size
@@ -1662,7 +1697,7 @@ class TelegramBot(TelegramNotifier):
                 )
                 for r in results:
                     _remove_file(r.path)
-                return ()
+                raise TelegramAttachmentError("attachment oversized after download")
             results.append(
                 OutgoingAttachment(
                     filename=name, mime_type=mime, size_bytes=actual_size, path=str(target)
@@ -1694,7 +1729,10 @@ class TelegramBot(TelegramNotifier):
         pending = self._active_pending_for(user_id)
         if pending is None or pending.draft_id == 0:
             return False
-        attachments = await self._collect_outgoing_attachments(message)
+        try:
+            attachments = await self._collect_outgoing_attachments(message)
+        except TelegramAttachmentError:
+            return True  # notice already sent; draft untouched
         if not attachments:
             return False
         existing = list(pending.draft.attachments)
