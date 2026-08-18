@@ -762,14 +762,20 @@ class EmailAssistant:
         contact = await self._resolve_recipient(recipient_phrase, user_id)
         if contact is None:
             return
-        gmail_message_id = self._storage.get_meta(f"tgm:{tg_message_id}") or ""
+        # Freeze the EXACT source Gmail message: the coordinator/bot already
+        # resolved it from the Telegram summary mapping (tgm: meta) when the
+        # message was dispatched; fall back to re-deriving only as a safety
+        # net for UI flows that did not carry it.
+        gmail_message_id = str(payload.get("message_id") or "")
+        if not gmail_message_id and tg_message_id:
+            gmail_message_id = self._storage.get_meta(f"tgm:{tg_message_id}") or ""
         if not gmail_message_id:
             await self._bot.send_notice("No puedo asociar eso a ningún correo.")
             return
         try:
             original = await self._gmail.fetch_message(gmail_message_id)
             await self._bot.send_typing()
-            messages = prompts.forward_body_messages(original)
+            messages = prompts.forward_note_messages(original)
             models = alternate_text_models(
                 self._settings.effective_text_model,
                 self._settings.effective_text_fallback_model,
@@ -777,8 +783,8 @@ class EmailAssistant:
             )
             # Bounded retry (one extra attempt) covers transient LLMEmptyResponse.
             # The retry reuses the SAME fetched original; attachments are only
-            # collected AFTER the body succeeds, so no duplicate temp files.
-            body = await call_with_retry(
+            # collected AFTER the note succeeds, so no duplicate temp files.
+            note = await call_with_retry(
                 lambda: self._ai.text(
                     messages,
                     max_tokens=self._settings.llm_max_tokens_draft,
@@ -794,10 +800,12 @@ class EmailAssistant:
             return
         subject = f"Fwd: {original.subject}"
         # Include the original's attachments (bounded; the preview shows them
-        # and the send pipeline verifies them against Gmail).
+        # and the send pipeline verifies them against Gmail). The original is
+        # NEVER reconstructed by the LLM — only the short note travels in the
+        # body; the trusted original is quoted at send time from Gmail.
         attachments = await self._collect_original_attachments(original)
         try:
-            body = finalize_draft_body(body, self._settings.email_signature_name)
+            note = finalize_draft_body(note, self._settings.email_signature_name)
         except LLMError:
             await self._bot.send_notice("No pude preparar el reenvío ahora; inténtalo otra vez.")
             return
@@ -806,8 +814,9 @@ class EmailAssistant:
             subject=subject,
             to=[EmailAddress(contact["display_name"], contact["email"])],
             cc=[],
-            body=body,
+            body=note,
             attachments=attachments,
+            forward_of=gmail_message_id,
         )
         await self._present_new_draft(draft, user_id=user_id)
 

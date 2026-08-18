@@ -288,6 +288,7 @@ class ReplyCoordinator:
                 latest,
                 in_reply_to=draft.in_reply_to or latest.in_reply_to,
                 references=draft.references or latest.references,
+                forward_of=draft.forward_of or latest.forward_of,
             )
         started_ms = int(time.time() * 1000)
         self._storage.set_draft_send_started(draft_id, started_ms)
@@ -749,6 +750,7 @@ class ReplyCoordinator:
             cc=[],
             body=str(row["body"]),
             attachments=(),
+            forward_of=str(row.get("forward_of") or ""),
         )
 
     def _load_attachments(self, row: dict[str, Any]) -> list[OutgoingAttachment | None]:

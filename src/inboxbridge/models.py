@@ -206,6 +206,12 @@ class DraftReply:
     ``translation_failed`` marks that a translation was attempted but failed,
     so the preview can show an explicit "translation unavailable" state
     instead of silently omitting the Spanish section.
+
+    ``forward_of`` marks a FORWARD: the exact Gmail message_id being
+    forwarded (frozen trusted state, like a reply's ``in_reply_to``). The
+    recipient/subject come from the user's explicit forward instruction; the
+    original message body is quoted at send time from trusted Gmail source
+    data — never reconstructed by the LLM.
     """
 
     thread_id: str
@@ -215,6 +221,7 @@ class DraftReply:
     body: str
     in_reply_to: str = ""
     references: str = ""
+    forward_of: str = ""
     attachments: tuple[OutgoingAttachment, ...] = ()
     body_es: str = ""
     translation_failed: bool = False

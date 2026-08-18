@@ -162,8 +162,12 @@ _ARCHIVE = re.compile(
     re.IGNORECASE,
 )
 _FORWARD = re.compile(
-    r"\b(reenv[ií]aselo a|reenv[ií]a este correo a|reenv[ií]a(lo)? a|"
-    r"reenv[ií]aselo|m[aá]ndaselo a)\b",
+    r"\b("
+    r"reenv[ií]aselo a|reenv[ií]a este correo a|reenv[ií]a(lo)? a|"
+    r"reenv[ií]aselo|m[aá]ndaselo a|"
+    r"forward this email to|forward this (?:one|message|mail|e-?mail) to|"
+    r"forward it to|forward it\b"
+    r")\b",
     re.IGNORECASE,
 )
 _COMPOSE = re.compile(
@@ -261,9 +265,12 @@ def _extract_after(text: str, pattern: re.Pattern[str]) -> str:
     # Trim trailing punctuation/connectors that are not part of the target.
     connectors = (
         r"\b(y dile|y cu[eé]ntale|y dile que|dici[eé]ndole que|diciendo que|"
-        r"dici[eé]ndole|diciendo|que| por favor| gracias| pls)\b"
+        r"dici[eé]ndole|diciendo|que| por favor| gracias| pls|"
+        r"con (?:su |el |la |los |las |este |esta |esto |eso |ese |un |una )?"
+        r"(?:pdf|adjuntos?|adjunta|adjunto|archivo|archivos|documento|fotos?|"
+        r"im[aá]genes?)(?: adjuntos?| adjuntas?| adjunto)?)\b"
     )
-    rest = re.split(connectors, rest, maxsplit=1)[0]
+    rest = re.split(connectors, rest, maxsplit=1, flags=re.IGNORECASE)[0]
     return rest.strip(" .,;:!?¿¡")
 
 

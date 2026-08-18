@@ -794,6 +794,28 @@ class TelegramBot(TelegramNotifier):
         pending = self._pending_replies.pop(user.id, None)
         if pending is not None:
             tg_message_id, thread_id, mode, target_message_id = pending
+            # An EXPLICIT forward instruction bound to a Gmail summary wins
+            # over an active/pending reply slot: never let a pending reply
+            # flow steal a forward (e.g. the user pressed "Responder" earlier
+            # and then replies to a summary with "reenvía esto a …").
+            if mode == "reply" and self._is_reply_to_own(message):
+                intent = (self._intent_classifier or IntentClassifier()).classify_rule_only(text)
+                if intent.action == IntentAction.FORWARD_EMAIL:
+                    reply = message.reply_to_message
+                    fwd_thread_id = (
+                        self._storage.get_meta(f"{_TG_META_PREFIX}{reply.message_id}") or ""
+                        if reply is not None
+                        else ""
+                    )
+                    await self._dispatch_intent(
+                        text,
+                        thread_id=fwd_thread_id,
+                        tg_message_id=reply.message_id if reply is not None else 0,
+                        user_id=user.id,
+                        fallback_to_reply=True,
+                        message=message,
+                    )
+                    return
             if mode == "question":
                 if is_thread_summary_request(text):
                     # Natural "resume este hilo" phrases route rules-first to
@@ -2527,7 +2549,11 @@ class TelegramBot(TelegramNotifier):
                 f"- {a.filename} ({_format_size(a.size_bytes)})" for a in draft.attachments
             )
             attachments_line = f"\nAdjuntos:\n{names}"
-        kind = "Nuevo correo" if not draft.thread_id else "Respuesta"
+        kind = (
+            "Reenvío"
+            if draft.forward_of
+            else ("Respuesta" if draft.thread_id else "Nuevo correo")
+        )
         spanish_block = ""
         if draft.body_es:
             spanish_block = (

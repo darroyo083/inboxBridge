@@ -130,6 +130,7 @@ class Storage:
         self._ensure_column("drafts", "send_started_at", "REAL")
         self._ensure_column("drafts", "verification_attempts", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("drafts", "attachments_json", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("drafts", "forward_of", "TEXT NOT NULL DEFAULT ''")
 
     def _ensure_column(self, table: str, column: str, ddl: str) -> None:
         """Idempotent ALTER TABLE ADD COLUMN for pre-existing databases.
@@ -301,12 +302,12 @@ class Storage:
             """
             INSERT INTO drafts(thread_id, message_id, body, to_json, subject,
                                status, telegram_user_id, attachments_json,
-                               created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               forward_of, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (thread_id, message_id, reply.body, to_json, reply.subject,
              DraftStatus.PENDING.value, telegram_user_id, attachments_json,
-             now, now),
+             reply.forward_of, now, now),
         )
         self._conn.commit()
         lastrowid = cur.lastrowid

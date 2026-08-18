@@ -127,6 +127,22 @@ class TestRuleBasics:
         assert intent.action == IntentAction.FORWARD_EMAIL
         assert intent.payload.get("recipient", "").lower() == "daniel"
 
+        # The audit phrases must all route to FORWARD (never COMPOSE/REPLY).
+        for phrase in (
+            "reenvíalo a x",
+            "reenvía este correo a x",
+            "reenvía este correo a x con su PDF adjunto",
+            "forward this email to x",
+            "forward it to x",
+            "reenvía este correo a darroyo083@gmail.com con su adjunto",
+        ):
+            intent = classify_rule(phrase)
+            assert intent.action == IntentAction.FORWARD_EMAIL, phrase
+            recipient = intent.payload.get("recipient", "")
+            assert recipient, phrase
+            assert "adjunto" not in recipient.casefold(), phrase
+            assert "pdf" not in recipient.casefold(), phrase
+
     def test_compose_verbs_rules_first(self) -> None:
         for phrase in (
             "envía un correo",

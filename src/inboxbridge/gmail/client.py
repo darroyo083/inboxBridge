@@ -211,7 +211,15 @@ class GmailClient:
             mime["In-Reply-To"] = in_reply_to
         if references:
             mime["References"] = references
-        mime.set_content(draft.body)
+        if draft.forward_of:
+            # A TRUE forward: quote the EXACT original from trusted Gmail
+            # source data (never LLM reconstruction), then attach the original
+            # attachments (already collected, exactly once).
+            original = await self.fetch_message(draft.forward_of)
+            body_text = _forward_quoted(original, note=draft.body)
+            mime.set_content(body_text)
+        else:
+            mime.set_content(draft.body)
         for attachment in draft.attachments:
             _attach_outgoing(mime, attachment)
 
@@ -617,6 +625,35 @@ def ensure_re_prefix(subject: str) -> str:
 def _b64url_decode(value: str) -> bytes:
     padded = value + "=" * (-len(value) % 4)
     return base64.urlsafe_b64decode(padded)
+
+
+def _forward_quoted(original: ParsedEmail, *, note: str) -> str:
+    """Build a TRUE forward body: the (optional) short note followed by the
+    original message quoted VERBATIM from trusted Gmail source data.
+
+    The quoted block is deterministic application data (sender/date/subject/
+    recipients/body straight from the fetched ``ParsedEmail``) — never LLM
+    reconstruction, so a forwarded email can never contain hallucinated
+    content. Attachment filenames are listed for the recipient's awareness;
+    the binaries travel as real attachments.
+    """
+    quoted_headers = [
+        "---------- Forwarded message ----------",
+        f"From: {original.sender}",
+        f"Date: {original.date_iso}",
+        f"Subject: {original.subject}",
+    ]
+    if original.recipients:
+        quoted_headers.append("To: " + ", ".join(str(r) for r in original.recipients))
+    if original.attachments:
+        names = ", ".join(a.filename for a in original.attachments)
+        quoted_headers.append(f"Attachments: {names}")
+    quoted_headers.append("")
+    quoted_headers.append((original.body_text or "").rstrip())
+    quoted = "\n".join(quoted_headers)
+    if note.strip():
+        return f"{note.strip()}\n\n{quoted}"
+    return quoted
 
 
 def _to_int(value: Any) -> int | None:

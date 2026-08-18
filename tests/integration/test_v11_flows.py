@@ -529,6 +529,14 @@ def _button_data(markup: InlineKeyboardMarkup, row: int, col: int) -> str:
     return markup.inline_keyboard[row][col].callback_data or ""
 
 
+def _last_markup(stack: Stack, prefix: str) -> InlineKeyboardMarkup:
+    """The reply_markup of the last message starting with ``prefix``."""
+    for message in reversed(stack.sender.messages):
+        if (message.text or "").startswith(prefix) and message.reply_markup is not None:
+            return message.reply_markup
+    raise AssertionError(f"no message with reply_markup starting {prefix!r}")
+
+
 @pytest.fixture
 def stack(tmp_path: Path) -> Stack:
     return Stack(tmp_path)
@@ -1532,7 +1540,7 @@ async def test_flow_s_forward(stack: Stack) -> None:
     previews = [
         m.text
         for m in stack.sender.messages
-        if (m.text or "").startswith("Borrador (Nuevo correo)")
+        if (m.text or "").startswith("Borrador (Reenvío)")
     ]
     assert previews
     assert "daniel@forward.ch" in previews[-1]  # real address visible
@@ -1543,6 +1551,7 @@ async def test_flow_s_forward(stack: Stack) -> None:
     assert len(stack.gmail.sent) == 1
     assert stack.gmail.sent[0].to[0].email == "daniel@forward.ch"
     assert stack.gmail.sent[0].subject.startswith("Fwd:")
+    assert stack.gmail.sent[0].forward_of == "m-fwd"
     assert stack.gmail.sent[0].attachments[0].filename == "presupuesto.pdf"
     assert stack.draft_row(1)["status"] == DraftStatus.SENT_VERIFIED.value
 
@@ -2253,7 +2262,7 @@ async def test_flow_fallback_forward_retry_no_duplicate_attachments(
     previews = [
         m.text
         for m in stack.sender.messages
-        if (m.text or "").startswith("Borrador (Nuevo correo)")
+        if (m.text or "").startswith("Borrador (Reenvío)")
     ]
     assert previews and "presupuesto.pdf" in previews[-1]
     assert stack.ai.models[-2:] == [None, "fb-model"]
@@ -2972,3 +2981,337 @@ async def test_flow_reply_summary_with_pdf_external_recipient(
     assert sent.in_reply_to == "gm-orig"
     assert len(sent.attachments) == 1
     assert sent.attachments[0].filename == "solicitado.pdf"
+
+
+# ── FORWARD: FROZEN SOURCE + TRUSTED ORIGINAL ────────────────────────────────
+
+
+def _seed_forward_source(
+    stack: Stack, message_id: str = "m-fwd", subject: str = "Presupuesto",
+    *, attachment: bool = True,
+) -> ParsedEmail:
+    """Seed a fetchable original Gmail message the forward will quote/attach."""
+    if attachment:
+        original = email_with_attachments(
+            make_email(message_id=message_id, subject=subject)
+        )
+        stack.gmail.attachment_bytes[(message_id, 0)] = b"%PDF-1.4 fake pdf content"
+    else:
+        original = make_email(message_id=message_id, subject=subject)
+    stack.gmail.messages[message_id] = original
+    return original
+
+
+def _forward_previews(stack: Stack) -> list[str]:
+    return [
+        m.text
+        for m in stack.sender.messages
+        if (m.text or "").startswith("Borrador (Reenvío)")
+    ]
+
+
+def _new_email_previews(stack: Stack) -> list[str]:
+    return [
+        m.text
+        for m in stack.sender.messages
+        if (m.text or "").startswith("Borrador (Nuevo correo)")
+    ]
+
+
+async def test_flow_fwd_summary_reenvialo_routes_to_forward(stack: Stack) -> None:
+    """Exact Telegram summary + "reenvíalo a X" → FORWARD (never COMPOSE)."""
+    stack.contacts.create_contact("Daniel", "daniel@forward.ch")
+    original = _seed_forward_source(stack)
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    await stack.send_bg("reenvíalo a Daniel", reply_to=stack.bot_message(summary_id))
+    previews = _forward_previews(stack)
+    assert previews and "daniel@forward.ch" in previews[-1]
+    assert "presupuesto.pdf" in previews[-1]
+    assert _new_email_previews(stack) == []  # never COMPOSE
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    sent = stack.gmail.sent[0]
+    assert sent.forward_of == "m-fwd"  # exact original frozen
+    assert sent.to[0].email == "daniel@forward.ch"
+    assert sent.subject.startswith("Fwd:")
+    assert [a.filename for a in sent.attachments] == ["presupuesto.pdf"]
+
+
+async def test_flow_fwd_summary_con_pdf_adjunto_routes_to_forward(stack: Stack) -> None:
+    """"reenvía este correo a X con su PDF adjunto" → FORWARD, one PDF."""
+    stack.contacts.create_contact("Daniel", "daniel@forward.ch")
+    original = _seed_forward_source(stack)
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    await stack.send_bg(
+        "reenvía este correo a Daniel con su PDF adjunto",
+        reply_to=stack.bot_message(summary_id),
+    )
+    previews = _forward_previews(stack)
+    assert previews and "daniel@forward.ch" in previews[-1]
+    assert previews and "presupuesto.pdf" in previews[-1]
+    assert _new_email_previews(stack) == []
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    sent = stack.gmail.sent[0]
+    assert sent.forward_of == "m-fwd"
+    assert len(sent.attachments) == 1  # exactly ONE original PDF
+    assert sent.attachments[0].filename == "presupuesto.pdf"
+    assert sent.to[0].email == "daniel@forward.ch"
+
+
+async def test_flow_fwd_never_compose_direct_email(stack: Stack) -> None:
+    """Forward instruction with a bare email destination → FORWARD, not
+    COMPOSE; the address is used as-is (deterministic recipient)."""
+    original = _seed_forward_source(stack)
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    await stack.send_bg(
+        "reenvía este correo a darroyo083@gmail.com con su PDF adjunto",
+        reply_to=stack.bot_message(summary_id),
+    )
+    previews = _forward_previews(stack)
+    assert previews and "darroyo083@gmail.com" in previews[-1]
+    assert _new_email_previews(stack) == []
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    assert stack.gmail.sent[0].to[0].email == "darroyo083@gmail.com"
+    assert stack.gmail.sent[0].forward_of == "m-fwd"
+
+
+async def test_flow_fwd_preview_label_reenvio(stack: Stack) -> None:
+    """Preview label is "Borrador (Reenvío)" with Para + Adjuntos."""
+    stack.contacts.create_contact("Daniel", "daniel@forward.ch")
+    original = _seed_forward_source(stack)
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    await stack.send_bg("reenvíaselo a Daniel", reply_to=stack.bot_message(summary_id))
+    previews = _forward_previews(stack)
+    assert previews
+    text = previews[-1]
+    assert text.startswith("Borrador (Reenvío)")
+    assert "Para: Daniel <daniel@forward.ch>" in text
+    assert "Adjuntos:\n- presupuesto.pdf" in text
+    assert "Fwd:" in text
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert stack.draft_row(1)["status"] == DraftStatus.SENT_VERIFIED.value
+
+
+async def test_flow_fwd_target_frozen_later_message_no_change(stack: Stack) -> None:
+    """The exact original Gmail target is frozen at queue time: a later email
+    must NOT change the forwarded message."""
+    stack.contacts.create_contact("Daniel", "daniel@forward.ch")
+    original = _seed_forward_source(stack, message_id="m-fwd")
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    # A NEWER incoming email arrives after the summary but before the forward
+    # is processed — the frozen source must stay m-fwd.
+    _seed_incoming(stack, "m-newer", "t-newer", 500)
+    await stack.send_bg("reenvíaselo a Daniel", reply_to=stack.bot_message(summary_id))
+    previews = _forward_previews(stack)
+    assert previews and "presupuesto.pdf" in previews[-1]
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    assert stack.gmail.sent[0].forward_of == "m-fwd"  # frozen, not m-newer
+
+
+async def test_flow_fwd_original_pdf_included_exactly_once(stack: Stack) -> None:
+    """Forward of a message with one PDF → exactly one PDF on send."""
+    stack.contacts.create_contact("Daniel", "daniel@forward.ch")
+    original = _seed_forward_source(stack)
+    stack.gmail.attachment_bytes[("m-fwd", 0)] = b"%PDF-1.4 fake pdf content"
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    await stack.send_bg("reenvíaselo a Daniel", reply_to=stack.bot_message(summary_id))
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    assert len(stack.gmail.sent[0].attachments) == 1
+    assert stack.gmail.sent[0].attachments[0].filename == "presupuesto.pdf"
+    # verified against Gmail: exactly the one attachment, one PDF
+    row = stack.draft_row(1)
+    import json as _json
+
+    attachments = _json.loads(row["attachments_json"])
+    assert len(attachments) == 1
+
+
+async def test_flow_fwd_recipient_from_explicit_destination(stack: Stack) -> None:
+    """The recipient comes from the explicit forward destination, never the
+    original sender."""
+    stack.contacts.create_contact("Roman", "roman@example.com")
+    original = _seed_forward_source(stack)
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    await stack.send_bg("reenvíaselo a Roman", reply_to=stack.bot_message(summary_id))
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    sent = stack.gmail.sent[0]
+    assert sent.to[0].email == "roman@example.com"  # NOT anna@example.com
+    assert sent.forward_of == "m-fwd"
+
+
+async def test_flow_fwd_no_telegram_reupload(stack: Stack) -> None:
+    """The original PDF is recovered from Gmail — no Telegram re-upload is
+    needed and none happens."""
+    stack.contacts.create_contact("Daniel", "daniel@forward.ch")
+    original = _seed_forward_source(stack)
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    await stack.send_bg("reenvíaselo a Daniel", reply_to=stack.bot_message(summary_id))
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    assert stack.gmail.sent[0].attachments[0].filename == "presupuesto.pdf"
+    # The PDF came from Gmail attachment fetch (never a Telegram document).
+    assert ("m-fwd", 0) in stack.gmail.attachment_fetches
+    assert not stack.sender.downloaded
+
+
+async def test_flow_fwd_reply_and_pdf_still_correct(stack: Stack, tmp_path: Path) -> None:
+    """Regression #9: the reply+PDF flow stays a REPLY (not a forward)."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.sender.files["file-1"] = FakeFile(b"%PDF-1.4 fake")
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    message = _document_message(
+        801,
+        file_id="file-1",
+        file_name="solicitado.pdf",
+        caption="respóndele que le adjunto el documento solicitado",
+        reply_to=stack.bot_message(summary_id),
+    )
+    await stack.bot.process_update(_update(message))
+    await stack.pump()
+    await asyncio.sleep(0.15)
+    previews = [
+        m.text
+        for m in stack.sender.messages
+        if (m.text or "").startswith("Borrador (Respuesta)")
+    ]
+    assert previews and "solicitado.pdf" in previews[-1]
+    assert _forward_previews(stack) == []
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    sent = stack.gmail.sent[0]
+    assert sent.thread_id == "t1"  # reply into the thread
+    assert sent.forward_of == ""  # NOT a forward
+    assert len(sent.attachments) == 1
+    assert sent.attachments[0].filename == "solicitado.pdf"
+
+
+async def test_flow_fwd_compose_and_pdf_still_correct(stack: Stack) -> None:
+    """Regression #10: the compose+PDF flow stays COMPOSE (not a forward)."""
+    stack.contacts.create_contact("Daniel", "daniel@compose.ch")
+    await stack.send_bg("envía un correo a Daniel diciendo que muchas gracias")
+    previews = _new_email_previews(stack)
+    assert previews and "daniel@compose.ch" in previews[-1]
+    assert _forward_previews(stack) == []
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    assert stack.gmail.sent[0].forward_of == ""  # NOT a forward
+    assert stack.gmail.sent[0].to[0].email == "daniel@compose.ch"
+
+
+async def test_flow_fwd_active_reply_slot_does_not_steal_forward(stack: Stack) -> None:
+    """Regression #11: an explicit forward bound to a Gmail summary wins over
+    an active/pending reply slot (e.g. "Responder" pressed earlier)."""
+    stack.contacts.create_contact("Daniel", "daniel@forward.ch")
+    original = _seed_forward_source(stack)
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    # Press "Responder" on the summary → a pending reply slot is armed.
+    await stack.tap(CHAT_ID, f"reply:{summary_id}", user_id=7)
+    # Then the user replies to the summary with an EXPLICIT forward. The
+    # forward must win over the pending reply slot.
+    await stack.send_bg(
+        "reenvía este correo a Daniel", reply_to=stack.bot_message(summary_id)
+    )
+    previews = _forward_previews(stack)
+    assert previews and "daniel@forward.ch" in previews[-1]
+    assert _new_email_previews(stack) == []
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    assert stack.gmail.sent[0].forward_of == "m-fwd"
+    assert stack.gmail.sent[0].to[0].email == "daniel@forward.ch"
+
+
+async def test_flow_fwd_without_attachment_correct(stack: Stack) -> None:
+    """Regression #12: a forward of a message WITHOUT attachments is correct
+    (no attachment, still a Reenvío)."""
+    stack.contacts.create_contact("Daniel", "daniel@forward.ch")
+    original = _seed_forward_source(stack, attachment=False)
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    await stack.send_bg("reenvíaselo a Daniel", reply_to=stack.bot_message(summary_id))
+    previews = _forward_previews(stack)
+    assert previews and "daniel@forward.ch" in previews[-1]
+    assert "Adjuntos:" not in previews[-1]
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    assert stack.gmail.sent[0].attachments == ()
+    assert stack.gmail.sent[0].forward_of == "m-fwd"
+
+
+async def test_flow_fwd_cancel_cleans_temp(stack: Stack, tmp_path: Path) -> None:
+    """Regression #13: cancelling a forward cleans its temp files (no
+    leftovers in the delivery dir) and marks the draft CANCELLED."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.contacts.create_contact("Daniel", "daniel@forward.ch")
+    original = _seed_forward_source(stack)
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    await stack.send_bg("reenvíaselo a Daniel", reply_to=stack.bot_message(summary_id))
+    previews = _forward_previews(stack)
+    assert previews
+    for _ in range(100):
+        if stack.bot._pending_drafts:
+            break
+        await asyncio.sleep(0.02)
+    token = _button_data(
+        _last_markup(stack, "Borrador (Reenvío)"), 0, 2
+    ).split(":", 1)[1]
+    await stack.tap(CHAT_ID, f"cancel:{token}")
+    await stack.tap(CHAT_ID, f"cancelyes:{token}")
+    await asyncio.sleep(0.1)
+    for task in list(stack.coordinator._presentation_tasks):
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=3)
+        except TimeoutError:
+            task.cancel()
+    await stack.join_background()
+    assert stack.draft_row(1)["status"] == DraftStatus.CANCELLED.value
+    assert stack.gmail.sent == []
+    delivery_dir = Path(str(tmp_path / "tmp" / "delivery"))
+    leftovers = list(delivery_dir.iterdir()) if delivery_dir.is_dir() else []
+    assert leftovers == []
+
+
+async def test_flow_fwd_verified_send_duplicate_protection(stack: Stack) -> None:
+    """Regression #14: forward send is verified against Gmail; a duplicate
+    (already-sent) forward is detected and NOT re-sent."""
+    stack.contacts.create_contact("Daniel", "daniel@forward.ch")
+    original = _seed_forward_source(stack)
+    summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
+    await stack.send_bg("reenvíaselo a Daniel", reply_to=stack.bot_message(summary_id))
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert stack.draft_row(1)["status"] == DraftStatus.SENT_VERIFIED.value
+    assert len(stack.gmail.sent) == 1
+    # Simulate a resend tap on the verified forward → duplicate protection.
+    # The draft is verified, so a resend is refused (not in retry state).
+    await stack.tap(CHAT_ID, f"resend:{stack.draft_row(1)['id']}", user_id=7)
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1  # no duplicate
+    assert any("no está en estado" in (m.text or "") for m in stack.sender.messages)
