@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { createRoot } from "react-dom/client";
 import "./styles.css";
 
 const GITHUB_URL = "https://github.com/darroyo083/inboxbridge";
@@ -271,3 +272,5 @@ function App() {
 }
 
 export default App;
+
+createRoot(document.getElementById("root")!).render(<App />);
