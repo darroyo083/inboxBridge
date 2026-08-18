@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import type { MouseEvent, ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
@@ -36,14 +36,15 @@ function AppRouter({ children }: { children: ReactNode }) {
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
 
-  const value = useMemo<RouterContextValue>(() => ({
-    pathname,
-    navigate: (to) => {
-      if (normalizePath(to) === pathname) return;
-      window.history.pushState({}, "", to);
-      setPathname(normalizePath(to));
-    },
-  }), [pathname]);
+  const navigate = useCallback((to: string) => {
+    const nextPath = normalizePath(to);
+    const currentPath = normalizePath(window.location.pathname);
+    if (nextPath === currentPath) return;
+    window.history.pushState({}, "", nextPath);
+    setPathname(nextPath);
+  }, []);
+
+  const value = useMemo<RouterContextValue>(() => ({ pathname, navigate }), [navigate, pathname]);
 
   return <RouterContext.Provider value={value}>{children}</RouterContext.Provider>;
 }
@@ -125,9 +126,17 @@ function Header() {
   );
 }
 
-function PageTransition({ children }: PageProps) {
+function PageTransition() {
   const { pathname } = useRoute();
-  return <div key={pathname} className="page-transition">{children}</div>;
+  const [isChanging, setIsChanging] = useState(false);
+
+  useEffect(() => {
+    setIsChanging(true);
+    const frame = window.requestAnimationFrame(() => setIsChanging(false));
+    return () => window.cancelAnimationFrame(frame);
+  }, [pathname]);
+
+  return <div className={`page-transition${isChanging ? " is-changing" : ""}`}><RouteView /></div>;
 }
 
 function ScrollToTop() {
@@ -388,29 +397,30 @@ function App() {
       <PageMeta />
       <ScrollToTop />
       <Header />
-      <PageTransition>
-        <RouteView />
-      </PageTransition>
+      <PageTransition />
       <Footer />
     </AppRouter>
   );
 }
 
+const routeComponents = {
+  "/": HomePage,
+  "/how-it-works": HowItWorksPage,
+  "/capabilities": CapabilitiesPage,
+  "/safety": SafetyPage,
+  "/architecture": ArchitecturePage,
+};
+
 function RouteView() {
   const { pathname, navigate } = useRoute();
-  const page = {
-    "/": <HomePage />,
-    "/how-it-works": <HowItWorksPage />,
-    "/capabilities": <CapabilitiesPage />,
-    "/safety": <SafetyPage />,
-    "/architecture": <ArchitecturePage />,
-  }[pathname];
+  const knownPage = routeComponents[pathname as keyof typeof routeComponents];
+  const PageComponent = knownPage ?? HomePage;
 
   useEffect(() => {
-    if (!page) navigate("/");
-  }, [navigate, page, pathname]);
+    if (!knownPage) navigate("/");
+  }, [knownPage, navigate]);
 
-  return page ?? <HomePage />;
+  return <PageComponent />;
 }
 
 createRoot(document.getElementById("root")!).render(<App />);
