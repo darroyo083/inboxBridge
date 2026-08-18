@@ -1,46 +1,88 @@
-import { useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useState } from "react";
+import type { MouseEvent, ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
 const GITHUB_URL = "https://github.com/darroyo083/inboxbridge";
 
-type Operation = {
-  number: string;
-  title: string;
-  description: string;
+const navItems = [
+  { label: "Home", to: "/", end: true },
+  { label: "How it works", to: "/how-it-works" },
+  { label: "Capabilities", to: "/capabilities" },
+  { label: "Safety", to: "/safety" },
+  { label: "Architecture", to: "/architecture" },
+];
+
+type PageProps = { children: ReactNode; className?: string };
+
+type RouterContextValue = {
+  pathname: string;
+  navigate: (to: string) => void;
 };
 
-const operations: Operation[] = [
-  { number: "01", title: "RECEIVE", description: "Gmail Push and Pub/Sub surface new Primary inbox mail." },
-  { number: "02", title: "UNDERSTAND", description: "Thread history and PDF or document context are grounded together." },
-  { number: "03", title: "ASK", description: "InboxBridge summarizes in Spanish and waits for the user's intent." },
-  { number: "04", title: "DRAFT", description: "Reply, new mail, or forwarding instructions become a German draft." },
-  { number: "05", title: "REVIEW", description: "The final draft and Spanish translation are shown side by side." },
-  { number: "06", title: "CONFIRM", description: "Explicit confirmation gates the send, then Gmail delivery is verified." },
-];
+const RouterContext = createContext<RouterContextValue | null>(null);
 
-const capabilityGroups = [
-  {
-    label: "UNDERSTAND",
-    module: "MODULE.01",
-    items: ["Thread summaries and Q&A", "PDF and document grounding", "Attachment-aware context"],
-  },
-  {
-    label: "WRITE",
-    module: "MODULE.02",
-    items: ["Replies, new mail, and forwards", "Conversational draft editing", "German final email output"],
-  },
-  {
-    label: "MULTILINGUAL",
-    module: "MODULE.03",
-    items: ["Spanish incoming summaries", "Spanish review translation", "German drafting from Spanish"],
-  },
-  {
-    label: "SAFE DELIVERY",
-    module: "MODULE.04",
-    items: ["Explicit confirmation required", "Duplicate-send protections", "Gmail reconciliation after send"],
-  },
-];
+function normalizePath(pathname: string) {
+  const trimmed = pathname.replace(/\/+$/, "");
+  return trimmed || "/";
+}
+
+function AppRouter({ children }: { children: ReactNode }) {
+  const [pathname, setPathname] = useState(() => normalizePath(window.location.pathname));
+
+  useEffect(() => {
+    const handlePopState = () => setPathname(normalizePath(window.location.pathname));
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
+  const value = useMemo<RouterContextValue>(() => ({
+    pathname,
+    navigate: (to) => {
+      if (normalizePath(to) === pathname) return;
+      window.history.pushState({}, "", to);
+      setPathname(normalizePath(to));
+    },
+  }), [pathname]);
+
+  return <RouterContext.Provider value={value}>{children}</RouterContext.Provider>;
+}
+
+function useRoute() {
+  const context = useContext(RouterContext);
+  if (!context) throw new Error("useRoute must be used inside AppRouter");
+  return context;
+}
+
+function handleRouteClick(event: MouseEvent<HTMLAnchorElement>, navigate: (to: string) => void, to: string) {
+  if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  navigate(to);
+}
+
+function RouteLink({ to, children, className, ariaLabel }: { to: string; children: ReactNode; className?: string; ariaLabel?: string }) {
+  const { navigate } = useRoute();
+  return <a className={className} href={to} aria-label={ariaLabel} onClick={(event) => handleRouteClick(event, navigate, to)}>{children}</a>;
+}
+
+function RouteNavLink({ to, children, end = false, className = "" }: { to: string; children: ReactNode; end?: boolean; className?: string }) {
+  const { pathname, navigate } = useRoute();
+  const isActive = end ? pathname === to : pathname.startsWith(to);
+  return <a className={`${className}${isActive ? " is-active" : ""}`} href={to} aria-current={isActive ? "page" : undefined} onClick={(event) => handleRouteClick(event, navigate, to)}>{children}</a>;
+}
+
+function LogoMark({ compact = false }: { compact?: boolean }) {
+  return (
+    <span className={`logo-lockup${compact ? " logo-lockup-compact" : ""}`}>
+      <svg className="logo-mark" viewBox="0 0 32 32" aria-hidden="true">
+        <path d="M5 23V15a11 11 0 0 1 22 0v8" />
+        <path d="M10 23v-7a6 6 0 0 1 12 0v7" />
+        <path d="M3 26h26" />
+      </svg>
+      {!compact && <span className="brand-mark">InboxBridge</span>}
+    </span>
+  );
+}
 
 function ExternalArrow() {
   return <span aria-hidden="true" className="external-arrow">↗</span>;
@@ -48,13 +90,16 @@ function ExternalArrow() {
 
 function Header() {
   const [isOpen, setIsOpen] = useState(false);
+  const { pathname } = useRoute();
 
-  const closeMenu = () => setIsOpen(false);
+  useEffect(() => setIsOpen(false), [pathname]);
 
   return (
     <header className="site-header">
       <nav className="nav-shell" aria-label="Primary navigation">
-        <a className="brand-mark" href="#top" onClick={closeMenu}>InboxBridge</a>
+        <RouteLink className="brand-link" to="/" ariaLabel="InboxBridge home">
+          <LogoMark />
+        </RouteLink>
         <button
           className="menu-toggle"
           type="button"
@@ -66,10 +111,11 @@ function Header() {
           <span aria-hidden="true">{isOpen ? "CLOSE" : "MENU"}</span>
         </button>
         <div id="site-navigation" className={`nav-links${isOpen ? " is-open" : ""}`}>
-          <a href="#how-it-works" onClick={closeMenu}>How it works</a>
-          <a href="#capabilities" onClick={closeMenu}>Capabilities</a>
-          <a href="#engineering" onClick={closeMenu}>Engineering</a>
-          <a href="#architecture" onClick={closeMenu}>Architecture</a>
+          {navItems.map((item) => (
+            <RouteNavLink className="nav-link" end={item.end} key={item.to} to={item.to}>
+              {item.label}
+            </RouteNavLink>
+          ))}
         </div>
         <a className="nav-cta" href={GITHUB_URL} target="_blank" rel="noreferrer">
           <span>View on GitHub</span><ExternalArrow />
@@ -79,179 +125,230 @@ function Header() {
   );
 }
 
-function FlowDiagram() {
+function PageTransition({ children }: PageProps) {
+  const { pathname } = useRoute();
+  return <div key={pathname} className="page-transition">{children}</div>;
+}
+
+function ScrollToTop() {
+  const { pathname } = useRoute();
+  useEffect(() => window.scrollTo({ top: 0, behavior: "auto" }), [pathname]);
+  return null;
+}
+
+function Page({ children, className = "" }: PageProps) {
+  return <main className={`page ${className}`}>{children}</main>;
+}
+
+function PageHeader({ kicker, title, intro }: { kicker: string; title: ReactNode; intro: string }) {
   return (
-    <div className="flow-diagram" aria-label="System flow from Gmail through InboxBridge to Telegram">
-      <div className="flow-label">SYS.FLOW.01</div>
-      <div className="flow-track" aria-hidden="true" />
-      <div className="flow-node flow-node-gmail">
-        <span className="mono-label">DATA SOURCE</span>
-        <strong>Gmail API</strong>
-      </div>
-      <div className="flow-node flow-node-core">
-        <span className="mono-label">PROCESSOR</span>
-        <strong>InboxBridge Core</strong>
-      </div>
-      <div className="flow-node flow-node-telegram">
-        <span className="mono-label">CLIENT INTERFACE</span>
-        <strong>Telegram Bot API</strong>
-      </div>
-    </div>
+    <header className="page-header page-shell">
+      <span className="eyebrow">{kicker}</span>
+      <h1>{title}</h1>
+      <p>{intro}</p>
+    </header>
   );
 }
 
-function Hero() {
+function ButtonLink({ children, to, variant = "primary" }: { children: ReactNode; to: string; variant?: "primary" | "secondary" }) {
+  return <RouteLink className={`button button-${variant}`} to={to}>{children}</RouteLink>;
+}
+
+function FlowPreview() {
   return (
-    <section className="hero page-shell" id="top">
-      <div className="hero-copy">
-        <div className="status-badge"><span className="status-dot" />Work in Progress</div>
-        <h1>Your inbox,<br />conversational.</h1>
-        <p>Read, understand and respond to Gmail from Telegram, with multilingual AI, attachment-aware context and explicit confirmation before anything is sent.</p>
-        <div className="hero-actions">
-          <a className="button button-primary" href={GITHUB_URL} target="_blank" rel="noreferrer">View on GitHub <ExternalArrow /></a>
-          <a className="button button-secondary" href="#how-it-works">See how it works</a>
+    <div className="hero-visual" aria-label="InboxBridge flow preview">
+      <div className="visual-topline">
+        <span>SYS.FLOW / LIVE</span>
+        <span>01—03</span>
+      </div>
+      <div className="visual-route">
+        <div className="route-side route-source">
+          <span className="mono-label">SOURCE</span>
+          <strong>Gmail</strong>
+          <small>new thread</small>
+        </div>
+        <div className="route-core">
+          <span className="route-core-mark"><LogoMark compact /></span>
+          <strong>InboxBridge</strong>
+          <small>conversational layer</small>
+        </div>
+        <div className="route-side route-client">
+          <span className="mono-label">INTERFACE</span>
+          <strong>Telegram</strong>
+          <small>your review</small>
         </div>
       </div>
-      <FlowDiagram />
-    </section>
-  );
-}
-
-function StatusStrip() {
-  return (
-    <section className="status-strip page-shell" aria-label="Project status">
-      <span className="status-glyph" aria-hidden="true">[+]</span>
-      <p><strong>STATUS: ACTIVE DEVELOPMENT</strong><span className="status-separator">|</span> Core flows operational. Reliability and attachment hardening in progress.</p>
-    </section>
-  );
-}
-
-function Operations() {
-  return (
-    <section className="content-section page-shell" id="how-it-works">
-      <div className="section-intro">
-        <h2>Sequence of Operations</h2>
-        <p>A deterministic pipeline for handling communications safely.</p>
+      <div className="visual-line" aria-hidden="true" />
+      <div className="visual-message">
+        <div className="message-heading"><span className="message-dot" />INCOMING THREAD</div>
+        <p>Resumen listo. ¿Qué quieres hacer?</p>
+        <span className="message-meta">SPANISH SUMMARY / ATTACHMENT AWARE</span>
       </div>
-      <div className="operation-grid">
-        {operations.map((operation) => (
-          <article className="operation" key={operation.number}>
-            <span className="operation-number">{operation.number}</span>
-            <h3>{operation.title}</h3>
-            <p>{operation.description}</p>
-          </article>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function TraceEntry({ side, label, children, active = false }: { side: "left" | "right"; label: string; children: React.ReactNode; active?: boolean }) {
-  return (
-    <div className={`trace-entry trace-entry-${side}`}>
-      <div className="trace-message">
-        <span className={`mono-label${active ? " label-active" : ""}`}>{label}</span>
-        <div className={`trace-quote${active ? " trace-quote-active" : ""}`}>{children}</div>
-      </div>
-      <span className={`trace-node${active ? " trace-node-active" : ""}`} aria-hidden="true" />
-      <div className="trace-spacer" />
     </div>
   );
 }
 
-function MultilingualTrace() {
+function StatusBar() {
   return (
-    <section className="content-section trace-section page-shell">
-      <div className="section-intro">
-        <h2>Multilingual Trace</h2>
-        <p>Cross-lingual processing execution log.</p>
-      </div>
-      <div className="trace-log">
-        <div className="trace-line" aria-hidden="true" />
-        <TraceEntry side="left" label="SOURCE: GERMAN" active>&quot;Könnten Sie uns das Dokument bis Freitag schicken?&quot;</TraceEntry>
-        <TraceEntry side="right" label="SUMMARY: SPANISH">El cliente solicita el documento para el viernes.</TraceEntry>
-        <TraceEntry side="left" label="INTENT: USER INPUT" active>&quot;Dile que sí, lo envío el jueves.&quot;</TraceEntry>
-        <TraceEntry side="right" label="DRAFT: GERMAN">&quot;Ja, ich werde es Ihnen am Donnerstag schicken.&quot;</TraceEntry>
-        <TraceEntry side="left" label="REVIEW: SPANISH">Borrador: &quot;Sí, se lo enviaré el jueves.&quot;</TraceEntry>
-        <TraceEntry side="right" label="STATE" active><span className="state-text">Confirmed, sent, verified</span></TraceEntry>
-      </div>
-    </section>
+    <div className="status-bar page-shell">
+      <span className="status-dot" aria-hidden="true" />
+      <strong>ACTIVE DEVELOPMENT</strong>
+      <span className="status-divider">/</span>
+      <span>Core flows operational, attachment hardening in progress.</span>
+    </div>
   );
 }
 
-function Capabilities() {
+const homePreviews = [
+  { number: "01", title: "How it works", copy: "Six deliberate handoffs from new mail to verified delivery.", to: "/how-it-works" },
+  { number: "02", title: "Capabilities", copy: "Thread context, documents, drafting, and multilingual review.", to: "/capabilities" },
+  { number: "03", title: "Safety", copy: "AI proposes. Deterministic systems decide.", to: "/safety" },
+  { number: "04", title: "Architecture", copy: "A Telegram interface connected to Gmail through one core.", to: "/architecture" },
+];
+
+function HomePage() {
   return (
-    <section className="content-section page-shell" id="capabilities">
-      <div className="section-intro">
-        <h2>Capabilities</h2>
-        <p>Core system functions.</p>
-      </div>
-      <div className="capability-grid">
-        {capabilityGroups.map((group) => (
-          <article className="capability" key={group.module}>
-            <div className="capability-heading"><h3>{group.label}</h3><span>{group.module}</span></div>
-            <ul>
-              {group.items.map((item) => <li key={item}>{item}</li>)}
-            </ul>
-          </article>
-        ))}
-      </div>
-    </section>
+    <Page className="home-page">
+      <section className="hero page-shell">
+        <div className="hero-copy">
+          <div className="status-badge"><span className="status-dot" />Work in progress</div>
+          <h1>Your inbox,<br /><em>conversational.</em></h1>
+          <p>A multilingual Gmail assistant in Telegram, grounded in threads and attachments, with explicit confirmation before any message leaves.</p>
+          <div className="hero-actions">
+            <a className="button button-primary" href={GITHUB_URL} target="_blank" rel="noreferrer">View on GitHub <ExternalArrow /></a>
+            <ButtonLink to="/how-it-works" variant="secondary">Explore the flow</ButtonLink>
+          </div>
+        </div>
+        <FlowPreview />
+      </section>
+      <StatusBar />
+      <section className="home-previews page-shell">
+        <div className="section-heading">
+          <span className="eyebrow">THE SYSTEM</span>
+          <h2>One interface.<br />Four deliberate layers.</h2>
+          <p>See how InboxBridge turns a crowded inbox into a conversation you can trust.</p>
+        </div>
+        <div className="preview-grid">
+          {homePreviews.map((preview) => (
+            <RouteLink className="preview-link" to={preview.to} key={preview.to}>
+              <span className="preview-number">{preview.number}</span>
+              <span className="preview-body"><strong>{preview.title}</strong><span>{preview.copy}</span></span>
+              <ExternalArrow />
+            </RouteLink>
+          ))}
+        </div>
+      </section>
+    </Page>
+  );
+}
+
+const operations = [
+  { number: "01", title: "RECEIVE", description: "Gmail Push and Pub/Sub surface new mail from the Primary inbox.", detail: "GMAIL API" },
+  { number: "02", title: "UNDERSTAND", description: "Thread history and PDF or document context are grounded together.", detail: "CONTEXT + DOCS" },
+  { number: "03", title: "ASK", description: "A Spanish summary arrives in Telegram, ready for your intent.", detail: "TELEGRAM" },
+  { number: "04", title: "DRAFT", description: "Reply, new mail, or forwarding instructions become a German draft.", detail: "STRUCTURED OUTPUT" },
+  { number: "05", title: "REVIEW", description: "The draft and its Spanish translation are shown before anything moves.", detail: "USER REVIEW" },
+  { number: "06", title: "CONFIRM", description: "Explicit confirmation gates Gmail send. Delivery is reconciled afterward.", detail: "VERIFIED DELIVERY" },
+];
+
+function ProcessRow({ operation }: { operation: typeof operations[number] }) {
+  return (
+    <article className="process-row">
+      <span className="process-number">{operation.number}</span>
+      <div className="process-copy"><h2>{operation.title}</h2><p>{operation.description}</p></div>
+      <span className="process-detail">{operation.detail}</span>
+    </article>
+  );
+}
+
+function HowItWorksPage() {
+  return (
+    <Page className="inner-page">
+      <PageHeader kicker="HOW IT WORKS" title={<>From new mail to<br /><em>verified delivery.</em></>} intro="A clear sequence of small decisions. InboxBridge keeps the person in the loop where it matters." />
+      <section className="process-section page-shell">
+        <div className="process-list">{operations.map((operation) => <ProcessRow key={operation.number} operation={operation} />)}</div>
+      </section>
+      <section className="language-panel page-shell">
+        <div><span className="eyebrow">LANGUAGE TRACE</span><h2>One conversation,<br /><em>multiple languages.</em></h2><p>Incoming mail is summarized in Spanish. Your instructions become a polished German draft. The Spanish review stays visible until you confirm.</p></div>
+        <div className="language-steps">
+          <div><span>INCOMING</span><strong>German thread</strong><small>“Könnten Sie uns das Dokument senden?”</small></div>
+          <div><span>YOUR REVIEW</span><strong>Spanish summary</strong><small>“El cliente solicita el documento.”</small></div>
+          <div><span>FINAL DRAFT</span><strong>German email</strong><small>“Ja, ich werde es Ihnen schicken.”</small></div>
+        </div>
+      </section>
+    </Page>
+  );
+}
+
+const capabilityGroups = [
+  { index: "01", title: "Understand", copy: "Thread summaries and grounded answers that include the documents attached to the conversation.", tags: ["THREADS", "PDF", "DOCX"] },
+  { index: "02", title: "Write", copy: "Replies, new messages, forwards, and conversational edits that keep the full draft current.", tags: ["REPLY", "COMPOSE", "FORWARD"] },
+  { index: "03", title: "Translate", copy: "Spanish summaries and review translations, with professional German final emails.", tags: ["ES", "DE", "REVIEW"] },
+  { index: "04", title: "Deliver safely", copy: "Explicit confirmation, real recipients, duplicate-send protections, and verified Gmail delivery.", tags: ["CONFIRM", "RECONCILE", "SAFE"] },
+];
+
+function CapabilityCard({ group, featured = false }: { group: typeof capabilityGroups[number]; featured?: boolean }) {
+  return (
+    <article className={`capability-card${featured ? " capability-card-featured" : ""}`}>
+      <div className="capability-card-top"><span>{group.index}</span><span className="capability-signal" aria-hidden="true" /></div>
+      <h2>{group.title}</h2>
+      <p>{group.copy}</p>
+      <div className="tag-list">{group.tags.map((tag) => <span key={tag}>{tag}</span>)}</div>
+    </article>
+  );
+}
+
+function CapabilitiesPage() {
+  return (
+    <Page className="inner-page">
+      <PageHeader kicker="CAPABILITIES" title={<>The useful parts,<br /><em>without the noise.</em></>} intro="InboxBridge is focused on the moments where email becomes work: understanding context, writing clearly, and sending deliberately." />
+      <section className="capabilities-section page-shell">
+        <div className="capabilities-grid">
+          {capabilityGroups.map((group, index) => <CapabilityCard featured={index === 0} group={group} key={group.index} />)}
+        </div>
+      </section>
+      <section className="capability-note page-shell"><span className="eyebrow">IN PRACTICE</span><p>Ask about a PDF. Summarize the thread. Make the draft shorter. Forward it to a saved contact. The interface stays conversational while the system stays structured.</p></section>
+    </Page>
   );
 }
 
 const safetyPrinciples = [
-  { title: "Trusted State", copy: "Recipients, thread identity, and send metadata come from trusted application state." },
-  { title: "No Bypass", copy: "Generated drafts cannot bypass explicit confirmation and completeness checks." },
-  { title: "Verification", copy: "Sent messages are reconciled with Gmail and guarded against duplicate sending." },
+  { number: "01", title: "Trusted state", copy: "Recipients, thread identity, and important send metadata come from trusted application state, not generated prose." },
+  { number: "02", title: "No bypass", copy: "A generated draft cannot skip explicit confirmation or completeness checks. The send boundary is deterministic." },
+  { number: "03", title: "Verification", copy: "After Gmail sends, InboxBridge reconciles the message and guards against blind retries or duplicate delivery." },
 ];
 
-function SafetySection() {
+function SafetyPage() {
   return (
-    <section className="content-section safety-section page-shell" id="engineering">
-      <div className="safety-heading">
-        <h2>AI proposes.<br />Deterministic systems decide.</h2>
-        <p>Safety principles enforced at the architectural level.</p>
-      </div>
-      <div className="safety-grid">
-        {safetyPrinciples.map((principle, index) => (
-          <article className="safety-item" key={principle.title}>
-            <span className="safety-index">0{index + 1}</span>
-            <h3>{principle.title}</h3>
-            <p>{principle.copy}</p>
-          </article>
-        ))}
-      </div>
-    </section>
+    <Page className="inner-page safety-page">
+      <PageHeader kicker="SAFETY" title={<>AI proposes.<br /><em>Systems decide.</em></>} intro="The model can suggest language. It cannot decide who receives it, whether it is complete, or whether it has been sent." />
+      <section className="safety-intro page-shell"><div className="safety-statement"><span className="safety-quote">“</span><p>InboxBridge treats a draft as a proposal, not an action.</p></div><div className="safety-state"><span>SAFE SEND STATE</span><strong>Awaiting explicit confirmation</strong><small>AI output is visible. Gmail is untouched.</small></div></section>
+      <section className="principles-section page-shell">
+        <div className="principles-list">{safetyPrinciples.map((principle) => <article className="principle-row" key={principle.number}><span className="principle-number">{principle.number}</span><h2>{principle.title}</h2><p>{principle.copy}</p></article>)}</div>
+      </section>
+      <section className="send-boundary page-shell">
+        <div className="section-heading"><span className="eyebrow">THE SEND BOUNDARY</span><h2>Every handoff has a visible state.</h2></div>
+        <div className="boundary-flow"><div><span>01</span><strong>AI draft</strong><small>proposal</small></div><i aria-hidden="true" /><div className="boundary-active"><span>02</span><strong>Confirm</strong><small>human decision</small></div><i aria-hidden="true" /><div><span>03</span><strong>Gmail send</strong><small>verified result</small></div></div>
+      </section>
+    </Page>
   );
 }
 
-function Architecture() {
+function ArchitecturePage() {
   return (
-    <section className="content-section architecture-section page-shell" id="architecture">
-      <div className="section-intro"><h2>Architecture</h2></div>
-      <div className="architecture-diagram">
-        <div className="architecture-node">
-          <span className="mono-label">INTERFACE</span>
-          <strong>Telegram</strong>
-          <small>Bot API</small>
+    <Page className="inner-page architecture-page">
+      <PageHeader kicker="ARCHITECTURE" title={<>A small core,<br /><em>clear boundaries.</em></>} intro="Telegram is the interface. Gmail remains the source of truth. InboxBridge coordinates the decisions between them." />
+      <section className="system-section page-shell">
+        <div className="system-diagram">
+          <div className="system-node system-interface"><span className="eyebrow">INTERFACE</span><strong>Telegram</strong><small>Bot API</small></div>
+          <div className="system-link" aria-hidden="true"><span>INPUT</span></div>
+          <div className="system-core"><span className="eyebrow">CORE ENGINE</span><strong>InboxBridge</strong><p>Intent routing, structured LLM output, trusted state, and verified delivery.</p><div className="core-parts"><span>Intent</span><span>LLM</span><span>Docs</span><span>State</span><span>Delivery</span></div></div>
+          <div className="system-link" aria-hidden="true"><span>OUTPUT</span></div>
+          <div className="system-node system-external"><span className="eyebrow">SOURCE OF TRUTH</span><strong>Gmail</strong><small>OAuth 2.0 / API</small></div>
         </div>
-        <div className="architecture-connector" aria-hidden="true"><span>↔</span></div>
-        <div className="architecture-core">
-          <span className="core-tag">CORE.ENGINE</span>
-          <span className="mono-label label-active">INBOXBRIDGE ASSISTANT</span>
-          <div className="core-modules">
-            {['Intent', 'LLM', 'Docs', 'Persistence', 'Delivery'].map((module) => <span key={module}>{module}</span>)}
-          </div>
-        </div>
-        <div className="architecture-connector" aria-hidden="true"><span>↔</span></div>
-        <div className="architecture-node">
-          <span className="mono-label">EXTERNAL</span>
-          <strong>Gmail</strong>
-          <small>OAuth 2.0</small>
-        </div>
-      </div>
-    </section>
+      </section>
+      <section className="architecture-notes page-shell"><div><span className="eyebrow">DEPLOYMENT</span><h2>Built to stay small.</h2><p>Docker and Linux VPS deployment keep the runtime portable. SQLite stores identifiers and statuses, not email bodies or attachment content.</p></div><div><span className="eyebrow">RECOVERY</span><h2>Designed to reconcile.</h2><p>Retries and restarts return to trusted state. An uncertain send is checked against Gmail before anything can be sent again.</p></div></section>
+    </Page>
   );
 }
 
@@ -259,18 +356,61 @@ function Footer() {
   return (
     <footer className="site-footer">
       <div className="footer-shell page-shell">
-        <div><strong>InboxBridge</strong><p>© 2026. Deterministic systems.</p></div>
-        <div><span className="mono-label">WORK IN PROGRESS</span></div>
-        <div className="footer-links"><a href={GITHUB_URL} target="_blank" rel="noreferrer">GitHub <ExternalArrow /></a><a href="https://github.com/darroyo083" target="_blank" rel="noreferrer">Daniel Arroyo</a></div>
+        <div className="footer-brand"><LogoMark /><p>Conversational Gmail via Telegram.</p></div>
+        <div className="footer-nav"><span className="eyebrow">EXPLORE</span>{navItems.slice(1).map((item) => <RouteLink key={item.to} to={item.to}>{item.label}</RouteLink>)}</div>
+        <div className="footer-meta"><span className="eyebrow">WORK IN PROGRESS</span><a href={GITHUB_URL} target="_blank" rel="noreferrer">GitHub <ExternalArrow /></a><small>© 2026 Daniel Arroyo</small></div>
       </div>
     </footer>
   );
 }
 
-function App() {
-  return <><Header /><main><Hero /><StatusStrip /><Operations /><MultilingualTrace /><Capabilities /><SafetySection /><Architecture /></main><Footer /></>;
+const pageMeta: Record<string, { title: string; description: string }> = {
+  "/": { title: "InboxBridge | Conversational Gmail via Telegram", description: "A multilingual Gmail assistant for Telegram with attachment-aware context, safe draft confirmation and verified delivery." },
+  "/how-it-works": { title: "How it works | InboxBridge", description: "See how InboxBridge moves from incoming Gmail mail to a confirmed, verified delivery." },
+  "/capabilities": { title: "Capabilities | InboxBridge", description: "Explore InboxBridge capabilities for email context, drafting, translation, and safe delivery." },
+  "/safety": { title: "Safety | InboxBridge", description: "Understand the trusted state, no bypass, and verification principles behind InboxBridge." },
+  "/architecture": { title: "Architecture | InboxBridge", description: "A clear view of the InboxBridge Telegram, core engine, and Gmail architecture." },
+};
+
+function PageMeta() {
+  const { pathname } = useRoute();
+  useEffect(() => {
+    const meta = pageMeta[pathname] ?? pageMeta["/"];
+    document.title = meta.title;
+    document.querySelector('meta[name="description"]')?.setAttribute("content", meta.description);
+  }, [pathname]);
+  return null;
 }
 
-export default App;
+function App() {
+  return (
+    <AppRouter>
+      <PageMeta />
+      <ScrollToTop />
+      <Header />
+      <PageTransition>
+        <RouteView />
+      </PageTransition>
+      <Footer />
+    </AppRouter>
+  );
+}
+
+function RouteView() {
+  const { pathname, navigate } = useRoute();
+  const page = {
+    "/": <HomePage />,
+    "/how-it-works": <HowItWorksPage />,
+    "/capabilities": <CapabilitiesPage />,
+    "/safety": <SafetyPage />,
+    "/architecture": <ArchitecturePage />,
+  }[pathname];
+
+  useEffect(() => {
+    if (!page) navigate("/");
+  }, [navigate, page, pathname]);
+
+  return page ?? <HomePage />;
+}
 
 createRoot(document.getElementById("root")!).render(<App />);
