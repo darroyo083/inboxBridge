@@ -141,7 +141,9 @@ function PageTransition() {
 
 function ScrollToTop() {
   const { pathname } = useRoute();
-  useEffect(() => window.scrollTo({ top: 0, behavior: "auto" }), [pathname]);
+  useEffect(() => {
+    window.scrollTo({ top: 0, behavior: "auto" });
+  }, [pathname]);
   return null;
 }
 
