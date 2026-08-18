@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent, ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
@@ -165,9 +165,156 @@ function ButtonLink({ children, to, variant = "primary" }: { children: ReactNode
   return <RouteLink className={`button button-${variant}`} to={to}>{children}</RouteLink>;
 }
 
+function HalftoneField() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const host = canvas?.parentElement;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !host || !context) return;
+
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const pointer = { x: 0.5, y: 0.5, targetX: 0.5, targetY: 0.5, active: false };
+    let width = 0;
+    let height = 0;
+    let cellSize = 16;
+    let animationFrame = 0;
+    let inViewport = true;
+    let documentHidden = document.hidden;
+    let lastFrame = 0;
+
+    const resize = () => {
+      const bounds = host.getBoundingClientRect();
+      width = bounds.width;
+      height = bounds.height;
+      cellSize = width < 520 ? 23 : 16;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = Math.max(1, Math.floor(width * dpr));
+      canvas.height = Math.max(1, Math.floor(height * dpr));
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      context.setTransform(dpr, 0, 0, dpr, 0, 0);
+    };
+
+    const draw = (timestamp: number) => {
+      if (!inViewport || documentHidden) return;
+      const elapsed = Math.min(48, timestamp - lastFrame || 16);
+      lastFrame = timestamp;
+      pointer.x += (pointer.targetX - pointer.x) * Math.min(1, elapsed * 0.008);
+      pointer.y += (pointer.targetY - pointer.y) * Math.min(1, elapsed * 0.008);
+      context.clearRect(0, 0, width, height);
+
+      const time = reduceMotion ? 0 : timestamp * 0.0002;
+      const columns = Math.ceil(width / cellSize);
+      const rows = Math.ceil(height / cellSize);
+      for (let row = 0; row < rows; row += 1) {
+        for (let column = 0; column < columns; column += 1) {
+          const x = column * cellSize + cellSize * 0.5;
+          const y = row * cellSize + cellSize * 0.5;
+          const wave = (Math.sin(x * 0.014 + time) + Math.cos(y * 0.018 - time * 0.8) + 2) * 0.25;
+          const flowDistance = ((x - width * 0.54) / (width * 0.52)) ** 2 + ((y - height * 0.48) / (height * 0.75)) ** 2;
+          const flowField = Math.max(0, 1 - flowDistance);
+          const pointerDistance = Math.hypot(x / width - pointer.x, y / height - pointer.y);
+          const pointerField = pointer.active ? Math.max(0, 1 - pointerDistance * 4.8) : 0;
+          const edgeFade = Math.min(1, Math.min(x, width - x, y, height - y) / (cellSize * 2.5));
+          const energy = Math.min(1, (0.1 + wave * 0.25 + flowField * 0.42 + pointerField * 0.6) * edgeFade);
+          const size = 0.8 + energy * (reduceMotion ? 1.6 : 2.7);
+          context.fillStyle = `rgba(159, 190, 230, ${0.018 + energy * 0.12})`;
+          context.fillRect(x - size * 0.5, y - size * 0.5, size, size);
+        }
+      }
+
+      if (!reduceMotion) animationFrame = window.requestAnimationFrame(draw);
+    };
+
+    const schedule = () => {
+      if (!reduceMotion && !animationFrame && inViewport && !documentHidden) animationFrame = window.requestAnimationFrame(draw);
+    };
+    const stop = () => {
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      animationFrame = 0;
+    };
+    const handlePointerMove = (event: PointerEvent) => {
+      if (event.pointerType && event.pointerType !== "mouse") return;
+      const bounds = host.getBoundingClientRect();
+      pointer.targetX = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width));
+      pointer.targetY = Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height));
+      pointer.active = true;
+      schedule();
+    };
+    const handlePointerLeave = () => {
+      pointer.targetX = 0.5;
+      pointer.targetY = 0.5;
+      pointer.active = false;
+      schedule();
+    };
+    const handleVisibility = () => {
+      documentHidden = document.hidden;
+      if (documentHidden) stop();
+      else schedule();
+    };
+
+    resize();
+    if (reduceMotion) draw(0);
+    const resizeObserver = new ResizeObserver(() => {
+      resize();
+      if (reduceMotion) draw(0);
+    });
+    const intersectionObserver = "IntersectionObserver" in window
+      ? new IntersectionObserver(([entry]) => {
+        inViewport = entry.isIntersecting;
+        if (inViewport) schedule();
+        else stop();
+      }, { threshold: 0.05 })
+      : null;
+    resizeObserver.observe(host);
+    intersectionObserver?.observe(host);
+    host.addEventListener("pointermove", handlePointerMove, { passive: true });
+    host.addEventListener("pointerleave", handlePointerLeave, { passive: true });
+    document.addEventListener("visibilitychange", handleVisibility);
+    schedule();
+
+    return () => {
+      stop();
+      resizeObserver.disconnect();
+      intersectionObserver?.disconnect();
+      host.removeEventListener("pointermove", handlePointerMove);
+      host.removeEventListener("pointerleave", handlePointerLeave);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, []);
+
+  return <canvas ref={canvasRef} className="halftone-field" aria-hidden="true" />;
+}
+
+function Reveal({ children, className = "" }: PageProps) {
+  const elementRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const element = elementRef.current;
+    if (!element) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches || !("IntersectionObserver" in window)) {
+      element.classList.add("is-visible");
+      return;
+    }
+    element.classList.add("reveal-pending");
+    const observer = new IntersectionObserver(([entry]) => {
+      if (!entry.isIntersecting) return;
+      element.classList.add("is-visible");
+      observer.disconnect();
+    }, { threshold: 0.12 });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  return <div ref={elementRef} className={`reveal ${className}`}>{children}</div>;
+}
+
 function FlowPreview() {
   return (
     <div className="hero-visual" aria-label="InboxBridge flow preview">
+      <HalftoneField />
       <div className="visual-topline">
         <span>SYS.FLOW / LIVE</span>
         <span>01—03</span>
@@ -190,6 +337,8 @@ function FlowPreview() {
         </div>
       </div>
       <div className="visual-line" aria-hidden="true" />
+      <span className="flow-packet flow-packet-left" aria-hidden="true" />
+      <span className="flow-packet flow-packet-right" aria-hidden="true" />
       <div className="visual-message">
         <div className="message-heading"><span className="message-dot" />INCOMING THREAD</div>
         <p>Resumen listo. ¿Qué quieres hacer?</p>
@@ -239,7 +388,7 @@ function HomePage() {
           <h2>One interface.<br />Four deliberate layers.</h2>
           <p>See how InboxBridge turns a crowded inbox into a conversation you can trust.</p>
         </div>
-        <div className="preview-grid">
+        <Reveal className="preview-grid">
           {homePreviews.map((preview) => (
             <RouteLink className="preview-link" to={preview.to} key={preview.to}>
               <span className="preview-number">{preview.number}</span>
@@ -247,7 +396,7 @@ function HomePage() {
               <ExternalArrow />
             </RouteLink>
           ))}
-        </div>
+        </Reveal>
       </section>
     </Page>
   );
@@ -277,7 +426,7 @@ function HowItWorksPage() {
     <Page className="inner-page">
       <PageHeader kicker="HOW IT WORKS" title={<>From new mail to<br /><em>verified delivery.</em></>} intro="A clear sequence of small decisions. InboxBridge keeps the person in the loop where it matters." />
       <section className="process-section page-shell">
-        <div className="process-list">{operations.map((operation) => <ProcessRow key={operation.number} operation={operation} />)}</div>
+        <Reveal className="process-list">{operations.map((operation) => <ProcessRow key={operation.number} operation={operation} />)}</Reveal>
       </section>
       <section className="language-panel page-shell">
         <div><span className="eyebrow">LANGUAGE TRACE</span><h2>One conversation,<br /><em>multiple languages.</em></h2><p>Incoming mail is summarized in Spanish. Your instructions become a polished German draft. The Spanish review stays visible until you confirm.</p></div>
@@ -314,9 +463,9 @@ function CapabilitiesPage() {
     <Page className="inner-page">
       <PageHeader kicker="CAPABILITIES" title={<>The useful parts,<br /><em>without the noise.</em></>} intro="InboxBridge is focused on the moments where email becomes work: understanding context, writing clearly, and sending deliberately." />
       <section className="capabilities-section page-shell">
-        <div className="capabilities-grid">
+        <Reveal className="capabilities-grid">
           {capabilityGroups.map((group, index) => <CapabilityCard featured={index === 0} group={group} key={group.index} />)}
-        </div>
+        </Reveal>
       </section>
       <section className="capability-note page-shell"><span className="eyebrow">IN PRACTICE</span><p>Ask about a PDF. Summarize the thread. Make the draft shorter. Forward it to a saved contact. The interface stays conversational while the system stays structured.</p></section>
     </Page>
@@ -333,13 +482,13 @@ function SafetyPage() {
   return (
     <Page className="inner-page safety-page">
       <PageHeader kicker="SAFETY" title={<>AI proposes.<br /><em>Systems decide.</em></>} intro="The model can suggest language. It cannot decide who receives it, whether it is complete, or whether it has been sent." />
-      <section className="safety-intro page-shell"><div className="safety-statement"><span className="safety-quote">“</span><p>InboxBridge treats a draft as a proposal, not an action.</p></div><div className="safety-state"><span>SAFE SEND STATE</span><strong>Awaiting explicit confirmation</strong><small>AI output is visible. Gmail is untouched.</small></div></section>
+      <Reveal className="safety-intro page-shell"><div className="safety-statement"><span className="safety-quote">“</span><p>InboxBridge treats a draft as a proposal, not an action.</p></div><div className="safety-state"><span>SAFE SEND STATE</span><strong>Awaiting explicit confirmation</strong><small>AI output is visible. Gmail is untouched.</small></div></Reveal>
       <section className="principles-section page-shell">
-        <div className="principles-list">{safetyPrinciples.map((principle) => <article className="principle-row" key={principle.number}><span className="principle-number">{principle.number}</span><h2>{principle.title}</h2><p>{principle.copy}</p></article>)}</div>
+        <Reveal className="principles-list">{safetyPrinciples.map((principle) => <article className="principle-row" key={principle.number}><span className="principle-number">{principle.number}</span><h2>{principle.title}</h2><p>{principle.copy}</p></article>)}</Reveal>
       </section>
       <section className="send-boundary page-shell">
         <div className="section-heading"><span className="eyebrow">THE SEND BOUNDARY</span><h2>Every handoff has a visible state.</h2></div>
-        <div className="boundary-flow"><div><span>01</span><strong>AI draft</strong><small>proposal</small></div><i aria-hidden="true" /><div className="boundary-active"><span>02</span><strong>Confirm</strong><small>human decision</small></div><i aria-hidden="true" /><div><span>03</span><strong>Gmail send</strong><small>verified result</small></div></div>
+        <Reveal className="boundary-flow"><div><span>01</span><strong>AI draft</strong><small>proposal</small></div><i aria-hidden="true" /><div className="boundary-active"><span>02</span><strong>Confirm</strong><small>human decision</small></div><i aria-hidden="true" /><div><span>03</span><strong>Gmail send</strong><small>verified result</small></div></Reveal>
       </section>
     </Page>
   );
@@ -350,15 +499,15 @@ function ArchitecturePage() {
     <Page className="inner-page architecture-page">
       <PageHeader kicker="ARCHITECTURE" title={<>A small core,<br /><em>clear boundaries.</em></>} intro="Telegram is the interface. Gmail remains the source of truth. InboxBridge coordinates the decisions between them." />
       <section className="system-section page-shell">
-        <div className="system-diagram">
+        <Reveal className="system-diagram">
           <div className="system-node system-interface"><span className="eyebrow">INTERFACE</span><strong>Telegram</strong><small>Bot API</small></div>
           <div className="system-link" aria-hidden="true"><span>INPUT</span></div>
           <div className="system-core"><span className="eyebrow">CORE ENGINE</span><strong>InboxBridge</strong><p>Intent routing, structured LLM output, trusted state, and verified delivery.</p><div className="core-parts"><span>Intent</span><span>LLM</span><span>Docs</span><span>State</span><span>Delivery</span></div></div>
           <div className="system-link" aria-hidden="true"><span>OUTPUT</span></div>
           <div className="system-node system-external"><span className="eyebrow">SOURCE OF TRUTH</span><strong>Gmail</strong><small>OAuth 2.0 / API</small></div>
-        </div>
+        </Reveal>
       </section>
-      <section className="architecture-notes page-shell"><div><span className="eyebrow">DEPLOYMENT</span><h2>Built to stay small.</h2><p>Docker and Linux VPS deployment keep the runtime portable. SQLite stores identifiers and statuses, not email bodies or attachment content.</p></div><div><span className="eyebrow">RECOVERY</span><h2>Designed to reconcile.</h2><p>Retries and restarts return to trusted state. An uncertain send is checked against Gmail before anything can be sent again.</p></div></section>
+      <Reveal className="architecture-notes page-shell"><div><span className="eyebrow">DEPLOYMENT</span><h2>Built to stay small.</h2><p>Docker and Linux VPS deployment keep the runtime portable. SQLite stores identifiers and statuses, not email bodies or attachment content.</p></div><div><span className="eyebrow">RECOVERY</span><h2>Designed to reconcile.</h2><p>Retries and restarts return to trusted state. An uncertain send is checked against Gmail before anything can be sent again.</p></div></Reveal>
     </Page>
   );
 }
