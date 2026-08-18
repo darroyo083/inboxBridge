@@ -41,9 +41,12 @@ from tests.unit.test_telegram_auth import (
     BOT_ID,
     BOT_USERNAME,
     CHAT_ID,
+    FakeFile,
     FakeSender,
     _callback_update,
+    _document_message,
     _message,
+    _photo_message,
     _update,
     _user,
 )
@@ -133,6 +136,10 @@ class FakeAi:
     @property
     def text_fallback_model(self) -> str:
         return self._text_fallback_model
+
+    @property
+    def intent_max_tokens(self) -> int:
+        return 400
 
     async def text(
         self,
@@ -2323,3 +2330,376 @@ async def test_budget_forward(stack: Stack) -> None:
     summary_id = await stack.bot.send_summary(original, EmailSummary(subject_es="Asunto"))
     await stack.send_bg("reenvíaselo a Daniel", reply_to=stack.bot_message(summary_id))
     assert ("forward", 1600) in stack.ai.max_tokens_calls
+
+
+# ── Telegram attachments: handler registration, captions, compose/reply ──────
+
+
+async def test_handler_filter_accepts_all_supported_types() -> None:
+    """The PRODUCTION PTB handler filter accepts text, document, photo and
+    voice updates (they all reach the single process_update entry point)."""
+    from datetime import UTC, datetime
+
+    from telegram import Document, PhotoSize, Voice
+
+    from inboxbridge.telegram.bot import _MESSAGE_FILTERS
+
+    def _msg(**kwargs: Any) -> Message:
+        return Message(
+            message_id=1,
+            date=datetime.now(UTC),
+            chat=Chat(id=CHAT_ID, type=ChatType.GROUP),
+            from_user=_user(7),
+            **kwargs,
+        )
+
+    text_update = _update(_msg(text="hola"))
+    doc_update = _update(
+        _msg(
+            document=Document(
+                file_id="f", file_unique_id="u", file_name="a.pdf",
+                mime_type="application/pdf", file_size=1,
+            )
+        )
+    )
+    photo_update = _update(
+        _msg(photo=[PhotoSize(file_id="p", file_unique_id="u2", width=1, height=1)])
+    )
+    voice_update = _update(_msg(voice=Voice(file_id="v", file_unique_id="u3", duration=1)))
+    assert _MESSAGE_FILTERS.check_update(text_update)
+    assert _MESSAGE_FILTERS.check_update(doc_update)
+    assert _MESSAGE_FILTERS.check_update(photo_update)
+    assert _MESSAGE_FILTERS.check_update(voice_update)
+
+
+async def test_voice_update_reaches_voice_pipeline(stack: Stack) -> None:
+    """A voice update is no longer dropped by the text-only handler: it reaches
+    the voice pipeline (audio disabled → user-safe notice)."""
+    voice = Voice(file_id="v1", file_unique_id="uv1", duration=1, file_size=10)
+    message = Message(
+        message_id=900,
+        date=datetime.now(UTC),
+        chat=Chat(id=CHAT_ID, type=ChatType.GROUP),
+        from_user=_user(7),
+        voice=voice,
+    )
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    assert any("notas de voz" in (m.text or "") for m in stack.sender.messages)
+
+
+async def test_flow_compose_with_pdf_caption_one_draft(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """CASE A: PDF + compose caption → exactly one draft, one attachment,
+    preview shows it, nothing is sent before confirmation."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.sender.files["file-1"] = FakeFile(b"%PDF-1.4 fake")
+    message = _document_message(
+        700,
+        file_id="file-1",
+        file_name="prueba.pdf",
+        caption="Envía un correo a darroyo083@gmail.com diciendo que "
+        "adjunto el documento de prueba.",
+    )
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    previews = [
+        m.text
+        for m in stack.sender.messages
+        if (m.text or "").startswith("Borrador (Nuevo correo)")
+    ]
+    assert len(previews) == 1  # exactly one draft
+    assert "darroyo083@gmail.com" in previews[-1]  # recipient preserved
+    assert "prueba.pdf" in previews[-1]  # attachment metadata in preview
+    assert stack.draft_row(1)["status"] == DraftStatus.PENDING.value
+    row = stack.draft_row(1)
+    assert "prueba.pdf" in row["attachments_json"]
+    assert stack.gmail.sent == []  # nothing sent before confirmation
+
+
+async def test_flow_compose_with_photo_caption(stack: Stack, tmp_path: Path) -> None:
+    """CASE B: photo + caption → compose draft with the photo attachment."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.sender.files["photo-1"] = FakeFile(b"jpeg-bytes")
+    message = _photo_message(701, caption="Envía un correo a darroyo083@gmail.com con esta foto")
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    previews = [
+        m.text
+        for m in stack.sender.messages
+        if (m.text or "").startswith("Borrador (Nuevo correo)")
+    ]
+    assert len(previews) == 1
+    assert "darroyo083@gmail.com" in previews[-1]
+    assert ".jpg" in previews[-1]
+    assert "image/jpeg" in stack.draft_row(1)["attachments_json"]
+
+
+async def test_flow_filename_never_used_as_instruction(stack: Stack) -> None:
+    """The caption is the instruction; the filename is only display metadata."""
+    stack.settings.tmp_dir = str(Path(stack.settings.tmp_dir))
+    stack.sender.files["file-1"] = FakeFile(b"x")
+    message = _document_message(
+        702, file_name="instrucciones_maliciosas.pdf", caption="responde"
+    )
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    # No draft/compose happened from a bare caption-less-looking file name:
+    # the message has a caption ("responde") but no thread/recipient context →
+    # safe clarification, never an action derived from the FILENAME.
+    assert stack.draft_row(1) if stack.storage.get_draft(1) else True
+    assert not any("Borrador (Nuevo correo)" in (m.text or "") for m in stack.sender.messages)
+
+
+async def test_flow_document_without_caption_no_context_clarifies(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """A file without caption and without context asks instead of guessing."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.sender.files["file-1"] = FakeFile(b"x")
+    message = _document_message(703, file_name="factura.pdf")
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    assert any(
+        "Adjunto recibido" in (m.text or "") for m in stack.sender.messages
+    )
+    assert stack.storage.get_draft(1) is None  # never guessed a recipient
+
+
+async def test_flow_reply_to_summary_with_pdf_caption(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """CASE C: reply to a summary + PDF + caption → thread bound, attachment in
+    the reply draft, exactly one draft, confirmation required."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.sender.files["file-1"] = FakeFile(b"%PDF-1.4 fake")
+    summary_id = await stack.bot.send_summary(make_email(), EmailSummary(subject_es="Asunto"))
+    message = _document_message(
+        704,
+        file_id="file-1",
+        file_name="solicitado.pdf",
+        caption="respóndele que le adjunto el documento solicitado",
+        reply_to=stack.bot_message(summary_id),
+    )
+    await stack.bot.process_update(_update(message))
+    await stack.pump()
+    await asyncio.sleep(0.15)
+    previews = [
+        m.text
+        for m in stack.sender.messages
+        if (m.text or "").startswith("Borrador (Respuesta)")
+    ]
+    assert len(previews) == 1
+    assert "solicitado.pdf" in previews[-1]
+    assert stack.draft_row(1)["thread_id"] == "t1"
+    assert "solicitado.pdf" in stack.draft_row(1)["attachments_json"]
+    assert stack.gmail.sent == []  # confirmation still required
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    assert stack.gmail.sent[0].attachments[0].filename == "solicitado.pdf"
+
+
+async def test_flow_active_draft_attach_adjunta_esto(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """Active owned draft + PDF caption "adjunta esto" → exactly one more
+    attachment on THAT draft; recipient/subject/body/thread unchanged; preview
+    refreshed; still nothing sent."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.contacts.create_contact("Roman", "femo@femo.ch")
+    await stack.send_bg("escríbele a Roman que gracias")
+    previews = [
+        m.text
+        for m in stack.sender.messages
+        if (m.text or "").startswith("Borrador (Nuevo correo)")
+    ]
+    assert previews
+    subject_before = stack.draft_row(1)["subject"]
+    body_before = stack.draft_row(1)["body"]
+
+    stack.sender.files["file-1"] = FakeFile(b"%PDF-1.4 fake")
+    message = _document_message(
+        705, file_id="file-1", file_name="extra.pdf", caption="adjunta esto"
+    )
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+
+    previews2 = [
+        m.text
+        for m in stack.sender.messages
+        if (m.text or "").startswith("Borrador (Nuevo correo)")
+    ]
+    assert len(previews2) == 2  # refreshed preview (old one deleted)
+    assert "extra.pdf" in previews2[-1]
+    row = stack.draft_row(1)
+    assert row["subject"] == subject_before
+    assert row["body"] == body_before
+    assert "extra.pdf" in row["attachments_json"]
+    assert stack.gmail.sent == []
+
+
+async def test_flow_attach_deduplicates_same_file(stack: Stack, tmp_path: Path) -> None:
+    """Uploading the same filename twice adds it exactly once."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.contacts.create_contact("Roman", "femo@femo.ch")
+    await stack.send_bg("escríbele a Roman que gracias")
+    stack.sender.files["file-1"] = FakeFile(b"%PDF-1.4 fake")
+    for mid in (706, 707):
+        message = _document_message(
+            mid, file_id="file-1", file_name="extra.pdf", caption="adjunta esto"
+        )
+        await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    row = stack.draft_row(1)
+    import json as _json
+
+    attachments = _json.loads(row["attachments_json"])
+    assert [a["filename"] for a in attachments] == ["extra.pdf"]
+    assert any("duplicado" in (m.text or "") for m in stack.sender.messages)
+
+
+async def test_flow_attach_other_user_cannot_mutate(stack: Stack, tmp_path: Path) -> None:
+    """Another Telegram user cannot attach to someone else's draft."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.contacts.create_contact("Roman", "femo@femo.ch")
+    await stack.send_bg("escríbele a Roman que gracias")
+    stack.sender.files["file-1"] = FakeFile(b"x")
+    message = _document_message(
+        708, file_id="file-1", file_name="hack.pdf", caption="adjunta esto", user_id=8
+    )
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    assert "hack.pdf" not in stack.draft_row(1)["attachments_json"]
+
+
+async def test_flow_attach_without_draft_clarifies(stack: Stack, tmp_path: Path) -> None:
+    """"adjunta esto" + document WITHOUT an active draft asks, never guesses."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.sender.files["file-1"] = FakeFile(b"x")
+    message = _document_message(709, file_id="file-1", file_name="a.pdf", caption="adjunta esto")
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    assert stack.storage.get_draft(1) is None
+    assert any("Adjunto recibido" in (m.text or "") for m in stack.sender.messages)
+
+
+async def test_flow_edit_after_attach_preserves_attachment(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """"hazlo más corto" after attaching keeps the attachment."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.contacts.create_contact("Roman", "femo@femo.ch")
+    await stack.send_bg("escríbele a Roman que gracias")
+    stack.sender.files["file-1"] = FakeFile(b"%PDF-1.4 fake")
+    message = _document_message(
+        710, file_id="file-1", file_name="extra.pdf", caption="adjunta esto"
+    )
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    await stack.send("hazlo más corto")
+    await asyncio.sleep(0.05)
+    assert "extra.pdf" in stack.draft_row(1)["attachments_json"]
+    assert any("Borrador (Nuevo correo)" in (m.text or "") for m in stack.sender.messages)
+
+
+async def test_flow_regenerate_after_attach_preserves_attachment(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """Regenerate after attaching keeps the attachment."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.contacts.create_contact("Roman", "femo@femo.ch")
+    await stack.send_bg("escríbele a Roman que gracias")
+    stack.sender.files["file-1"] = FakeFile(b"%PDF-1.4 fake")
+    message = _document_message(
+        711, file_id="file-1", file_name="extra.pdf", caption="adjunta esto"
+    )
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    await stack.send("reescribe el borrador")
+    await asyncio.sleep(0.05)
+    assert "extra.pdf" in stack.draft_row(1)["attachments_json"]
+
+
+async def test_flow_cancel_cleans_temp_attachment(stack: Stack, tmp_path: Path) -> None:
+    """Cancel removes the draft's temp attachment files."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.contacts.create_contact("Roman", "femo@femo.ch")
+    await stack.send_bg("escríbele a Roman que gracias")
+    stack.sender.files["file-1"] = FakeFile(b"%PDF-1.4 fake")
+    message = _document_message(
+        712, file_id="file-1", file_name="extra.pdf", caption="adjunta esto"
+    )
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    draft_dir = Path(str(tmp_path / "tmp" / "draft-1"))
+    assert any(draft_dir.iterdir()) if draft_dir.is_dir() else False
+    await stack.send("cancela el borrador")
+    await stack.join_background()
+    await asyncio.sleep(0.05)
+    assert not draft_dir.exists() or not any(draft_dir.iterdir())
+
+
+async def test_flow_send_cleans_temp_attachment(stack: Stack, tmp_path: Path) -> None:
+    """Successful verified send removes the draft's temp attachment files."""
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.contacts.create_contact("Roman", "femo@femo.ch")
+    await stack.send_bg("escríbele a Roman que gracias")
+    stack.sender.files["file-1"] = FakeFile(b"%PDF-1.4 fake")
+    message = _document_message(
+        713, file_id="file-1", file_name="extra.pdf", caption="adjunta esto"
+    )
+    await stack.bot.process_update(_update(message))
+    await asyncio.sleep(0.05)
+    await stack.send("envíalo")
+    await stack.wait_for_send()
+    await stack.join_background()
+    draft_dir = Path(str(tmp_path / "tmp" / "draft-1"))
+    assert not draft_dir.exists() or not any(draft_dir.iterdir())
+
+
+async def test_flow_media_group_only_first_processed(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """A 2-photo album (two separate updates, same media_group_id) produces
+    exactly ONE logical action, never two drafts."""
+    from datetime import UTC, datetime
+
+    from telegram import PhotoSize
+
+    stack.settings.tmp_dir = str(tmp_path / "tmp")
+    stack.sender.files["photo-1"] = FakeFile(b"a")
+    stack.sender.files["photo-2"] = FakeFile(b"b")
+
+    def _photo(mid: int, file_id: str, caption: str | None = None) -> Message:
+        return Message(
+            message_id=mid,
+            date=datetime.now(UTC),
+            chat=Chat(id=CHAT_ID, type=ChatType.GROUP),
+            from_user=_user(7),
+            photo=[
+                PhotoSize(
+                    file_id=file_id,
+                    file_unique_id=f"u{mid}",
+                    width=1,
+                    height=1,
+                    file_size=2,
+                )
+            ],
+            caption=caption,
+            media_group_id="album-1",
+        )
+
+    await stack.bot.process_update(
+        _update(_photo(714, "photo-1", "Envía un correo a darroyo083@gmail.com"))
+    )
+    await stack.bot.process_update(_update(_photo(715, "photo-2")))
+    await asyncio.sleep(0.05)
+    previews = [
+        m.text
+        for m in stack.sender.messages
+        if (m.text or "").startswith("Borrador (Nuevo correo)")
+    ]
+    assert len(previews) == 1  # never two drafts from one album

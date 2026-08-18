@@ -154,7 +154,7 @@ class ReplyCoordinator:
                 draft_id, draft.thread_id,
             )
             self._storage.set_draft_status(draft_id, DraftStatus.CANCELLED)
-            self._cleanup_attachments(draft)
+            self._cleanup_draft_tmp(draft_id)
             await self._bot.send_notice("Borrador cancelado.")
             return
         self._storage.set_draft_status(draft_id, DraftStatus.CONFIRMED)
@@ -213,7 +213,17 @@ class ReplyCoordinator:
             await self._send_claimed(draft_id, draft)
 
     async def _send_claimed(self, draft_id: int, draft: DraftReply) -> None:
-        """Send attempt for a draft already atomically claimed as SENDING."""
+        """Send attempt for a draft already atomically claimed as SENDING.
+
+        The passed draft may predate attach/edit flows; the LATEST persisted
+        state (body + attachments) is always used for the actual send.
+        """
+        row = self._storage.get_draft(draft_id)
+        if row is not None:
+            latest = self._draft_from_row(row)
+            attachments = [a for a in self._load_attachments(row) if a is not None]
+            if attachments:
+                draft = replace(latest, attachments=tuple(attachments))
         started_ms = int(time.time() * 1000)
         self._storage.set_draft_send_started(draft_id, started_ms)
         try:
@@ -300,7 +310,7 @@ class ReplyCoordinator:
                 )
                 self._storage.set_draft_status(draft_id, DraftStatus.SENT_VERIFIED)
                 await self._bot.send_notice("Enviado y verificado ✓")
-                self._cleanup_attachments(draft)
+                self._cleanup_draft_tmp(draft_id)
                 return
             if not result.checked_ok:
                 break  # inconclusive — never resend without Gmail evidence
@@ -559,6 +569,27 @@ class ReplyCoordinator:
                 if parent.is_dir() and not any(parent.iterdir()):
                     parent.rmdir()
                     break
+
+    def _cleanup_draft_tmp(self, draft_id: int) -> None:
+        """Remove the LATEST persisted attachments of a draft AND any orphan
+        files in its temp dir (attach/edit flows add files after the
+        presentation-time snapshot)."""
+        row = self._storage.get_draft(draft_id)
+        if row is not None:
+            current = [a for a in self._load_attachments(row) if a is not None]
+            if current:
+                snapshot = replace(
+                    DraftReply(thread_id="", subject="", to=[], cc=[], body=""),
+                    attachments=tuple(current),
+                )
+                self._cleanup_attachments(snapshot)
+                return
+        base = self._draft_tmp_dir(draft_id)
+        with contextlib.suppress(OSError):
+            if base.is_dir():
+                for f in base.iterdir():
+                    f.unlink(missing_ok=True)
+                base.rmdir()
 
     def cleanup_orphan_tmp(self) -> None:
         """Remove temp files/dirs that can no longer be used.

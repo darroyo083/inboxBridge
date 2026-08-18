@@ -17,7 +17,7 @@ from datetime import UTC
 from pathlib import Path
 from typing import Any
 
-from .models import DraftReply, DraftStatus, MessageStatus
+from .models import DraftReply, DraftStatus, MessageStatus, OutgoingAttachment
 
 
 class Storage:
@@ -334,6 +334,31 @@ class Storage:
         self._conn.execute(
             "UPDATE drafts SET body = ?, updated_at = ? WHERE id = ?",
             (body, now, draft_id),
+        )
+        self._conn.commit()
+
+    def set_draft_attachments(
+        self, draft_id: int, attachments: tuple[OutgoingAttachment, ...]
+    ) -> None:
+        """Persist attachment metadata for an existing draft (binaries never
+        stored; temp paths are derived from the draft id at load time)."""
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        attachments_json = json.dumps(
+            [
+                {
+                    "filename": a.filename,
+                    "mime_type": a.mime_type,
+                    "size_bytes": a.size_bytes,
+                }
+                for a in attachments
+            ]
+        )
+        self._conn.execute(
+            "UPDATE drafts SET attachments_json = ?, updated_at = ? WHERE id = ?",
+            (attachments_json, now, draft_id),
         )
         self._conn.commit()
 

@@ -751,6 +751,7 @@ class EmailAssistant:
             to=[EmailAddress(contact["display_name"], contact["email"])],
             cc=[],
             body=body,
+            attachments=tuple(payload.get("attachments") or ()),
         )
         await self._present_new_draft(draft, user_id=user_id)
 
@@ -858,6 +859,13 @@ class EmailAssistant:
         display_match = _re.search(r"<([^<>@\s]+@[^<>\s]+)>", phrase)
         if display_match:
             phrase = display_match.group(1)
+        # The phrase may carry trailing words after the address (e.g. a photo
+        # caption "a alguien@gmail.com con esta foto"): the FIRST bare email
+        # in the phrase is the deterministic recipient (still shown in the
+        # preview before anything can be sent).
+        email_match = _re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", phrase)
+        if email_match:
+            phrase = email_match.group(0)
         # Bare valid email → direct destination (still shown in preview).
         from .contacts import validate_email
 

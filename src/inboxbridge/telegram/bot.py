@@ -58,7 +58,7 @@ import re
 import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -469,6 +469,13 @@ def _split_original(text: str) -> list[str]:
     return chunks
 
 
+#: Production message-handler filter: every supported message type reaches the
+#: SINGLE ``process_update`` entry point (text, documents, photos, voice).
+_MESSAGE_FILTERS = (
+    filters.TEXT | filters.Document.ALL | filters.PHOTO | filters.VOICE
+)
+
+
 class TelegramBot(TelegramNotifier):
     def __init__(
         self,
@@ -502,6 +509,9 @@ class TelegramBot(TelegramNotifier):
         self._pending_replies: dict[int, tuple[int, str, str]] = {}
         #: user_id -> pending multi-step UI state (compose, contact ops)
         self._pending_flows: dict[int, dict[str, Any]] = {}
+        #: media_group_id -> seen-at timestamp: only the first member of a
+        #: Telegram album is processed (bounded, in-memory).
+        self._seen_media_groups: dict[str, float] = {}
         self._application: Application[Any, Any, Any, Any, Any, Any] | None = None
         self._started = False
 
@@ -551,7 +561,10 @@ class TelegramBot(TelegramNotifier):
             self._bot_user_id = me.id
             self._bot_username = me.username
         application = Application.builder().bot(cast(Bot, sender)).build()
-        application.add_handler(MessageHandler(filters.TEXT, self._on_message))
+        # Every supported message type must reach the SINGLE process_update
+        # entry point (it already handles text, document, photo and voice).
+        # Text-only registration meant documents/photos/voice never arrived.
+        application.add_handler(MessageHandler(_MESSAGE_FILTERS, self._on_message))
         application.add_handler(CallbackQueryHandler(self._on_callback_query, pattern=_CALLBACK_RE))
         await application.initialize()
         await application.start()
@@ -730,7 +743,28 @@ class TelegramBot(TelegramNotifier):
             await self._handle_voice(message, user.id)
             return
 
+        # Media groups (albums) arrive as several separate updates. Only the
+        # FIRST member of a group is processed: a multi-photo album can never
+        # create several drafts/actions from one intended action. Single
+        # documents/photos (the supported cases) have no media_group_id.
+        media_group_id = getattr(message, "media_group_id", None)
+        if media_group_id:
+            if media_group_id in self._seen_media_groups:
+                return  # already handled this album
+            self._seen_media_groups[media_group_id] = time.time()
+            self._prune_media_groups()
+
         text = message.text or message.caption or ""
+
+        # Active owned draft + Telegram file(s): attach to THAT draft only —
+        # never a second draft; recipient/subject/body/thread/attachments are
+        # preserved; the preview is re-rendered with a bumped draft version.
+        if (
+            self._active_pending_for(user.id) is not None
+            and (message.document is not None or message.photo)
+            and await self._attach_to_active_draft(message, user.id)
+        ):
+            return
 
         # Multi-step UI flows (compose recipient/instruction, contact inputs,
         # candidate selection, draft edit mode) take precedence.
@@ -792,7 +826,21 @@ class TelegramBot(TelegramNotifier):
             # "escribe a Roman…", "recuérdame…", contact management).
             if self._action_callback is not None and text.strip():
                 await self._dispatch_intent(
-                    text, thread_id="", tg_message_id=0, user_id=user.id
+                    text,
+                    thread_id="",
+                    tg_message_id=0,
+                    user_id=user.id,
+                    message=message,
+                )
+                return
+            # A file without any instruction and without conversational
+            # context must never guess a recipient/thread — ask instead.
+            if message.document is not None or message.photo:
+                await self.send_notice(
+                    "Adjunto recibido. Dime qué quieres que haga con él, por "
+                    "ejemplo: «Envía un correo a … adjuntando esto», responde a "
+                    "un resumen con el adjunto, o «adjúntalo» si tienes un "
+                    "borrador activo."
                 )
             return
 
@@ -900,6 +948,15 @@ class TelegramBot(TelegramNotifier):
                     "Tienes un borrador pendiente. Puedes decir: «envíalo», "
                     "«cancela el borrador», «hazlo más corto»… o editar el texto."
                 )
+            elif message is not None and (message.document is not None or message.photo):
+                # A file without a recognizable instruction must never guess a
+                # recipient/thread — ask instead.
+                await self.send_notice(
+                    "Adjunto recibido. Dime qué quieres que haga con él, por "
+                    "ejemplo: «Envía un correo a … adjuntando esto», responde a "
+                    "un resumen con el adjunto, o «adjúntalo» si tienes un "
+                    "borrador activo."
+                )
             else:
                 await self._send("No te he entendido del todo. ¿Qué quieres que haga?")
             return
@@ -915,6 +972,18 @@ class TelegramBot(TelegramNotifier):
         if action in (IntentAction.MODIFY_DRAFT, IntentAction.REGENERATE_DRAFT):
             await self._edit_draft_via_text(user_id, text, action)
             return
+
+        # Same-message compose with Telegram files: the caption is the
+        # instruction and the attachments travel in the payload (single
+        # download, single draft).
+        if (
+            action == IntentAction.COMPOSE_NEW_EMAIL
+            and message is not None
+            and (message.document is not None or message.photo)
+        ):
+            attachments = await self._collect_outgoing_attachments(message)
+            if attachments:
+                payload["attachments"] = attachments
 
         # Reply intent (rules-first, but the LLM may still classify it): the
         # classic reply flow when bound to a thread; otherwise resolve "al
@@ -1529,6 +1598,7 @@ class TelegramBot(TelegramNotifier):
         ``outgoing_attachment_max_bytes`` each. Violations reject the whole
         batch with a notice; filenames are sanitized to display metadata only.
         """
+        kind = "document" if message.document is not None else "photo" if message.photo else "none"
         entries: list[tuple[str, str, int, str]] = []
         if message.document is not None:
             doc = message.document
@@ -1548,12 +1618,14 @@ class TelegramBot(TelegramNotifier):
         max_count = self._settings.outgoing_attachment_max_count
         max_bytes = self._settings.outgoing_attachment_max_bytes
         if len(entries) > max_count:
+            logger.info("telegram_attachment type=%s count=%d outcome=rejected", kind, len(entries))
             await self.send_notice(
                 f"Demasiados adjuntos (máximo {max_count}); no los añado. Vuelve a intentarlo."
             )
             return ()
         oversized = [name for name, _, size, _ in entries if size > max_bytes]
         if oversized:
+            logger.info("telegram_attachment type=%s count=%d outcome=rejected", kind, len(entries))
             await self.send_notice(
                 f"Adjunto demasiado grande (máximo {max_bytes // (1024 * 1024)} MB); "
                 "no los añado: "
@@ -1569,6 +1641,11 @@ class TelegramBot(TelegramNotifier):
                 await asyncio.to_thread(file.download, target)  # type: ignore[attr-defined]
             except Exception:
                 logger.exception("downloading telegram attachment %s failed", name)
+                logger.info(
+                    "telegram_attachment type=%s count=%d outcome=rejected",
+                    kind,
+                    len(entries),
+                )
                 for r in results:
                     _remove_file(r.path)
                 await self.send_notice("No pude descargar un adjunto; vuelve a intentarlo.")
@@ -1591,7 +1668,81 @@ class TelegramBot(TelegramNotifier):
                     filename=name, mime_type=mime, size_bytes=actual_size, path=str(target)
                 )
             )
+        logger.info(
+            "telegram_attachment type=%s count=%d outcome=accepted",
+            kind,
+            len(results),
+        )
         return tuple(results)
+
+    def _prune_media_groups(self) -> None:
+        """Drop media-group bookkeeping older than the flow TTL (bounded)."""
+        cutoff = time.time() - _FLOW_TTL_SECONDS
+        stale = [g for g, seen in self._seen_media_groups.items() if seen < cutoff]
+        for group in stale:
+            self._seen_media_groups.pop(group, None)
+
+    async def _attach_to_active_draft(self, message: Message, user_id: int) -> bool:
+        """Attach a Telegram file to the user's ACTIVE draft (no second draft).
+
+        Preserves recipient/subject/body/thread and existing attachments,
+        deduplicates by sanitized filename, claims the file into the draft's
+        temp dir (deterministic ``NN_name`` convention, same as the responder)
+        and re-renders the preview with a bumped draft version. Ownership is
+        per Telegram user; stale-preview protection is untouched.
+        """
+        pending = self._active_pending_for(user_id)
+        if pending is None or pending.draft_id == 0:
+            return False
+        attachments = await self._collect_outgoing_attachments(message)
+        if not attachments:
+            return False
+        existing = list(pending.draft.attachments)
+        existing_names = {a.filename for a in existing}
+        added = [a for a in attachments if a.filename not in existing_names]
+        skipped = len(attachments) - len(added)
+        if added:
+            target_dir = Path(self._settings.tmp_dir) / f"draft-{pending.draft_id}"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            claimed: list[OutgoingAttachment] = []
+            for index, attachment in enumerate(added, start=len(existing)):
+                source = Path(attachment.path)
+                target = target_dir / f"{index + 1:02d}_{attachment.filename}"
+                try:
+                    if source != target and source.is_file():
+                        source.replace(target)
+                except OSError:
+                    _remove_file(str(source))
+                    continue
+                claimed.append(
+                    OutgoingAttachment(
+                        filename=attachment.filename,
+                        mime_type=attachment.mime_type,
+                        size_bytes=attachment.size_bytes,
+                        path=str(target),
+                    )
+                )
+            if claimed:
+                updated = replace(
+                    pending.draft,
+                    attachments=tuple(existing) + tuple(claimed),
+                )
+                self._storage.set_draft_attachments(pending.draft_id, updated.attachments)
+                await self.apply_draft_edit(pending.draft_id, updated)
+                logger.info(
+                    "telegram_attachment type=attach outcome=accepted draft=%d count=%d",
+                    pending.draft_id,
+                    len(claimed),
+                )
+                await self.send_notice(
+                    "Adjunto añadido al borrador: "
+                    + ", ".join(a.filename for a in claimed)
+                )
+            else:
+                await self.send_notice("No pude añadir el adjunto al borrador.")
+        if skipped:
+            await self.send_notice("Adjunto duplicado; no lo añado de nuevo.")
+        return True
 
     def _outgoing_tmp_path(self, filename: str) -> Path:
         """Unique temp path for one outgoing attachment (safe, no traversal)."""

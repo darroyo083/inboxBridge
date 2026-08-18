@@ -1146,6 +1146,7 @@ def _photo_message(
     chat_id: int = CHAT_ID,
     user_id: int = 7,
     reply_to: Message | None = None,
+    caption: str | None = None,
 ) -> Message:
     photo = PhotoSize(
         file_id="photo-1",
@@ -1160,6 +1161,7 @@ def _photo_message(
         chat=Chat(id=chat_id, type=ChatType.GROUP),
         from_user=_user(user_id),
         photo=[photo],
+        caption=caption,
         reply_to_message=reply_to,
     )
 
