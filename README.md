@@ -1,8 +1,9 @@
 # InboxBridge
 
-Self-hosted email assistant that connects your Gmail **Primary** inbox with a
-private Telegram group. **Natural language first**: no slash commands needed —
-talk to it like a person.
+InboxBridge is a self-hosted AI Gmail assistant controlled through Telegram.
+The live landing is [inboxbridge.dev](https://inboxbridge.dev). It uses AI to
+understand email threads and attachments, produce multilingual summaries and
+drafts, and require explicit confirmation before sending.
 
 - New Gmail emails (Primary tab) → LLM → natural **Spanish** summary → your
   private Telegram group.
@@ -72,8 +73,8 @@ RUN_REAL_LLM=1 pytest -m real_llm   # opt-in REAL AI validation (synthetic conte
 13. Delivery is reconciled against Gmail; success is shown only after verification.
 14. Ambiguous send failures are resolved by reconciliation, never by blind resend.
 15. New emails and forwards use the SAME verified-delivery pipeline.
-16. Contacts/aliases managed from Telegram (e.g. "cuando diga Roman usa femo@femo.ch");
-    the LLM never invents an address; ambiguous recipients always ask.
+16. Contacts/aliases managed from Telegram; the LLM never invents an address and
+    ambiguous recipients always ask.
 17. Telegram documents/photos attach to replies; Gmail attachments come to Telegram.
 18. Reminders survive restarts, fire once, and are cancelable.
 19. Scanned PDFs and images are read by the external vision model (no local OCR).

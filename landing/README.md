@@ -1,6 +1,10 @@
 # InboxBridge Landing
 
-Public static landing experience for InboxBridge, implemented from the Stitch
+Public static landing experience for the self-hosted AI Gmail assistant
+InboxBridge, controlled through Telegram. Live at
+[inboxbridge.dev](https://inboxbridge.dev).
+
+Implemented from the Stitch
 screen `2e95e801d7ba476aa9e520ad7493ce28` in project
 `15616762419389439509`.
 
