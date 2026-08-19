@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <rect width="1200" height="630" fill="#0a0a0a"/>
+  <path d="M0 48h1200M0 96h1200M0 144h1200M0 192h1200M0 240h1200M0 288h1200M0 336h1200M0 384h1200M0 432h1200M0 480h1200M0 528h1200M0 576h1200" stroke="#1b1b1b"/>
+  <path d="M48 0v630M96 0v630M144 0v630M192 0v630M240 0v630M288 0v630M336 0v630M384 0v630M432 0v630M480 0v630M528 0v630M576 0v630M624 0v630M672 0v630M720 0v630M768 0v630M816 0v630M864 0v630M912 0v630M960 0v630M1008 0v630M1056 0v630M1104 0v630M1152 0v630" stroke="#1b1b1b"/>
+  <text x="72" y="128" fill="#f5f5f5" font-family="Arial, sans-serif" font-size="22" letter-spacing="5">INBOXBRIDGE</text>
+  <text x="72" y="270" fill="#f5f5f5" font-family="Arial, sans-serif" font-size="82" font-weight="600">Your inbox,</text>
+  <text x="72" y="360" fill="#f5f5f5" font-family="Arial, sans-serif" font-size="82" font-weight="600">conversational.</text>
+  <text x="72" y="444" fill="#a3a3a3" font-family="monospace" font-size="18">GMAIL API  /  TELEGRAM BOT API  /  EXPLICIT CONFIRMATION</text>
+</svg>
