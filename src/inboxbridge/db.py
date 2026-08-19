@@ -17,7 +17,7 @@ from datetime import UTC
 from pathlib import Path
 from typing import Any
 
-from .models import DraftReply, DraftStatus, MessageStatus
+from .models import DraftReply, DraftStatus, MessageStatus, OutgoingAttachment
 
 
 class Storage:
@@ -130,6 +130,9 @@ class Storage:
         self._ensure_column("drafts", "send_started_at", "REAL")
         self._ensure_column("drafts", "verification_attempts", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("drafts", "attachments_json", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("drafts", "forward_of", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("drafts", "telegram_token", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("drafts", "telegram_message_id", "INTEGER NOT NULL DEFAULT 0")
 
     def _ensure_column(self, table: str, column: str, ddl: str) -> None:
         """Idempotent ALTER TABLE ADD COLUMN for pre-existing databases.
@@ -250,6 +253,23 @@ class Storage:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def latest_incoming_message(self) -> dict[str, Any] | None:
+        """The most recent INCOMING message fully processed by InboxBridge.
+
+        Only messages that were successfully summarized and posted to Telegram
+        (status ``sent_telegram``) are eligible — this excludes our own sent
+        messages (those live in ``drafts``, never ``messages``), failed rows
+        and never-processed history. Used to resolve "al último correo" to a
+        concrete, immutable thread target.
+        """
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT * FROM messages WHERE status = ? "
+            "ORDER BY created_at DESC, history_id DESC LIMIT 1",
+            (MessageStatus.SENT_TELEGRAM.value,),
+        ).fetchone()
+        return dict(row) if row else None
+
     # ── drafts ──────────────────────────────────────────────────────────────
     def create_draft(
         self,
@@ -284,12 +304,12 @@ class Storage:
             """
             INSERT INTO drafts(thread_id, message_id, body, to_json, subject,
                                status, telegram_user_id, attachments_json,
-                               created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               forward_of, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (thread_id, message_id, reply.body, to_json, reply.subject,
              DraftStatus.PENDING.value, telegram_user_id, attachments_json,
-             now, now),
+             reply.forward_of, now, now),
         )
         self._conn.commit()
         lastrowid = cur.lastrowid
@@ -308,6 +328,28 @@ class Storage:
         )
         self._conn.commit()
 
+    def set_draft_telegram(self, draft_id: int, token: str, message_id: int) -> None:
+        """Persist the Telegram preview identity so a draft callback survives
+        restart: the callback token can be resolved back to the draft row."""
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        self._conn.execute(
+            "UPDATE drafts SET telegram_token = ?, telegram_message_id = ?, updated_at = ? "
+            "WHERE id = ?",
+            (token, message_id, now, draft_id),
+        )
+        self._conn.commit()
+
+    def get_draft_by_token(self, token: str) -> dict[str, Any] | None:
+        """Resolve a Telegram callback token to its persisted draft row."""
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT * FROM drafts WHERE telegram_token = ?", (token,)
+        ).fetchone()
+        return dict(row) if row else None
+
     def set_draft_body(self, draft_id: int, body: str) -> None:
         """Update the persisted draft body after an edit (retry coherence)."""
         assert self._conn is not None
@@ -317,6 +359,31 @@ class Storage:
         self._conn.execute(
             "UPDATE drafts SET body = ?, updated_at = ? WHERE id = ?",
             (body, now, draft_id),
+        )
+        self._conn.commit()
+
+    def set_draft_attachments(
+        self, draft_id: int, attachments: tuple[OutgoingAttachment, ...]
+    ) -> None:
+        """Persist attachment metadata for an existing draft (binaries never
+        stored; temp paths are derived from the draft id at load time)."""
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        attachments_json = json.dumps(
+            [
+                {
+                    "filename": a.filename,
+                    "mime_type": a.mime_type,
+                    "size_bytes": a.size_bytes,
+                }
+                for a in attachments
+            ]
+        )
+        self._conn.execute(
+            "UPDATE drafts SET attachments_json = ?, updated_at = ? WHERE id = ?",
+            (attachments_json, now, draft_id),
         )
         self._conn.commit()
 

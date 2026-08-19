@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import itertools
 import logging
 import random
 from collections.abc import Awaitable, Callable
@@ -19,6 +20,38 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 _R = TypeVar("_R", bound=Callable[..., Awaitable[Any]])
+
+
+def alternate_text_models(
+    primary: str, fallback: str | None, *, task: str
+) -> Callable[[], str | None]:
+    """Model for each logical attempt of ONE operation: primary, fallback,
+    primary, ... (returns ``None`` = primary).
+
+    The outer bounded retry loop keeps its EXACT call budget — no retry
+    multiplication — while gaining model diversity on technical failures:
+    attempt 1 uses the primary model, attempt 2 (a retry) uses the configured
+    fallback model, attempt 3 the primary again, and so on.
+
+    Fallback is a resilience mechanism, never a quality/judging switch: it
+    only matters because the retry was already triggered by a technical
+    failure. Disabled (empty fallback or equal to primary) → primary on every
+    attempt, exactly like today.
+    """
+    if not fallback or fallback == primary:
+        return lambda: None
+    counter = itertools.count()
+
+    def _next() -> str | None:
+        attempt = next(counter)
+        if attempt % 2 == 1:
+            logger.info(
+                "text_fallback task=%s fallback_used=true model=%s", task, fallback
+            )
+            return fallback
+        return None
+
+    return _next
 
 
 class LLMError(Exception):
@@ -46,13 +79,35 @@ class LLMEmptyResponse(LLMInvalidResponse):
     """
 
 
+class LLMIncompleteResponse(LLMError):
+    """Provider answered with non-empty but TRUNCATED/incomplete content
+    (``finish_reason=length`` or an obviously dangling ending).
+
+    A sendable draft must never be built from such content: it is retryable
+    (the same request may complete on a later attempt).
+    """
+
+
+class StructuredOutputError(LLMError):
+    """Provider answered but the structured contract (JSON) did not parse.
+
+    Retryable: the SAME generation may produce a parseable contract on a
+    later attempt. Provider metadata (``finish_reason=stop``) alone is NOT
+    proof of a usable structured response — this error also covers
+    ``finish_reason=stop`` output that is syntactically broken. The raw
+    output must never be shown to the user.
+    """
+
+
 class LLMUnsupportedModality(LLMError):
     """Provider rejected the request on technical grounds (unsupported
     modality, bad format). Fallback-worthy: a different model may accept it."""
 
 
 def _default_retryable(exc: BaseException) -> bool:
-    return isinstance(exc, LLMRateLimited | LLMUnavailable | LLMEmptyResponse)
+    return isinstance(
+        exc, LLMRateLimited | LLMUnavailable | LLMEmptyResponse | LLMIncompleteResponse
+    )
 
 
 def _backoff_delay(attempt: int, base_backoff: float, max_backoff: float) -> float:

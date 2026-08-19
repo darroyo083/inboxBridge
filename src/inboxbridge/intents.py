@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from .llm.base import LLMError
+from .llm.base import LLMError, alternate_text_models, call_with_retry
 from .llm.prompts import UNTRUSTED_DATA_END, UNTRUSTED_DATA_START, _seal
 
 # ── action vocabulary ────────────────────────────────────────────────────────
@@ -113,11 +113,18 @@ _CANCEL_DRAFT = re.compile(
     re.IGNORECASE,
 )
 _EDIT = re.compile(
-    r"\b(hazlo m[aá]s corto|m[aá]s corto|hazlo m[aá]s formal|m[aá]s formal|"
-    r"hazlo m[aá]s amable|m[aá]s amable|m[aá]s educado|m[aá]s cordial|"
-    r"hazlo m[aá]s pol[ií]tico|ed[ií]talo y|ed[ií]talo|pon que|ponle que|"
-    r"cambia (el|la|lo|las|los)|a[nñ]ade (que|la|el|lo)|quita (el|la|lo|las|los)|"
-    r"no, mejor|mejor dile|en su lugar dile|dile mejor)\b",
+    r"\b("
+    # Length/tone modifiers — a modifier is required ("más largo", "mucho más
+    # corto", "hazlo muy breve"...), optionally with a verb prefix.
+    r"(?:hazlo |ponlo |d[eé]jalo |h[aá]zlo )?"
+    r"(?:un poco |mucho |muy |m[aá]s |menos )"
+    r"(?:largo|corto|breve|formal|informal|cercano|amable|directo|profesional|"
+    r"educado|cordial|pol[ií]tico)"
+    # Existing verb forms.
+    r"|ed[ií]talo y|ed[ií]talo|pon que|ponle que"
+    r"|cambia (el|la|lo|las|los)|a[nñ]ade (que|la|el|lo)|quita (el|la|lo|las|los)"
+    r"|no, mejor|mejor dile|en su lugar dile|dile mejor"
+    r")\b",
     re.IGNORECASE,
 )
 _REGENERATE = re.compile(
@@ -155,14 +162,35 @@ _ARCHIVE = re.compile(
     re.IGNORECASE,
 )
 _FORWARD = re.compile(
-    r"\b(reenv[ií]aselo a|reenv[ií]a este correo a|reenv[ií]a(lo)? a|"
-    r"reenv[ií]aselo|m[aá]ndaselo a)\b",
+    r"\b("
+    r"reenv[ií]aselo a|reenv[ií]a este correo a|reenv[ií]a(lo)? a|"
+    r"reenv[ií]aselo|m[aá]ndaselo a|"
+    r"forward this email to|forward this (?:one|message|mail|e-?mail) to|"
+    r"forward it to|forward it\b"
+    r")\b",
     re.IGNORECASE,
 )
 _COMPOSE = re.compile(
-    r"\b(escr[ií]be a |escr[ií]bele a |manda un correo a |m[aá]ndale un correo a |"
-    r"nuevo correo (para|a) |redacta un correo a |escr[ií]be un correo a |"
-    r"manda un mail a |escr[ií]be un mail a )",
+    r"\b("
+    # verb + [un/el] + object (correo/email/mail), optional "a <recipient>"
+    r"(?:env[ií]a|manda|escr[ií]be|redacta) (?:un |el )?(?:correo|email|mail)(?: a )?"
+    # verb + "a <recipient>" (no object)
+    r"|(?:env[ií]a|manda|escr[ií]be|redacta) a "
+    # existing object forms
+    r"|m[aá]ndale un (?:correo|mail) a |escr[ií]bele a "
+    r"|nuevo correo (?:para|a) "
+    r")",
+    re.IGNORECASE,
+)
+_REPLY = re.compile(
+    r"\b(resp[oó]ndele|respondele|resp[oó]nde|responde|"
+    r"cont[eé]stale|contestale|cont[eé]sta|contesta|dile que)\b",
+    re.IGNORECASE,
+)
+#: References to "the latest incoming email" (a slot value, not an intent).
+_LATEST = re.compile(
+    r"\b(al (?:último|ultimo)(?: correo| email| mensaje)?(?: recibido| entrante)?"
+    r"|al correo m[aá]s reciente)\b",
     re.IGNORECASE,
 )
 _REMINDER = re.compile(
@@ -235,9 +263,32 @@ def _extract_after(text: str, pattern: re.Pattern[str]) -> str:
     end = match.end()
     rest = text[end:].strip()
     # Trim trailing punctuation/connectors that are not part of the target.
-    connectors = r"\b(y dile|y cu[eé]ntale|y dile que|que| por favor| gracias| pls)\b"
-    rest = re.split(connectors, rest, maxsplit=1)[0]
+    connectors = (
+        r"\b(y dile|y cu[eé]ntale|y dile que|dici[eé]ndole que|diciendo que|"
+        r"dici[eé]ndole|diciendo|que| por favor| gracias| pls|"
+        r"con (?:su |el |la |los |las |este |esta |esto |eso |ese |un |una )?"
+        r"(?:pdf|adjuntos?|adjunta|adjunto|archivo|archivos|documento|fotos?|"
+        r"im[aá]genes?)(?: adjuntos?| adjuntas?| adjunto)?)\b"
+    )
+    rest = re.split(connectors, rest, maxsplit=1, flags=re.IGNORECASE)[0]
     return rest.strip(" .,;:!?¿¡")
+
+
+def has_latest_reference(text: str) -> bool:
+    """Whether the phrase references "the latest incoming email"."""
+    return _LATEST.search(text) is not None
+
+
+def strip_latest_reference(text: str) -> str:
+    """Remove the "latest email" reference from a reply instruction.
+
+    Returns the instruction with the target reference (and any dangling "al")
+    removed, so the reply instruction passed to the draft flow describes only
+    the reply content — never a dynamic target.
+    """
+    stripped = _LATEST.sub(" ", text)
+    stripped = re.sub(r"\bal\b", " ", stripped, flags=re.IGNORECASE)
+    return " ".join(stripped.split()).strip(" .,;:!?¿¡")
 
 
 def _rule_classify(text: str) -> _RuleResult:
@@ -305,7 +356,7 @@ def _rule_classify(text: str) -> _RuleResult:
     if _LIST_REMINDERS.search(stripped):
         return _RuleResult(IntentAction.LIST_REMINDERS, explicit=False)
 
-    # Compose / forward.
+    # Compose / forward / reply.
     if _FORWARD.search(stripped):
         recipient = _extract_after(stripped, _FORWARD)
         return _RuleResult(
@@ -320,6 +371,15 @@ def _rule_classify(text: str) -> _RuleResult:
             explicit=False,
             payload={"recipient": target, "instruction": stripped},
         )
+    if _REPLY.search(stripped):
+        # Deterministic reply intent ("respóndele que…", "dile que…"): never
+        # depends on an LLM classification, so a transient empty LLM response
+        # cannot break this UX.
+        return _RuleResult(
+            IntentAction.REPLY_TO_EMAIL,
+            explicit=False,
+            payload={"instruction": stripped},
+        )
 
     # Questions / attachments / summaries.
     if _ATTACHMENT.search(stripped):
@@ -329,9 +389,17 @@ def _rule_classify(text: str) -> _RuleResult:
             payload={"instruction": stripped},
         )
     if _ASK.search(stripped):
-        return _RuleResult(IntentAction.ASK_ABOUT_EMAIL, explicit=False)
+        return _RuleResult(
+            IntentAction.ASK_ABOUT_EMAIL,
+            explicit=False,
+            payload={"instruction": stripped},
+        )
     if _THREAD_SUMMARY.search(stripped):
-        return _RuleResult(IntentAction.SUMMARIZE_THREAD, explicit=False)
+        return _RuleResult(
+            IntentAction.SUMMARIZE_THREAD,
+            explicit=False,
+            payload={"instruction": stripped},
+        )
 
     # Draft editing / regeneration.
     if _REGENERATE.search(stripped):
@@ -346,6 +414,16 @@ def _rule_classify(text: str) -> _RuleResult:
 
 
 # ── LLM fallback ─────────────────────────────────────────────────────────────
+
+
+def is_thread_summary_request(text: str) -> bool:
+    """Deterministic rules-first check for thread-summary phrases (no LLM).
+
+    Used to route natural "resume este hilo" phrases to SUMMARIZE_THREAD even
+    inside flows that would otherwise force another action (e.g. the
+    "Preguntar" button).
+    """
+    return bool(_THREAD_SUMMARY.search(text.strip()))
 
 
 def _llm_classify_messages(text: str, context: str) -> list[dict[str, str]]:
@@ -459,11 +537,25 @@ class IntentClassifier:
             return intent
         if not allow_llm or self._ai is None:
             return intent
+        ai = self._ai
         try:
-            content = await self._ai.text(
-                _llm_classify_messages(text, context),
-                max_tokens=150,
+            # Bounded 2-attempt loop: primary model, then the configured
+            # fallback model on technical failures (same provider). Rules
+            # already handled deterministically above and never reach here.
+            models = alternate_text_models(
+                ai.text_model,
+                ai.text_fallback_model,
                 task="intent",
+            )
+            content = await call_with_retry(
+                lambda: ai.text(
+                    _llm_classify_messages(text, context),
+                    max_tokens=ai.intent_max_tokens,
+                    task="intent",
+                    model=models(),
+                ),
+                max_attempts=2,
+                base_backoff=0.5,
             )
         except LLMError:
             return Intent(action=IntentAction.UNKNOWN, confidence=0.2, source="llm")

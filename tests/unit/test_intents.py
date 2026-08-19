@@ -5,7 +5,13 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from inboxbridge.intents import Intent, IntentAction, IntentClassifier
+from inboxbridge.intents import (
+    Intent,
+    IntentAction,
+    IntentClassifier,
+    has_latest_reference,
+    strip_latest_reference,
+)
 
 
 def classify_rule(text: str) -> Intent:
@@ -41,6 +47,33 @@ class TestRuleBasics:
         assert classify_rule("hazlo más formal").action == IntentAction.MODIFY_DRAFT
         assert classify_rule("cambia las 18:00 por las 19:00").action == IntentAction.MODIFY_DRAFT
         assert classify_rule("reescríbelo").action == IntentAction.REGENERATE_DRAFT
+
+    def test_edit_length_tone_modifiers_rules_first(self) -> None:
+        """Common edit language must classify rules-first (no LLM intent call)."""
+        for phrase in (
+            "más largo",
+            "mas largo",
+            "hazlo más largo",
+            "hazlo mas largo",
+            "mucho más largo",
+            "un poco más largo",
+            "más corto",
+            "mas corto",
+            "hazlo más corto",
+            "un poco más corto",
+            "muy corto",
+            "hazlo muy breve",
+            "más formal",
+            "menos formal",
+            "más informal",
+            "más cercano",
+            "más amable",
+            "más directo",
+            "más profesional",
+        ):
+            intent = classify_rule(phrase)
+            assert intent.action == IntentAction.MODIFY_DRAFT, phrase
+            assert not intent.explicit
 
     def test_questions_and_summaries(self) -> None:
         assert classify_rule("¿qué me está pidiendo?").action == IntentAction.ASK_ABOUT_EMAIL
@@ -94,6 +127,72 @@ class TestRuleBasics:
         assert intent.action == IntentAction.FORWARD_EMAIL
         assert intent.payload.get("recipient", "").lower() == "daniel"
 
+        # The audit phrases must all route to FORWARD (never COMPOSE/REPLY).
+        for phrase in (
+            "reenvíalo a x",
+            "reenvía este correo a x",
+            "reenvía este correo a x con su PDF adjunto",
+            "forward this email to x",
+            "forward it to x",
+            "reenvía este correo a darroyo083@gmail.com con su adjunto",
+        ):
+            intent = classify_rule(phrase)
+            assert intent.action == IntentAction.FORWARD_EMAIL, phrase
+            recipient = intent.payload.get("recipient", "")
+            assert recipient, phrase
+            assert "adjunto" not in recipient.casefold(), phrase
+            assert "pdf" not in recipient.casefold(), phrase
+
+    def test_compose_verbs_rules_first(self) -> None:
+        for phrase in (
+            "envía un correo",
+            "manda un correo",
+            "escribe un correo",
+            "envía un email",
+            "manda un email",
+            "escribe un email",
+        ):
+            intent = classify_rule(phrase)
+            assert intent.action == IntentAction.COMPOSE_NEW_EMAIL, phrase
+
+    def test_compose_with_recipient_and_instruction(self) -> None:
+        intent = classify_rule("envía un correo a user@example.com")
+        assert intent.action == IntentAction.COMPOSE_NEW_EMAIL
+        assert intent.payload.get("recipient", "").lower() == "user@example.com"
+
+        intent = classify_rule(
+            "envía un correo a user@example.com diciendo que mañana llego tarde"
+        )
+        assert intent.action == IntentAction.COMPOSE_NEW_EMAIL
+        assert intent.payload.get("recipient", "").lower() == "user@example.com"
+
+    def test_latest_reference_detection(self) -> None:
+        for phrase in ("al último", "al último correo", "al último correo recibido",
+                       "al último email", "al correo más reciente"):
+            assert has_latest_reference(phrase), phrase
+        assert not has_latest_reference("respóndele que gracias")
+
+    def test_strip_latest_reference(self) -> None:
+        assert strip_latest_reference(
+            "respóndele que gracias al último correo recibido"
+        ) == "respóndele que gracias"
+        assert strip_latest_reference(
+            "respóndele al último correo que muchas gracias"
+        ) == "respóndele que muchas gracias"
+
+    def test_reply_intent_is_rule_based(self) -> None:
+        # "respóndele…" / "dile que…" resolve deterministically (rules-first),
+        # so a transient empty LLM response can never break this UX.
+        for phrase in (
+            "respóndele que sí",
+            "respóndele que el viernes sí puedo",
+            "dile que mañana estaré allí a las 14:30",
+            "contéstale que sí",
+        ):
+            intent = classify_rule(phrase)
+            assert intent.action == IntentAction.REPLY_TO_EMAIL
+            assert not intent.explicit  # generates a draft, never a blind send
+
     def test_help_and_unknown(self) -> None:
         assert classify_rule("ayuda").action == IntentAction.HELP
         assert classify_rule("hola que tal").action == IntentAction.UNKNOWN
@@ -109,9 +208,30 @@ class FakeAi:
     def __init__(self, content: str) -> None:
         self._content = content
         self.calls = 0
+        self.max_tokens_used: list[int] = []
 
-    async def text(self, messages: list[Any], *, max_tokens: int, task: str) -> str:
+    @property
+    def text_model(self) -> str:
+        return "primary-model"
+
+    @property
+    def text_fallback_model(self) -> str:
+        return ""  # disabled in these unit tests
+
+    @property
+    def intent_max_tokens(self) -> int:
+        return 400
+
+    async def text(
+        self,
+        messages: list[Any],
+        *,
+        max_tokens: int,
+        task: str,
+        model: str | None = None,
+    ) -> str:
         self.calls += 1
+        self.max_tokens_used.append(max_tokens)
         return self._content
 
 
@@ -165,7 +285,26 @@ class TestLlmFallback:
         from inboxbridge.llm.base import LLMError
 
         class BrokenAi:
-            async def text(self, messages: list[Any], *, max_tokens: int, task: str) -> str:
+            @property
+            def text_model(self) -> str:
+                return "primary-model"
+
+            @property
+            def text_fallback_model(self) -> str:
+                return ""
+
+            @property
+            def intent_max_tokens(self) -> int:
+                return 400
+
+            async def text(
+                self,
+                messages: list[Any],
+                *,
+                max_tokens: int,
+                task: str,
+                model: str | None = None,
+            ) -> str:
                 raise LLMError("boom")
 
         intent = run(IntentClassifier(BrokenAi()).classify("haz algo", context=""))
@@ -174,9 +313,9 @@ class TestLlmFallback:
     def test_ambiguous_llm_result_becomes_clarify(self) -> None:
         ai = FakeAi(
             '{"action": "reply_to_email", "recipient": "", "instruction": '
-            '"dile que sí", "needs_clarification": true}'
+            '"dile algo", "needs_clarification": true}'
         )
-        intent = run(IntentClassifier(ai).classify("dile que sí", context=""))
+        intent = run(IntentClassifier(ai).classify("dile algo", context=""))
         assert intent.action == IntentAction.CLARIFY
 
     def test_rules_win_over_llm(self) -> None:
@@ -184,3 +323,90 @@ class TestLlmFallback:
         intent = run(IntentClassifier(ai).classify("márcalo como leído", context=""))
         assert intent.action == IntentAction.MARK_READ  # rule, not LLM
         assert ai.calls == 0
+
+
+# ── intent LLM technical fallback (AI_TEXT_FALLBACK_MODEL) ──────────────────
+
+
+def test_rules_first_intent_never_calls_llm() -> None:
+    ai = FakeAi('{"action": "unknown", "recipient": "", "instruction": ""}')
+    intent = run(
+        IntentClassifier(ai).classify("respóndele que muchas gracias", context="")
+    )
+    assert intent.action == IntentAction.REPLY_TO_EMAIL
+    assert ai.calls == 0  # deterministic routing: no fallback call at all
+
+
+def test_ambiguous_intent_primary_technical_failure_uses_fallback() -> None:
+    class FailOnceAi(FakeAi):
+        @property
+        def text_fallback_model(self) -> str:
+            return "fb-model"
+
+        @property
+        def intent_max_tokens(self) -> int:
+            return 400
+
+        async def text(
+            self,
+            messages: list[Any],
+            *,
+            max_tokens: int,
+            task: str,
+            model: str | None = None,
+        ) -> str:
+            self.calls += 1
+            self.models.append(model)
+            if self.calls == 1:
+                from inboxbridge.llm.base import LLMUnavailable
+
+                raise LLMUnavailable("primary down")
+            return self._content
+
+    ai = FailOnceAi(
+        '{"action": "summarize_thread", "recipient": "", "instruction": "", '
+        '"needs_clarification": false}'
+    )
+    ai.models = []
+    intent = run(IntentClassifier(ai).classify("haz algo", context=""))
+    assert intent.action == IntentAction.SUMMARIZE_THREAD
+    assert ai.models == [None, "fb-model"]  # primary, then fallback model
+
+
+def test_both_intent_classifiers_fail_keeps_clarification() -> None:
+    class AlwaysDownAi(FakeAi):
+        @property
+        def text_fallback_model(self) -> str:
+            return "fb-model"
+
+        @property
+        def intent_max_tokens(self) -> int:
+            return 400
+
+        async def text(
+            self,
+            messages: list[Any],
+            *,
+            max_tokens: int,
+            task: str,
+            model: str | None = None,
+        ) -> str:
+            self.calls += 1
+            from inboxbridge.llm.base import LLMUnavailable
+
+            raise LLMUnavailable("down")
+
+    ai = AlwaysDownAi("x")
+    intent = run(IntentClassifier(ai).classify("haz algo", context=""))
+    assert intent.action == IntentAction.UNKNOWN
+    assert ai.calls == 2  # bounded: primary + fallback, no explosion
+
+
+def test_intent_classifier_uses_small_budget() -> None:
+    ai = FakeAi(
+        '{"action": "summarize_thread", "recipient": "", "instruction": "", '
+        '"needs_clarification": false}'
+    )
+    intent = run(IntentClassifier(ai).classify("haz algo", context=""))
+    assert intent.action == IntentAction.SUMMARIZE_THREAD
+    assert ai.max_tokens_used == [400]  # intent stays deliberately small

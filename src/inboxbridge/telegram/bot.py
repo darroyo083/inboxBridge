@@ -50,13 +50,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import json
 import logging
 import mimetypes
 import re
 import secrets
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -79,7 +81,14 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes, Messag
 from ..config import Settings
 from ..contracts import TelegramNotifier
 from ..db import Storage
-from ..intents import IntentAction, IntentClassifier
+from ..intents import (
+    IntentAction,
+    IntentClassifier,
+    has_latest_reference,
+    is_thread_summary_request,
+    strip_latest_reference,
+)
+from ..llm.qa import CONTEXTUAL_EMOJIS, QaSection
 from ..models import DraftReply, EmailSummary, OutgoingAttachment, ParsedEmail
 
 logger = logging.getLogger(__name__)
@@ -91,6 +100,27 @@ _TG_GMAIL_PREFIX = "tgm:"  # tg message_id -> gmail message_id (IDs only)
 _TG_SENDER_PREFIX = "tgs:"  # tg message_id -> sender display name
 _TG_ORIG_PREFIX = "tgo:"  # tg message_id -> JSON list of temporary original message ids
 _CONFIRM_TIMEOUT_SECONDS = 900.0
+
+#: Bounded pending conversational slot-filling (reply target / compose) expires
+#: after this many seconds. In-memory only (intentionally not persisted): a
+#: restart clears it, which is safe — the user just re-issues the command.
+_FLOW_TTL_SECONDS = 900.0
+
+#: Explicit cancellation phrases that clear a pending conversational flow.
+_FLOW_CANCEL = re.compile(
+    r"^(cancela|cancelar|anula|anular|olv[ií]dalo|d[eé]jalo|nada|nada m[aá]s)$",
+    re.IGNORECASE,
+)
+
+#: Intent actions that create a NEW draft. With an active draft these must ask
+#: for explicit cancellation instead of silently replacing/mutating it.
+_NEW_DRAFT_ACTIONS = frozenset(
+    {
+        IntentAction.COMPOSE_NEW_EMAIL,
+        IntentAction.FORWARD_EMAIL,
+        IntentAction.REPLY_TO_EMAIL,
+    }
+)
 
 #: Telegram hard limit is 4096 chars per message; stay safely below.
 _MAX_MSG_CHARS = 3900
@@ -181,6 +211,10 @@ class ReplyRequest:
     #: Telegram-supplied files (documents/photos) downloaded to a temporary
     #: directory; the responder attaches them to the outgoing reply.
     attachments: tuple[OutgoingAttachment, ...] = ()
+    #: EXACT incoming Gmail message this reply targets, FROZEN at queue time
+    #: (the Telegram summary the user replied to, or the resolved "al último"
+    #: message). The recipient and in_reply_to come only from this message.
+    target_message_id: str = ""
 
 
 @dataclass
@@ -199,6 +233,10 @@ class _PendingDraft:
     preview_version: int = 1
     decided: bool | None = None
     future: asyncio.Future[bool] | None = None
+    #: True when this pending was RECONSTRUCTED from a persisted row after a
+    #: restart (the coordinator coroutine that awaited the future is gone, so
+    #: send/cancel must drive the coordinator's verified path directly).
+    restored: bool = False
 
     def resolve(self, confirmed: bool) -> None:
         self.decided = confirmed
@@ -209,6 +247,141 @@ class _PendingDraft:
 def neutralize_links(text: str) -> str:
     """Make URLs non-clickable in Telegram display (https:// → hxxps://)."""
     return _URL_SCHEME_RE.sub(lambda match: f"hxxp{match.group(0)[4:]}", text)
+
+
+class TelegramAttachmentError(RuntimeError):
+    """A Telegram file could not be downloaded/validated.
+
+    Raised (after a user-facing notice) so attachment-bearing actions abort
+    instead of silently presenting a draft that implies an attachment is
+    included when it is not. The user is never left with a misleading draft.
+    """
+
+
+#: Neutral fallback emoji for sections whose model-provided emoji is not in
+#: the shared allowlist (``llm.qa.CONTEXTUAL_EMOJIS``).
+_NEUTRAL_EMOJI = "ℹ️"
+
+
+def render_rich_text(text: str) -> str:
+    """Render an AI answer with SAFE rich formatting (Telegram HTML).
+
+    The model output is treated as untrusted data: every character is
+    HTML-escaped, and the ONLY structure added is a bold heading on lines that
+    start with a whitelisted contextual emoji (e.g. ``💰 125 CHF`` →
+    ``💰 <b>125 CHF</b>``). Bullets and blank lines pass through as plain
+    text. The result is always well-formed HTML because only this function
+    emits tags.
+    """
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and stripped[0] in CONTEXTUAL_EMOJIS:
+            heading = html.escape(stripped[1:].strip())
+            lines.append(f"{stripped[0]} <b>{heading}</b>" if heading else stripped[0])
+        else:
+            lines.append(html.escape(line))
+    return "\n".join(lines)
+
+
+def _cap_field(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def render_qa_answer(answer: str, sections: list[QaSection]) -> str:
+    """Deterministic, safe render of the structured Q&A contract.
+
+    Application-controlled layout: one line per section — ``<emoji> <b>title``
+    + items (a single item is rendered bare on the next line, multiple items
+    as bullets). A single-section/single-item answer whose item appears in
+    ``answer`` renders compact and inline: ``👤 El contacto es <b>Markus
+    Schneider</b>.`` All dynamic values are HTML-escaped; emojis outside the
+    allowlist fall back to a neutral one; only this function emits tags, so
+    the output is always well-formed Telegram HTML.
+    """
+    answer = _cap_field(answer, 600)
+    if not sections:
+        return html.escape(answer)
+    if (
+        len(sections) == 1
+        and len(sections[0].items) == 1
+        and answer
+    ):
+        section = sections[0]
+        item = section.items[0]
+        escaped_answer = html.escape(answer)
+        escaped_item = html.escape(_cap_field(item, 300))
+        if escaped_item and escaped_item in escaped_answer:
+            emoji = (
+                section.emoji if section.emoji in CONTEXTUAL_EMOJIS else _NEUTRAL_EMOJI
+            )
+            bolded = escaped_answer.replace(escaped_item, f"<b>{escaped_item}</b>", 1)
+            return f"{emoji} {bolded}"
+    lines: list[str] = []
+    if answer:
+        lines.append(html.escape(answer))
+    for section in sections:
+        emoji = section.emoji if section.emoji in CONTEXTUAL_EMOJIS else _NEUTRAL_EMOJI
+        lines.append(f"{emoji} <b>{html.escape(_cap_field(section.title, 60))}</b>")
+        items = [_cap_field(item, 300) for item in section.items]
+        if len(items) == 1:
+            lines.append(html.escape(items[0]))
+        else:
+            lines.extend(f"• {html.escape(item)}" for item in items)
+    return "\n".join(lines)
+
+
+def render_qa_plain(answer: str, sections: list[QaSection]) -> str:
+    """Plain-text variant of the structured answer (no markup at all).
+
+    Used as the Telegram fallback when a formatted send fails: keeps every
+    fact, loses only the bold layout.
+    """
+    lines: list[str] = []
+    if answer:
+        lines.append(answer)
+    for section in sections:
+        lines.append(f"{section.emoji} {section.title}")
+        items = section.items
+        if len(items) == 1:
+            lines.append(items[0])
+        else:
+            lines.extend(f"• {item}" for item in items)
+    return "\n".join(lines)
+
+
+def render_summary(headline: str, sections: list[QaSection]) -> str:
+    """Deterministic, safe render of the structured thread-summary contract.
+
+    Layout: a fixed ``📬 <b>headline</b>`` header followed by the same
+    application-controlled section blocks as Q&A (emoji + bold title, single
+    item bare, multiple items as bullets). A single-section summary whose
+    title equals the headline renders as the header plus bullets only — the
+    compact form for simple threads, no repeated header. All values are
+    HTML-escaped; only this function emits tags.
+    """
+    headline = _cap_field(headline, 60)
+    header = f"📬 <b>{html.escape(headline)}</b>"
+    if not sections:
+        return header
+    if len(sections) == 1 and sections[0].title == headline:
+        items = [_cap_field(item, 300) for item in sections[0].items]
+        lines = [header] + [f"• {html.escape(item)}" for item in items]
+        return "\n".join(lines)
+    body = render_qa_answer("", sections)
+    return f"{header}\n{body}"
+
+
+def render_summary_plain(headline: str, sections: list[QaSection]) -> str:
+    """Plain-text variant of the structured summary (no markup at all)."""
+    lines = [f"📬 {headline}"]
+    if len(sections) == 1 and sections[0].title == headline:
+        lines.extend(f"• {item}" for item in sections[0].items)
+        return "\n".join(lines)
+    body = render_qa_plain("", sections)
+    if body:
+        lines.append(body)
+    return "\n".join(lines)
 
 
 def _normalize_memory_text(text: str) -> str:
@@ -313,6 +486,13 @@ def _split_original(text: str) -> list[str]:
     return chunks
 
 
+#: Production message-handler filter: every supported message type reaches the
+#: SINGLE ``process_update`` entry point (text, documents, photos, voice).
+_MESSAGE_FILTERS = (
+    filters.TEXT | filters.Document.ALL | filters.PHOTO | filters.VOICE
+)
+
+
 class TelegramBot(TelegramNotifier):
     def __init__(
         self,
@@ -333,6 +513,9 @@ class TelegramBot(TelegramNotifier):
         self._status_provider = status_provider
         self._original_fetcher = original_fetcher
         self._resend_callback: Callable[[int], Awaitable[None]] | None = None
+        self._draft_restorer: Callable[[str], Any] | None = None
+        self._draft_sender: Callable[[int], Awaitable[None]] | None = None
+        self._draft_canceller: Callable[[int], Awaitable[None]] | None = None
         self._action_callback: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None
         self._intent_classifier: Any | None = None
         self._assistant: Any | None = None
@@ -343,15 +526,38 @@ class TelegramBot(TelegramNotifier):
         self._pending_drafts: dict[str, _PendingDraft] = {}
         #: user_id -> (tg summary message_id, thread_id, mode)
         #: mode: "reply" (Responder) | "question" (Preguntar)
-        self._pending_replies: dict[int, tuple[int, str, str]] = {}
+        #: user_id -> (tg summary message_id, thread_id, mode, target Gmail
+        #: message_id). mode: "reply" (Responder) | "question" (Preguntar).
+        #: The target Gmail message is FROZEN here (summary -> Gmail mapping).
+        self._pending_replies: dict[int, tuple[int, str, str, str]] = {}
         #: user_id -> pending multi-step UI state (compose, contact ops)
         self._pending_flows: dict[int, dict[str, Any]] = {}
+        #: media_group_id -> seen-at timestamp: only the first member of a
+        #: Telegram album is processed (bounded, in-memory).
+        self._seen_media_groups: dict[str, float] = {}
         self._application: Application[Any, Any, Any, Any, Any, Any] | None = None
         self._started = False
 
     def register_resend_callback(self, callback: Callable[[int], Awaitable[None]]) -> None:
         """Wire the "Reintentar envío" button to the reply coordinator."""
         self._resend_callback = callback
+
+    def register_draft_actions(
+        self,
+        restorer: Callable[[str], Any],
+        sender: Callable[[int], Awaitable[None]],
+        canceller: Callable[[int], Awaitable[None]],
+    ) -> None:
+        """Wire restart-safe draft actions to the reply coordinator.
+
+        ``restorer`` rebuilds a ``_PendingDraft`` from its persisted row when a
+        stale Telegram button resolves after a restart; ``sender``/``canceller``
+        drive the verified send / cancel for drafts whose original presentation
+        coroutine is gone. Send always requires the explicit button tap.
+        """
+        self._draft_restorer = restorer
+        self._draft_sender = sender
+        self._draft_canceller = canceller
 
     def register_action_callback(
         self, callback: Callable[[str, dict[str, Any]], Awaitable[None]]
@@ -395,7 +601,10 @@ class TelegramBot(TelegramNotifier):
             self._bot_user_id = me.id
             self._bot_username = me.username
         application = Application.builder().bot(cast(Bot, sender)).build()
-        application.add_handler(MessageHandler(filters.TEXT, self._on_message))
+        # Every supported message type must reach the SINGLE process_update
+        # entry point (it already handles text, document, photo and voice).
+        # Text-only registration meant documents/photos/voice never arrived.
+        application.add_handler(MessageHandler(_MESSAGE_FILTERS, self._on_message))
         application.add_handler(CallbackQueryHandler(self._on_callback_query, pattern=_CALLBACK_RE))
         await application.initialize()
         await application.start()
@@ -496,6 +705,8 @@ class TelegramBot(TelegramNotifier):
             pending.resolve(False)
             cancelled += 1
             self._pending_drafts.pop(pending.token, None)
+        # Also clear any pending conversational slot-fill flow for this member.
+        self._pending_flows.pop(user_id, None)
         text = "Nada que cancelar." if cancelled == 0 else f"Borradores cancelados: {cancelled}."
         await self._send(text, reply_to=message.message_id)
 
@@ -572,7 +783,28 @@ class TelegramBot(TelegramNotifier):
             await self._handle_voice(message, user.id)
             return
 
+        # Media groups (albums) arrive as several separate updates. Only the
+        # FIRST member of a group is processed: a multi-photo album can never
+        # create several drafts/actions from one intended action. Single
+        # documents/photos (the supported cases) have no media_group_id.
+        media_group_id = getattr(message, "media_group_id", None)
+        if media_group_id:
+            if media_group_id in self._seen_media_groups:
+                return  # already handled this album
+            self._seen_media_groups[media_group_id] = time.time()
+            self._prune_media_groups()
+
         text = message.text or message.caption or ""
+
+        # Active owned draft + Telegram file(s): attach to THAT draft only —
+        # never a second draft; recipient/subject/body/thread/attachments are
+        # preserved; the preview is re-rendered with a bumped draft version.
+        if (
+            self._active_pending_for(user.id) is not None
+            and (message.document is not None or message.photo)
+            and await self._attach_to_active_draft(message, user.id)
+        ):
+            return
 
         # Multi-step UI flows (compose recipient/instruction, contact inputs,
         # candidate selection, draft edit mode) take precedence.
@@ -585,8 +817,42 @@ class TelegramBot(TelegramNotifier):
         # "Responder"/"Preguntar" button flows: next message is the intent.
         pending = self._pending_replies.pop(user.id, None)
         if pending is not None:
-            tg_message_id, thread_id, mode = pending
+            tg_message_id, thread_id, mode, target_message_id = pending
+            # An EXPLICIT forward instruction bound to a Gmail summary wins
+            # over an active/pending reply slot: never let a pending reply
+            # flow steal a forward (e.g. the user pressed "Responder" earlier
+            # and then replies to a summary with "reenvía esto a …").
+            if mode == "reply" and self._is_reply_to_own(message):
+                intent = (self._intent_classifier or IntentClassifier()).classify_rule_only(text)
+                if intent.action == IntentAction.FORWARD_EMAIL:
+                    reply = message.reply_to_message
+                    fwd_thread_id = (
+                        self._storage.get_meta(f"{_TG_META_PREFIX}{reply.message_id}") or ""
+                        if reply is not None
+                        else ""
+                    )
+                    await self._dispatch_intent(
+                        text,
+                        thread_id=fwd_thread_id,
+                        tg_message_id=reply.message_id if reply is not None else 0,
+                        user_id=user.id,
+                        fallback_to_reply=True,
+                        message=message,
+                    )
+                    return
             if mode == "question":
+                if is_thread_summary_request(text):
+                    # Natural "resume este hilo" phrases route rules-first to
+                    # SUMMARIZE_THREAD even when the user pressed "Preguntar",
+                    # instead of being answered as a Q&A question.
+                    await self._dispatch_intent(
+                        text,
+                        thread_id=thread_id,
+                        tg_message_id=tg_message_id,
+                        user_id=user.id,
+                        force=IntentAction.SUMMARIZE_THREAD,
+                    )
+                    return
                 await self._dispatch_intent(
                     text,
                     thread_id=thread_id,
@@ -595,7 +861,10 @@ class TelegramBot(TelegramNotifier):
                     force=IntentAction.ASK_ABOUT_EMAIL,
                 )
                 return
-            attachments = await self._collect_outgoing_attachments(message)
+            try:
+                attachments = await self._collect_outgoing_attachments(message)
+            except TelegramAttachmentError:
+                return  # notice already sent; never a misleading draft
             memory = tuple(m["value"] for m in self._storage.list_memories(user.id))
             self._queue.put_nowait(
                 ReplyRequest(
@@ -605,6 +874,7 @@ class TelegramBot(TelegramNotifier):
                     memory=memory,
                     user_id=user.id,
                     attachments=attachments,
+                    target_message_id=target_message_id,
                 )
             )
             return
@@ -622,7 +892,21 @@ class TelegramBot(TelegramNotifier):
             # "escribe a Roman…", "recuérdame…", contact management).
             if self._action_callback is not None and text.strip():
                 await self._dispatch_intent(
-                    text, thread_id="", tg_message_id=0, user_id=user.id
+                    text,
+                    thread_id="",
+                    tg_message_id=0,
+                    user_id=user.id,
+                    message=message,
+                )
+                return
+            # A file without any instruction and without conversational
+            # context must never guess a recipient/thread — ask instead.
+            if message.document is not None or message.photo:
+                await self.send_notice(
+                    "Adjunto recibido. Dime qué quieres que haga con él, por "
+                    "ejemplo: «Envía un correo a … adjuntando esto», responde a "
+                    "un resumen con el adjunto, o «adjúntalo» si tienes un "
+                    "borrador activo."
                 )
             return
 
@@ -675,21 +959,50 @@ class TelegramBot(TelegramNotifier):
         payload.setdefault("user_id", user_id)
         payload.setdefault("thread_id", thread_id)
         payload.setdefault("tg_message_id", tg_message_id)
+        # The user's exact text must ALWAYS reach the intent handler: rules
+        # without an instruction payload (Q&A, thread summary) must not fall
+        # back to an internal default question.
+        if not payload.get("instruction"):
+            payload["instruction"] = text
         if tg_message_id:
             payload.setdefault(
                 "message_id", self._storage.get_meta(f"{_TG_GMAIL_PREFIX}{tg_message_id}") or ""
             )
 
+        # An active unsent draft must never be silently replaced by a NEW
+        # compose/reply/forward flow. Require explicit cancellation first.
+        if has_draft and action in _NEW_DRAFT_ACTIONS:
+            await self._send(
+                "Tienes un borrador pendiente. Cáncelo antes de empezar otro: "
+                "«cancela el borrador»."
+            )
+            return
+
+        # Edit language ("más largo", "más formal"...) only routes as an edit
+        # when there IS an active draft. Outside a draft it must not mutate
+        # anything: treat it as ambiguous so the normal fallback applies.
+        if action in (IntentAction.MODIFY_DRAFT, IntentAction.REGENERATE_DRAFT) and not has_draft:
+            action = IntentAction.UNKNOWN
+
         if action in (IntentAction.CLARIFY, IntentAction.UNKNOWN):
             if fallback_to_reply:
                 # Classic reply flow: the member's message is the reply intent
                 # (empty thread → the coordinator asks for context).
-                attachments = (
-                    await self._collect_outgoing_attachments(message)
-                    if message is not None
-                    else ()
-                )
+                if message is not None and (
+                    message.document is not None or message.photo
+                ):
+                    try:
+                        attachments = await self._collect_outgoing_attachments(message)
+                    except TelegramAttachmentError:
+                        return  # notice already sent; never a misleading draft
+                else:
+                    attachments = ()
                 memory = tuple(m["value"] for m in self._storage.list_memories(user_id))
+                target_message_id = ""
+                if tg_message_id:
+                    target_message_id = (
+                        self._storage.get_meta(f"{_TG_GMAIL_PREFIX}{tg_message_id}") or ""
+                    )
                 self._queue.put_nowait(
                     ReplyRequest(
                         thread_id=thread_id,
@@ -702,6 +1015,7 @@ class TelegramBot(TelegramNotifier):
                         memory=memory,
                         user_id=user_id,
                         attachments=attachments,
+                        target_message_id=target_message_id,
                     )
                 )
                 return
@@ -709,6 +1023,15 @@ class TelegramBot(TelegramNotifier):
                 await self._send(
                     "Tienes un borrador pendiente. Puedes decir: «envíalo», "
                     "«cancela el borrador», «hazlo más corto»… o editar el texto."
+                )
+            elif message is not None and (message.document is not None or message.photo):
+                # A file without a recognizable instruction must never guess a
+                # recipient/thread — ask instead.
+                await self.send_notice(
+                    "Adjunto recibido. Dime qué quieres que haga con él, por "
+                    "ejemplo: «Envía un correo a … adjuntando esto», responde a "
+                    "un resumen con el adjunto, o «adjúntalo» si tienes un "
+                    "borrador activo."
                 )
             else:
                 await self._send("No te he entendido del todo. ¿Qué quieres que haga?")
@@ -726,25 +1049,58 @@ class TelegramBot(TelegramNotifier):
             await self._edit_draft_via_text(user_id, text, action)
             return
 
-        # LLM-classified "reply to email": the classic reply flow.
-        if action == IntentAction.REPLY_TO_EMAIL and fallback_to_reply:
-            attachments = (
-                await self._collect_outgoing_attachments(message)
-                if message is not None
-                else ()
-            )
-            memory = tuple(m["value"] for m in self._storage.list_memories(user_id))
-            self._queue.put_nowait(
-                ReplyRequest(
-                    thread_id=thread_id,
-                    user_instructions=text,
-                    source_message_id=(
-                        message.message_id if message is not None else tg_message_id
-                    ),
-                    memory=memory,
-                    user_id=user_id,
-                    attachments=attachments,
+        # Same-message compose with Telegram files: the caption is the
+        # instruction and the attachments travel in the payload (single
+        # download, single draft).
+        if (
+            action == IntentAction.COMPOSE_NEW_EMAIL
+            and message is not None
+            and (message.document is not None or message.photo)
+        ):
+            try:
+                attachments = await self._collect_outgoing_attachments(message)
+            except TelegramAttachmentError:
+                return  # notice already sent; never a misleading draft
+            if attachments:
+                payload["attachments"] = attachments
+
+        # Reply intent (rules-first, but the LLM may still classify it): the
+        # classic reply flow when bound to a thread; otherwise resolve "al
+        # último" directly or start a bounded reply-target slot fill.
+        if action == IntentAction.REPLY_TO_EMAIL:
+            if fallback_to_reply:
+                await self._queue_reply(
+                    user_id, text, thread_id, message=message, tg_message_id=tg_message_id
                 )
+                return
+            if has_latest_reference(text):
+                latest = self._latest_reply_target()
+                if latest is None:
+                    await self._send(
+                        "No tengo ningún correo recibido reciente al que responder."
+                    )
+                    return
+                # Freeze the exact incoming message id NOW (never re-resolved).
+                await self._queue_reply(
+                    user_id,
+                    strip_latest_reference(text) or text,
+                    latest["thread_id"],
+                    message=message,
+                    tg_message_id=tg_message_id,
+                    target_message_id=latest["message_id"],
+                )
+                return
+            # No target yet: remember the instruction and ask for the target.
+            self._pending_flows[user_id] = {
+                "flow": "reply_target",
+                "instruction": text,
+                "user_id": user_id,
+                "ts": time.time(),
+            }
+            await self._send(
+                "¿A qué correo quieres responder? Di «al último» para el correo "
+                "recibido más reciente, o responde directamente a un resumen de "
+                "InboxBridge."
             )
             return
 
@@ -752,6 +1108,67 @@ class TelegramBot(TelegramNotifier):
             await self._send("No puedo hacer eso ahora mismo.")
             return
         await self._action_callback(action.value, payload)
+
+    # ── reply target resolution ("al último") ────────────────────────────────
+
+    def _latest_reply_target(self) -> dict[str, Any] | None:
+        """Resolve "the latest incoming email" to a concrete thread target.
+
+        Frozen at resolution time: the returned ``thread_id``/``message_id`` are
+        immutable, so a draft bound to them can never silently switch to a newer
+        email that arrives later.
+        """
+        row = self._storage.latest_incoming_message()
+        if row is None or not str(row.get("thread_id") or "").strip():
+            return None
+        return {
+            "thread_id": str(row["thread_id"]),
+            "message_id": str(row.get("message_id") or ""),
+        }
+
+    async def _queue_reply(
+        self,
+        user_id: int,
+        instruction: str,
+        thread_id: str,
+        *,
+        message: Message | None = None,
+        tg_message_id: int = 0,
+        target_message_id: str = "",
+    ) -> None:
+        """Put a ReplyRequest on the coordinator queue (classic reply flow).
+
+        A failed Telegram attachment download aborts the reply (notice already
+        sent) — the queue never receives a request whose attachment silently
+        vanished. The reply target Gmail message is FROZEN here: the exact
+        message mapped to the Telegram summary (``tgm:`` meta) or the explicit
+        resolved target ("al último").
+        """
+        if message is not None and (message.document is not None or message.photo):
+            try:
+                attachments = await self._collect_outgoing_attachments(message)
+            except TelegramAttachmentError:
+                return
+        else:
+            attachments = ()
+        if not target_message_id and tg_message_id:
+            target_message_id = (
+                self._storage.get_meta(f"{_TG_GMAIL_PREFIX}{tg_message_id}") or ""
+            )
+        memory = tuple(m["value"] for m in self._storage.list_memories(user_id))
+        self._queue.put_nowait(
+            ReplyRequest(
+                thread_id=thread_id,
+                user_instructions=instruction,
+                source_message_id=(
+                    message.message_id if message is not None else tg_message_id
+                ),
+                memory=memory,
+                user_id=user_id,
+                attachments=attachments,
+                target_message_id=target_message_id,
+            )
+        )
 
     # ── text draft actions (explicit only; never on "ok"/"sí") ─────────────
 
@@ -773,6 +1190,26 @@ class TelegramBot(TelegramNotifier):
                 return pending
         return None
 
+    def _resolve_draft_pending(self, token: str) -> _PendingDraft | None:
+        """Resolve a draft callback token to a pending draft.
+
+        Live pendings live in memory; after a restart they are reconstructed
+        from the PERSISTED row (the coordinator's ``restore_pending``), so a
+        stale Telegram button keeps working safely. A restored pending carries
+        ``restored=True`` so send/cancel route through the coordinator's
+        verified path instead of a (dead) in-memory future.
+        """
+        pending = self._pending_drafts.get(token)
+        if pending is not None:
+            return pending
+        if self._draft_restorer is not None:
+            restored = self._draft_restorer(token)
+            if restored is not None:
+                restored_pending = cast(_PendingDraft, restored)
+                self._pending_drafts[token] = restored_pending
+                return restored_pending
+        return None
+
     async def _send_draft_via_text(self, user_id: int) -> None:
         pending = self._active_pending_for(user_id)
         if pending is None:
@@ -785,7 +1222,10 @@ class TelegramBot(TelegramNotifier):
             )
             return
         self._pending_drafts.pop(pending.token, None)
-        pending.resolve(True)
+        if pending.restored and self._draft_sender is not None:
+            await self._draft_sender(pending.draft_id)
+        else:
+            pending.resolve(True)
 
     async def _cancel_draft_via_text(self, user_id: int) -> None:
         pending = self._active_pending_for(user_id)
@@ -793,7 +1233,10 @@ class TelegramBot(TelegramNotifier):
             await self._send("No hay ningún borrador pendiente para cancelar.")
             return
         self._pending_drafts.pop(pending.token, None)
-        pending.resolve(False)
+        if pending.restored and self._draft_canceller is not None:
+            await self._draft_canceller(pending.draft_id)
+        else:
+            pending.resolve(False)
 
     async def _edit_draft_via_text(
         self, user_id: int, text: str, action: IntentAction
@@ -817,6 +1260,23 @@ class TelegramBot(TelegramNotifier):
         self, message: Message, user_id: int, flow: dict[str, Any], text: str
     ) -> bool:
         flow_name = str(flow.get("flow") or "")
+
+        # Bounded: stale pending flows expire (in-memory only, no persistence).
+        ts = flow.get("ts")
+        if isinstance(ts, int | float) and (time.time() - ts) > _FLOW_TTL_SECONDS:
+            self._pending_flows.pop(user_id, None)
+            await self._send("Se acabó el tiempo de esta petición; empieza de nuevo.")
+            return True
+
+        # Explicit cancellation clears the pending flow (never a send).
+        if _FLOW_CANCEL.match(text.strip()):
+            self._pending_flows.pop(user_id, None)
+            await self._send("Cancelado.")
+            return True
+
+        if flow_name == "reply_target":
+            await self._reply_target_step(user_id, flow, text)
+            return True
         if flow_name == "compose_recipient":
             await self._compose_recipient_step(user_id, text)
             return True
@@ -878,12 +1338,40 @@ class TelegramBot(TelegramNotifier):
             return True
         return False
 
+    async def _reply_target_step(
+        self, user_id: int, flow: dict[str, Any], text: str
+    ) -> None:
+        """Fill the missing reply target slot ("al último" → latest email)."""
+        if has_latest_reference(text):
+            latest = self._latest_reply_target()
+            if latest is None:
+                await self._send(
+                    "No tengo ningún correo recibido reciente al que responder."
+                )
+                return
+            self._pending_flows.pop(user_id, None)
+            instruction = str(flow.get("instruction") or "")
+            # Freeze the exact incoming message id NOW (never re-resolved).
+            await self._queue_reply(
+                user_id,
+                instruction,
+                latest["thread_id"],
+                target_message_id=latest["message_id"],
+            )
+            return
+        await self._send(
+            "Dime «al último» para responder al correo recibido más reciente, "
+            "o responde directamente a un resumen de InboxBridge."
+        )
+
     async def _compose_recipient_step(
         self, user_id: int, text: str, instruction_hint: str | None = None
     ) -> None:
         from ..contacts import validate_email
 
-        phrase = text.strip().strip(".,;:!?¿¡")
+        # Allow "a <recipient>" / "para <recipient>" as a natural slot fill.
+        phrase = re.sub(r"^(a |para )", "", text.strip(), flags=re.IGNORECASE)
+        phrase = phrase.strip(" .,;:!?¿¡")
         if validate_email(phrase):
             self._pending_flows[user_id] = {
                 "flow": "compose_instruction",
@@ -1200,7 +1688,7 @@ class TelegramBot(TelegramNotifier):
         try:
             file = await self._ensure_sender().get_file(voice.file_id)
             target = self._outgoing_tmp_path(f"voice_{voice.file_unique_id}.ogg")
-            await asyncio.to_thread(file.download, target)  # type: ignore[attr-defined]
+            await file.download_to_drive(custom_path=target)
         except Exception:
             logger.exception("voice download failed")
             await self._send("No pude descargar la nota de voz.")
@@ -1235,9 +1723,13 @@ class TelegramBot(TelegramNotifier):
         """Download Telegram documents/photos to the temp dir (bounded, safe).
 
         Limits: ``outgoing_attachment_max_count`` files and
-        ``outgoing_attachment_max_bytes`` each. Violations reject the whole
-        batch with a notice; filenames are sanitized to display metadata only.
+        ``outgoing_attachment_max_bytes`` each. Any rejection (too many,
+        oversized, download failure) sends a user-facing notice and raises
+        :class:`TelegramAttachmentError` so the attachment-bearing action
+        ABORTS — a draft must never silently imply an attachment is included
+        when it is not. Filenames are sanitized to display metadata only.
         """
+        kind = "document" if message.document is not None else "photo" if message.photo else "none"
         entries: list[tuple[str, str, int, str]] = []
         if message.document is not None:
             doc = message.document
@@ -1257,31 +1749,44 @@ class TelegramBot(TelegramNotifier):
         max_count = self._settings.outgoing_attachment_max_count
         max_bytes = self._settings.outgoing_attachment_max_bytes
         if len(entries) > max_count:
+            logger.info("telegram_attachment type=%s count=%d outcome=rejected", kind, len(entries))
             await self.send_notice(
                 f"Demasiados adjuntos (máximo {max_count}); no los añado. Vuelve a intentarlo."
             )
-            return ()
-        oversized = [name for name, _, size, _ in entries if size > max_bytes]
+            raise TelegramAttachmentError("attachment count exceeds the limit")
+        # Entries shape: (file_id, sanitized_name, reported_size, mime). The
+        # rejection notice must name the SANITIZED FILENAME, never the
+        # Telegram file id (the file id is an internal identifier).
+        oversized = [n for _file_id, n, size, _mime in entries if size > max_bytes]
         if oversized:
+            logger.info("telegram_attachment type=%s count=%d outcome=rejected", kind, len(entries))
             await self.send_notice(
                 f"Adjunto demasiado grande (máximo {max_bytes // (1024 * 1024)} MB); "
                 "no los añado: "
                 + ", ".join(oversized)
             )
-            return ()
+            raise TelegramAttachmentError("attachment reported oversized")
         results: list[OutgoingAttachment] = []
         for file_id, name, _reported_size, mime in entries:
+            target: Path | None = None
             try:
                 file = await self._ensure_sender().get_file(file_id)
                 target = self._outgoing_tmp_path(name)
-                # PTB File.download is the blocking variant; run it off the loop.
-                await asyncio.to_thread(file.download, target)  # type: ignore[attr-defined]
+                # PTB >=20 async download API (File.download was removed).
+                await file.download_to_drive(custom_path=target)
             except Exception:
                 logger.exception("downloading telegram attachment %s failed", name)
+                logger.info(
+                    "telegram_attachment type=%s count=%d outcome=rejected",
+                    kind,
+                    len(entries),
+                )
                 for r in results:
                     _remove_file(r.path)
+                if target is not None:
+                    _remove_file(str(target))
                 await self.send_notice("No pude descargar un adjunto; vuelve a intentarlo.")
-                return ()
+                raise TelegramAttachmentError("telegram download failed") from None
             # Re-validate against the REAL downloaded size (Telegram's reported
             # size is client-supplied metadata and must not be trusted).
             actual_size = target.stat().st_size
@@ -1294,13 +1799,90 @@ class TelegramBot(TelegramNotifier):
                 )
                 for r in results:
                     _remove_file(r.path)
-                return ()
+                raise TelegramAttachmentError("attachment oversized after download")
             results.append(
                 OutgoingAttachment(
                     filename=name, mime_type=mime, size_bytes=actual_size, path=str(target)
                 )
             )
+        logger.info(
+            "telegram_attachment type=%s count=%d outcome=accepted",
+            kind,
+            len(results),
+        )
         return tuple(results)
+
+    def _prune_media_groups(self) -> None:
+        """Drop media-group bookkeeping older than the flow TTL (bounded)."""
+        cutoff = time.time() - _FLOW_TTL_SECONDS
+        stale = [g for g, seen in self._seen_media_groups.items() if seen < cutoff]
+        for group in stale:
+            self._seen_media_groups.pop(group, None)
+
+    async def _attach_to_active_draft(self, message: Message, user_id: int) -> bool:
+        """Attach a Telegram file to the user's ACTIVE draft (no second draft).
+
+        Preserves recipient/subject/body/thread and existing attachments,
+        deduplicates by sanitized filename, claims the file into the draft's
+        temp dir (deterministic ``NN_name`` convention, same as the responder)
+        and re-renders the preview with a bumped draft version. Ownership is
+        per Telegram user; stale-preview protection is untouched.
+        """
+        pending = self._active_pending_for(user_id)
+        if pending is None or pending.draft_id == 0:
+            return False
+        try:
+            attachments = await self._collect_outgoing_attachments(message)
+        except TelegramAttachmentError:
+            return True  # notice already sent; draft untouched
+        if not attachments:
+            return False
+        existing = list(pending.draft.attachments)
+        existing_names = {a.filename for a in existing}
+        added = [a for a in attachments if a.filename not in existing_names]
+        skipped = len(attachments) - len(added)
+        if added:
+            target_dir = Path(self._settings.tmp_dir) / f"draft-{pending.draft_id}"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            claimed: list[OutgoingAttachment] = []
+            for index, attachment in enumerate(added, start=len(existing)):
+                source = Path(attachment.path)
+                target = target_dir / f"{index + 1:02d}_{attachment.filename}"
+                try:
+                    if source != target and source.is_file():
+                        source.replace(target)
+                except OSError:
+                    _remove_file(str(source))
+                    continue
+                claimed.append(
+                    OutgoingAttachment(
+                        filename=attachment.filename,
+                        mime_type=attachment.mime_type,
+                        size_bytes=attachment.size_bytes,
+                        path=str(target),
+                    )
+                )
+            if claimed:
+                updated = replace(
+                    pending.draft,
+                    attachments=tuple(existing) + tuple(claimed),
+                )
+                self._storage.set_draft_attachments(pending.draft_id, updated.attachments)
+                await self.apply_draft_edit(pending.draft_id, updated)
+                logger.info(
+                    "telegram_attachment type=attach outcome=accepted draft=%d count=%d",
+                    pending.draft_id,
+                    len(claimed),
+                )
+                await self.send_notice(
+                    "Adjunto añadido al borrador: "
+                    + ", ".join(a.filename for a in claimed)
+                )
+            else:
+                await self.send_notice("No pude añadir el adjunto al borrador.")
+        if skipped:
+            await self.send_notice("Adjunto duplicado; no lo añado de nuevo.")
+        return True
 
     def _outgoing_tmp_path(self, filename: str) -> Path:
         """Unique temp path for one outgoing attachment (safe, no traversal)."""
@@ -1449,7 +2031,7 @@ class TelegramBot(TelegramNotifier):
             return
 
         # First tap on SEND / CANCEL / EDIT: confirmation UI, no action yet.
-        pending = self._pending_drafts.get(token)
+        pending = self._resolve_draft_pending(token)
         if pending is None:
             await sender.answer_callback_query(
                 query.id, "Este borrador ya no está disponible."
@@ -1541,7 +2123,7 @@ class TelegramBot(TelegramNotifier):
         )
 
     async def _draft_second_step(self, query: CallbackQuery, action: str, token: str) -> None:
-        pending = self._pending_drafts.get(token)
+        pending = self._resolve_draft_pending(token)
         if pending is None:
             await self._ensure_sender().answer_callback_query(
                 query.id, "Este borrador ya no está disponible."
@@ -1560,12 +2142,23 @@ class TelegramBot(TelegramNotifier):
                 )
                 return
             self._pending_drafts.pop(token, None)
-            pending.resolve(True)
+            if pending.restored:
+                # The original presentation coroutine is gone (restart): drive
+                # the coordinator's verified send directly (never auto-send —
+                # this is the explicit owner confirmation tap).
+                if self._draft_sender is not None:
+                    await self._draft_sender(pending.draft_id)
+            else:
+                pending.resolve(True)
             await sender.answer_callback_query(query.id, "Enviando…")
             return
         if action == "cancelyes":
             self._pending_drafts.pop(token, None)
-            pending.resolve(False)
+            if pending.restored:
+                if self._draft_canceller is not None:
+                    await self._draft_canceller(pending.draft_id)
+            else:
+                pending.resolve(False)
             await sender.answer_callback_query(query.id, "Cancelado.")
             return
         if action == "edit":
@@ -1576,7 +2169,7 @@ class TelegramBot(TelegramNotifier):
             )
 
     async def _draft_back(self, query: CallbackQuery, token: str, notice: str) -> None:
-        pending = self._pending_drafts.get(token)
+        pending = self._resolve_draft_pending(token)
         if pending is None:
             await self._ensure_sender().answer_callback_query(
                 query.id, "Este borrador ya no está disponible."
@@ -1659,7 +2252,16 @@ class TelegramBot(TelegramNotifier):
             await self._send("No puedo asociar eso a ningún hilo.")
             return
         sender_name = self._storage.get_meta(f"{_TG_SENDER_PREFIX}{tg_message_id}") or ""
-        self._pending_replies[query.from_user.id] = (tg_message_id, thread_id, mode)
+        # Freeze the exact Gmail message the summary maps to (reply target).
+        target_message_id = self._storage.get_meta(
+            f"{_TG_GMAIL_PREFIX}{tg_message_id}"
+        ) or ""
+        self._pending_replies[query.from_user.id] = (
+            tg_message_id,
+            thread_id,
+            mode,
+            target_message_id,
+        )
         if mode == "question":
             await self._send("¿Qué quieres saber sobre este correo?")
         elif sender_name:
@@ -1906,6 +2508,67 @@ class TelegramBot(TelegramNotifier):
     async def send_notice(self, text: str) -> int:
         return await self._send(neutralize_links(text))
 
+    async def send_rich_notice(self, text: str) -> int:
+        """Send an informational answer (Q&A / summary) with SAFE rich
+        formatting: only emoji-led section headings are bolded, everything else
+        is HTML-escaped plain text. Falls back to plain text if the formatted
+        send fails (the answer is never lost)."""
+        rendered = render_rich_text(text)
+        try:
+            sender = self._ensure_sender()
+            message = await sender.send_message(
+                self._allowed_chat_id,
+                rendered,
+                parse_mode=ParseMode.HTML,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+            return message.message_id
+        except Exception:
+            logger.warning("rich-format send failed; falling back to plain text")
+            return await self._send(neutralize_links(text))
+
+    async def send_qa_answer(self, answer: str, sections: list[QaSection]) -> int:
+        """Send the structured Q&A contract with deterministic safe formatting
+        (application-controlled sections, escaped values, allowlisted emojis).
+        Falls back to a plain-text rendering of the SAME content when the
+        formatted send fails — the answer is never lost."""
+        rendered = render_qa_answer(answer, sections)
+        try:
+            sender = self._ensure_sender()
+            message = await sender.send_message(
+                self._allowed_chat_id,
+                rendered,
+                parse_mode=ParseMode.HTML,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+            return message.message_id
+        except Exception:
+            logger.warning("rich-format send failed; falling back to plain text")
+            return await self._send(neutralize_links(render_qa_plain(answer, sections)))
+
+    async def send_summary_answer(
+        self, headline: str, sections: list[QaSection]
+    ) -> int:
+        """Send the structured thread-summary contract with the same safe,
+        deterministic formatting as Q&A (fixed 📬 header, section blocks).
+        Falls back to a plain-text rendering of the SAME content when the
+        formatted send fails — the summary is never lost."""
+        rendered = render_summary(headline, sections)
+        try:
+            sender = self._ensure_sender()
+            message = await sender.send_message(
+                self._allowed_chat_id,
+                rendered,
+                parse_mode=ParseMode.HTML,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+            return message.message_id
+        except Exception:
+            logger.warning("rich-format send failed; falling back to plain text")
+            return await self._send(
+                neutralize_links(render_summary_plain(headline, sections))
+            )
+
     async def send_typing(self) -> None:
         await self._ensure_sender().send_chat_action(self._allowed_chat_id, ChatAction.TYPING)
 
@@ -1917,6 +2580,11 @@ class TelegramBot(TelegramNotifier):
 
         The preview is versioned: any edit re-renders it and bumps the preview
         version — a stale preview can never authorize a send.
+
+        The callback token AND the preview message id are PERSISTED on the
+        draft row, so an unconfirmed draft stays safely actionable across a
+        restart: a stale button resolves back to the draft, Cancel/Edit work,
+        and Send still needs an explicit owner confirmation.
         """
         pending = _PendingDraft(
             token=secrets.token_urlsafe(8),
@@ -1928,6 +2596,8 @@ class TelegramBot(TelegramNotifier):
         message_id = await self._post_draft_preview(pending)
         pending.message_id = message_id
         self._pending_drafts[pending.token] = pending
+        if draft_id:
+            self._storage.set_draft_telegram(draft_id, pending.token, message_id)
         return message_id
 
     async def _post_draft_preview(self, pending: _PendingDraft) -> int:
@@ -1947,13 +2617,27 @@ class TelegramBot(TelegramNotifier):
                 f"- {a.filename} ({_format_size(a.size_bytes)})" for a in draft.attachments
             )
             attachments_line = f"\nAdjuntos:\n{names}"
-        kind = "Nuevo correo" if not draft.thread_id else "Respuesta"
+        kind = (
+            "Reenvío"
+            if draft.forward_of
+            else ("Respuesta" if draft.thread_id else "Nuevo correo")
+        )
+        spanish_block = ""
+        if draft.body_es:
+            spanish_block = (
+                f"\n\n🇪🇸 Español · traducción\n{neutralize_links(draft.body_es)}"
+            )
+        elif draft.translation_failed:
+            spanish_block = (
+                "\n\n🇪🇸 Español · traducción\n⚠️ No pude generar la traducción ahora."
+            )
         text = (
             f"Borrador ({kind})\n"
             f"Para: {to_line}{cc_line}\n"
             f"Asunto: {draft.subject}\n"
             f"{attachments_line}\n\n"
-            f"{neutralize_links(draft.body)}"
+            f"🇩🇪 Alemán · se enviará\n{neutralize_links(draft.body)}"
+            f"{spanish_block}"
         )
         keyboard = InlineKeyboardMarkup(
             [
@@ -1988,6 +2672,10 @@ class TelegramBot(TelegramNotifier):
         new_message_id = await self._post_draft_preview(pending)
         pending.message_id = new_message_id
         pending.preview_version = pending.draft_version
+        # Persist the NEW preview identity so the edited draft also survives a
+        # subsequent restart.
+        if pending.draft_id:
+            self._storage.set_draft_telegram(pending.draft_id, pending.token, new_message_id)
         # Invalidate the old preview + buttons (replay of old callbacks is a no-op).
         self._pending_drafts.pop(old_token, None)
         self._pending_drafts[pending.token] = pending

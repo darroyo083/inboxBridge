@@ -7,12 +7,16 @@ sending, and the /status report.
 
 from __future__ import annotations
 
+import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from inboxbridge.config import Settings
 from inboxbridge.db import Storage
 from inboxbridge.gmail.history import HistoryDelta
-from inboxbridge.models import MessageStatus, PubSubEvent
+from inboxbridge.models import AttachmentMeta, MessageStatus, PubSubEvent
 from inboxbridge.pipeline import InboundPipeline
 from inboxbridge.status import build_status_text
 from tests.mocks.coordinator import FakeGmail, make_email
@@ -69,6 +73,67 @@ async def test_happy_path(tmp_path: object) -> None:
     # Baseline advanced.
     assert storage.get_meta("last_history_id") == "20"
     assert storage.get_status("m1") == MessageStatus.SENT_TELEGRAM
+
+
+async def test_summary_outcome_log_is_privacy_safe(
+    tmp_path: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="inboxbridge.pipeline")
+    settings = make_settings()
+    storage = make_storage(tmp_path)
+    storage.set_meta("last_history_id", "10")
+    email = replace(
+        make_email(),
+        attachments=[
+            AttachmentMeta(
+                filename="rechnung.pdf",
+                mime_type="application/pdf",
+                size_bytes=2048,
+                extracted_text="Rechnung Nr. 42: 125 CHF fällig am 20.08.2026.",
+            )
+        ],
+    )
+    gmail = FakeGmail(messages={"m1": email})
+    llm = FakeLLM(summary="Reunión el viernes.")
+    telegram = FakeTelegram()
+
+    pipeline = InboundPipeline(
+        settings, gmail, llm, telegram, storage,
+        history_provider=_delta_provider(["m1"]),
+    )
+    result = await pipeline.process_event(make_event(history_id=20))
+    assert result.status == MessageStatus.SENT_TELEGRAM
+
+    # Outcome log: counts/bools only — never attachment names, bodies or addresses.
+    assert any(
+        "summary outcome=success attachments=1 attachment_context=true" in r.message
+        for r in caplog.records
+    )
+    assert not any("rechnung.pdf" in r.message for r in caplog.records)
+    assert not any("125 CHF" in r.message for r in caplog.records)
+    assert not any("anna@example.com" in r.message for r in caplog.records)
+
+
+async def test_summary_outcome_failed_log(
+    tmp_path: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="inboxbridge.pipeline")
+    settings = make_settings()
+    storage = make_storage(tmp_path)
+    storage.set_meta("last_history_id", "10")
+    gmail = FakeGmail(messages={"m1": make_email()})
+    llm = FakeLLM(transient_failures=3)  # exceeds llm_max_retries=2 → hard failure
+    telegram = FakeTelegram()
+
+    pipeline = InboundPipeline(
+        settings, gmail, llm, telegram, storage,
+        history_provider=_delta_provider(["m1"]),
+    )
+    result = await pipeline.process_event(make_event(history_id=20))
+    assert result.status == MessageStatus.FAILED
+    assert any(
+        "summary outcome=failed error=" in r.message for r in caplog.records
+    )
 
 
 async def test_spanish_subject_flows_to_telegram_and_original_stays_untouched(
@@ -157,6 +222,37 @@ async def test_no_new_messages_is_noop(tmp_path: object) -> None:
     result = await pipeline.process_event(make_event(history_id=20))
     assert result.status == MessageStatus.SENT_TELEGRAM  # no-op result
     assert telegram.sent == []
+
+
+async def test_baseline_advances_past_non_primary_only_delta(tmp_path: object) -> None:
+    """A delta with only definitively non-Primary history (no new messages, no
+    unknowns) advances the baseline — repeated re-scanning is avoided."""
+    settings = make_settings()
+    storage = make_storage(tmp_path)
+    storage.set_meta("last_history_id", "10")
+
+    pipeline = InboundPipeline(
+        settings, FakeGmail(), FakeLLM(), FakeTelegram(), storage,
+        history_provider=_delta_full_provider(history_id=30, message_ids=[]),
+    )
+    result = await pipeline.process_event(make_event(history_id=30))
+    assert result.status == MessageStatus.SENT_TELEGRAM
+    assert storage.get_meta("last_history_id") == "30"
+
+
+async def test_baseline_does_not_advance_on_unknown_candidate(tmp_path: object) -> None:
+    """A delta with a candidate of UNKNOWN Primary status must not advance the
+    baseline — advancing could silently lose a real Primary email."""
+    settings = make_settings()
+    storage = make_storage(tmp_path)
+    storage.set_meta("last_history_id", "10")
+
+    pipeline = InboundPipeline(
+        settings, FakeGmail(), FakeLLM(), FakeTelegram(), storage,
+        history_provider=_delta_full_provider(history_id=30, message_ids=[], unknown_count=1),
+    )
+    await pipeline.process_event(make_event(history_id=30))
+    assert storage.get_meta("last_history_id") == "10"  # unchanged → retried next push
 
 
 async def test_llm_failure_marks_failed_and_retry_recovers(tmp_path: object) -> None:
@@ -257,6 +353,17 @@ def _delta_provider(message_ids: list[str]):
 
 async def _empty_delta(event: PubSubEvent) -> HistoryDelta:
     return HistoryDelta(history_id=event.history_id, message_ids=[])
+
+
+def _delta_full_provider(
+    *, history_id: int, message_ids: list[str], unknown_count: int = 0
+):
+    async def provider(event: PubSubEvent) -> HistoryDelta:
+        return HistoryDelta(
+            history_id=history_id, message_ids=message_ids, unknown_count=unknown_count
+        )
+
+    return provider
 
 
 class FailingLLM(FakeLLM):

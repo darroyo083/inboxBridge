@@ -35,13 +35,32 @@ cp .env.example .env
 
 mkdir -p credentials
 # copy credentials/client_secret.json into credentials/
-# (do this ONCE on your dev machine with a browser available:)
+# (do this ONCE with a browser available:)
 docker compose run --rm inboxbridge python -m inboxbridge.oauth_bootstrap
 ```
 
 `oauth_bootstrap` opens the local OAuth flow: you authorize in a browser, and
-the refresh token is saved to `credentials/token.json`. Copy that file to the
-VPS (same path). Refresh tokens from installed-app flows do not expire.
+the refresh token is saved to `data/token.json` — i.e. inside the persistent
+`inboxbridge-data` Docker volume, NOT the read-only `credentials/` mount. Run
+this on the VPS (SSH port-forward the local server URL it prints) so the token
+lands in the volume directly. Refresh tokens from installed-app flows do not
+expire; the access token still expires and is refreshed + saved back to
+`data/token.json` on every expiry, which is why that path must stay writable.
+
+### Switching to another Gmail account
+
+Only two things are genuinely account-specific:
+
+1. **OAuth token** — re-run `docker compose run --rm inboxbridge python -m
+   inboxbridge.oauth_bootstrap` (or delete `data/token.json` and start, which
+   triggers the flow), authorizing with the new account. The refresh token in
+   the volume is replaced.
+2. **`EMAIL_SIGNATURE_NAME`** — set it to the display/signature name you want
+   on outgoing drafts for the new account (it is explicit configuration; it is
+   never inferred from the mailbox).
+
+The OAuth token and the signature identity are independent: nothing else needs
+to change when switching accounts.
 
 ## 4. Run
 
@@ -74,6 +93,8 @@ docker compose up -d
 | `TELEGRAM_BOT_TOKEN` | bot token from @BotFather |
 | `TELEGRAM_ALLOWED_CHAT_ID` | numeric id of the private group (only this chat is processed) |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | OpenAI-compatible endpoint (OpenCode Go, DeepSeek, OpenRouter…) |
+| `AI_TEXT_FALLBACK_MODEL` | OPTIONAL second text model on the SAME provider (same base URL/API key). Used ONLY as a bounded technical-reliability fallback: transient failures (empty/incomplete output, rate limit, provider unavailable/timeout) and unparseable structured contracts (Q&A / thread-summary JSON) retry on this model with the same logical input. Never a quality/judging switch. Empty → disabled; equal to `LLM_MODEL` → treated as disabled. No hardcoded model ids; changing it needs only a config reload + container recreate. |
+| `LLM_MAX_TOKENS_*` | Task-aware output ceilings (reasoning-capable models consume part of max_tokens internally): `LLM_MAX_TOKENS_SUMMARY` (1000), `LLM_MAX_TOKENS_DRAFT` (1600), `LLM_MAX_TOKENS_INTENT` (400), `LLM_MAX_TOKENS_QA` (1600), `LLM_MAX_TOKENS_THREAD_SUMMARY` (2000), `LLM_MAX_TOKENS_THREAD_SUMMARY_PLAIN` (1500), `LLM_MAX_TOKENS_TRANSLATION` (1200). Ceilings, not guaranteed consumption — a larger value never makes a summary/draft verbose. |
 | `GOOGLE_CLOUD_PROJECT` | Cloud project hosting topic/subscription |
 | `GMAIL_PUBSUB_TOPIC` / `GMAIL_PUBSUB_SUBSCRIPTION` | short names (path built as `projects/<proj>/topics/<topic>`) |
 | `SEND_EMAILS` | `false` in dev; `true` only when you want real sending |

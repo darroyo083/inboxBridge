@@ -9,9 +9,12 @@ services:
       # El contenedor siempre parte con SEND_EMAILS=false a menos que .env lo active
       SEND_EMAILS: ${SEND_EMAILS:-false}
     volumes:
-      # Estado mínimo (SQLite + credenciales OAuth locales de esta instalación).
-      # Migrar el VPS = copiar este volumen + .env
+      # Estado persistente y escribible: SQLite + el token OAuth (data/token.json),
+      # que se reescribe en cada refresco del access token. Migrar el VPS =
+      # copiar este volumen + .env + credentials/.
       - inboxbridge-data:/app/data
+      # Secretos estáticos (client_secret.json, service_account_pubsub.json):
+      # solo lectura. El token NO va aquí (debe poder escribirse).
       - ./credentials:/app/credentials:ro
     healthcheck:
       test: ["CMD", "python", "-m", "inboxbridge.healthcheck"]

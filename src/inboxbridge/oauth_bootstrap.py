@@ -48,7 +48,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     store.save(creds)
     print(f"credentials saved to {store.path}")
-    print("copy this file to the VPS (same relative path) and start the service")
+    print(
+        "On the VPS the token lives in the writable data volume; "
+        "no copy is needed when running this on the target host."
+    )
     return 0
 
 

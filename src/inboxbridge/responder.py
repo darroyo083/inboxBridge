@@ -39,15 +39,21 @@ from .config import Settings
 from .contracts import GmailClient, LLMProvider
 from .db import Storage
 from .gmail.client import AmbiguousSendError, SendingDisabledError
+from .llm.base import (
+    LLMIncompleteResponse,
+    alternate_text_models,
+    call_with_retry,
+)
 from .models import (
     DraftReply,
     DraftRequest,
     DraftStatus,
     EmailAddress,
     OutgoingAttachment,
+    ParsedEmail,
     SendVerification,
 )
-from .telegram.bot import ReplyRequest, TelegramBot
+from .telegram.bot import ReplyRequest, TelegramBot, _PendingDraft
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +84,9 @@ class ReplyCoordinator:
         self._draft_locks: dict[int, asyncio.Lock] = {}
         #: Draft ids currently being reconciled (sweep skips them).
         self._active_reconciles: set[int] = set()
+        #: Background presentation tasks (compose/forward) so their blocking
+        #: confirmation wait never stalls the Telegram message handler.
+        self._presentation_tasks: set[asyncio.Task[None]] = set()
         bot.register_resend_callback(self.resend_draft)
 
     def _lock_for(self, draft_id: int) -> asyncio.Lock:
@@ -101,20 +110,83 @@ class ReplyCoordinator:
             return
         try:
             await self._bot.send_typing()
+            target, source = await self._resolve_reply_target(request)
+            if target is None:
+                return  # notice already sent
+            # Defense in depth: a normal reply must never target our own mailbox.
+            account_email = await self._gmail.get_account_email()
+            if (
+                account_email
+                and target.sender.email.casefold() == account_email.casefold()
+            ):
+                logger.warning("reply_target outcome=rejected reason=self_recipient")
+                await self._bot.send_notice(
+                    "No pude resolver el destinatario de forma segura; "
+                    "no respondo a mi propia cuenta."
+                )
+                return
             thread = await self._gmail.fetch_thread_context(request.thread_id)
             draft_request = DraftRequest(
                 thread_id=request.thread_id,
                 user_instructions=request.user_instructions,
                 language="de",
                 memory=request.memory,
+                reply_to=target.sender,
+                in_reply_to=target.message_id,
             )
             draft: DraftReply = await self._llm.draft_reply(draft_request, thread)
             if request.attachments:
                 draft = replace(draft, attachments=request.attachments)
+            logger.info("reply_target outcome=resolved source=%s", source)
             await self._present_draft(draft, user_id=request.user_id)
+        except LLMIncompleteResponse:
+            logger.warning(
+                "reply draft incomplete for thread %s; not presenting",
+                request.thread_id,
+            )
+            await self._bot.send_notice("La respuesta quedó incompleta. Inténtalo de nuevo.")
         except Exception:
             logger.exception("reply flow failed for thread %s", request.thread_id)
             await self._bot.send_notice("No pude preparar la respuesta. Inténtalo de nuevo.")
+
+    async def _resolve_reply_target(
+        self, request: ReplyRequest
+    ) -> tuple[ParsedEmail | None, str]:
+        """Frozen reply target: the EXACT incoming Gmail message mapped to the
+        Telegram summary the user replied to (or, defensively, the most recent
+        persisted incoming message of the thread).
+
+        The recipient and ``in_reply_to`` come ONLY from this message — never
+        from LLM output or thread heuristics. Returns (target, source) or
+        (None, "") after a user-facing notice.
+        """
+        target_id = request.target_message_id
+        source = "telegram_summary"
+        if not target_id:
+            row = self._storage.latest_incoming_message()
+            if row and str(row.get("thread_id") or "") == request.thread_id:
+                target_id = str(row.get("message_id") or "")
+                source = "latest_incoming"
+        if not target_id:
+            await self._bot.send_notice(
+                "No pude resolver el correo al que responder; inténtalo otra vez."
+            )
+            return None, ""
+        try:
+            target = await self._gmail.fetch_message(target_id)
+        except Exception:
+            logger.exception("reply target fetch failed for %s", target_id)
+            await self._bot.send_notice(
+                "No pude resolver el correo al que responder; inténtalo otra vez."
+            )
+            return None, ""
+        if target.thread_id != request.thread_id:
+            logger.warning("reply_target outcome=rejected reason=thread_mismatch")
+            await self._bot.send_notice(
+                "No pude resolver el correo al que responder; inténtalo otra vez."
+            )
+            return None, ""
+        return target, source
 
     async def _present_draft(self, draft: DraftReply, *, user_id: int = 0) -> None:
         """Show recipients/attachments/body and wait for explicit confirmation.
@@ -129,6 +201,7 @@ class ReplyCoordinator:
         # Claim freshly-downloaded files into tmp/draft-<id>/ so the whole
         # attachment lifecycle is per-draft (sweepable, resendable).
         draft = self._claim_attachments(draft_id, draft)
+        draft = await self._translate_for_preview(draft)
         await self._bot.send_draft_for_confirmation(
             draft, draft_id=draft_id, user_id=user_id
         )
@@ -139,11 +212,101 @@ class ReplyCoordinator:
                 draft_id, draft.thread_id,
             )
             self._storage.set_draft_status(draft_id, DraftStatus.CANCELLED)
-            self._cleanup_attachments(draft)
+            self._cleanup_draft_tmp(draft_id)
             await self._bot.send_notice("Borrador cancelado.")
             return
         self._storage.set_draft_status(draft_id, DraftStatus.CONFIRMED)
         await self._send_confirmed(draft_id, draft)
+
+    # ── restart-safe draft actions (unconfirmed drafts survive a restart) ──
+
+    def restore_pending(self, token: str) -> _PendingDraft | None:
+        """Reconstruct an in-memory pending draft from its persisted row.
+
+        After a restart the ``_pending_drafts`` map is empty but the draft row
+        (status PENDING) and its callback token are persisted, so a stale
+        Telegram button can resolve back to the draft: Cancel/Edit keep working
+        and Send still requires an explicit owner confirmation.
+        """
+        row = self._storage.get_draft_by_token(token)
+        if row is None or row["status"] != DraftStatus.PENDING.value:
+            return None
+        draft = self._draft_from_row(row)
+        attachments = [a for a in self._load_attachments(row) if a is not None]
+        if attachments:
+            draft = replace(draft, attachments=tuple(attachments))
+        return _PendingDraft(
+            token=token,
+            draft=draft,
+            message_id=int(row.get("telegram_message_id") or 0),
+            draft_id=int(row["id"]),
+            user_id=int(row.get("telegram_user_id") or 0),
+            restored=True,
+        )
+
+    async def send_confirmed_draft_id(self, draft_id: int) -> None:
+        """Drive a send for an unconfirmed draft whose original presentation
+        coroutine is gone (restart).
+
+        The owner has EXPLICITLY confirmed via the button; the draft is
+        atomically claimed and goes through the SAME verified-delivery path as
+        a normal send (claim → send → verify → duplicate protection). Never
+        auto-sends.
+        """
+        async with self._lock_for(draft_id):
+            row = self._storage.get_draft(draft_id)
+            if row is None or row["status"] != DraftStatus.PENDING.value:
+                return  # already resolved elsewhere (duplicate protection)
+            self._storage.set_draft_status(draft_id, DraftStatus.CONFIRMED)
+            draft = self._draft_from_row(row)
+            attachments = [a for a in self._load_attachments(row) if a is not None]
+            if attachments:
+                draft = replace(draft, attachments=tuple(attachments))
+        await self._send_confirmed(draft_id, draft)
+
+    async def cancel_confirmed_draft_id(self, draft_id: int) -> None:
+        """Cancel an unconfirmed draft after restart (the original coroutine
+        that would have handled cancel is gone). Marks CANCELLED + temp cleanup."""
+        async with self._lock_for(draft_id):
+            row = self._storage.get_draft(draft_id)
+            if row is None or row["status"] != DraftStatus.PENDING.value:
+                return
+            self._storage.set_draft_status(draft_id, DraftStatus.CANCELLED)
+            self._cleanup_draft_tmp(draft_id)
+        await self._bot.send_notice("Borrador cancelado.")
+
+    async def _translate_for_preview(self, draft: DraftReply) -> DraftReply:
+        """Attach a best-effort Spanish translation of the German body.
+
+        The translation is a display-only aid for the Telegram preview and is
+        derived from the EXACT body that will be sent (never generated
+        independently from the instruction). It is never persisted and never
+        included in the Gmail message. On failure (after a bounded retry) the
+        draft is marked ``translation_failed`` so the preview shows an explicit
+        state instead of silently dropping the Spanish section.
+        """
+        if draft.body_es or draft.translation_failed or not draft.body.strip():
+            return draft
+        try:
+            models = alternate_text_models(
+                self._settings.effective_text_model,
+                self._settings.effective_text_fallback_model,
+                task="translate",
+            )
+            translated = (
+                await call_with_retry(
+                    lambda: self._llm.translate_to_spanish(
+                        draft.body, model=models()
+                    ),
+                    max_attempts=2,
+                    base_backoff=self._settings.retry_backoff_base,
+                )
+            ).strip()
+            if translated:
+                return replace(draft, body_es=translated)
+        except Exception:
+            logger.warning("draft translation failed after retry")
+        return replace(draft, translation_failed=True)
 
     async def _send_confirmed(self, draft_id: int, draft: DraftReply) -> None:
         """Drive one send attempt: sending → (verified | unverified | failed).
@@ -165,7 +328,25 @@ class ReplyCoordinator:
             await self._send_claimed(draft_id, draft)
 
     async def _send_claimed(self, draft_id: int, draft: DraftReply) -> None:
-        """Send attempt for a draft already atomically claimed as SENDING."""
+        """Send attempt for a draft already atomically claimed as SENDING.
+
+        The passed draft may predate attach/edit flows; the LATEST persisted
+        state (body + attachments) is always used for the actual send, while
+        the FROZEN reply target (in_reply_to/references) is preserved — it is
+        immutable application state, never stored in the row.
+        """
+        row = self._storage.get_draft(draft_id)
+        if row is not None:
+            latest = self._draft_from_row(row)
+            attachments = [a for a in self._load_attachments(row) if a is not None]
+            if attachments:
+                latest = replace(latest, attachments=tuple(attachments))
+            draft = replace(
+                latest,
+                in_reply_to=draft.in_reply_to or latest.in_reply_to,
+                references=draft.references or latest.references,
+                forward_of=draft.forward_of or latest.forward_of,
+            )
         started_ms = int(time.time() * 1000)
         self._storage.set_draft_send_started(draft_id, started_ms)
         try:
@@ -242,13 +423,17 @@ class ReplyCoordinator:
                 expected_message_id=expected_message_id,
                 since_ms=started_ms,
             )
+            logger.info(
+                "reconcile draft=%d attempt=%d/%d outcome=%s",
+                draft_id, attempts, max_attempts, result.category,
+            )
             if result.verified:
                 self._storage.set_draft_sent_message(
                     draft_id, result.message_id or expected_message_id
                 )
                 self._storage.set_draft_status(draft_id, DraftStatus.SENT_VERIFIED)
                 await self._bot.send_notice("Enviado y verificado ✓")
-                self._cleanup_attachments(draft)
+                self._cleanup_draft_tmp(draft_id)
                 return
             if not result.checked_ok:
                 break  # inconclusive — never resend without Gmail evidence
@@ -358,17 +543,56 @@ class ReplyCoordinator:
             await self._reconcile_row(row, draft, startup=True)
 
     async def sweep_unverified(self) -> None:
-        """Periodic: re-verify drafts stuck in sent_unverified (bounded)."""
+        """Periodic: re-verify drafts stuck in sent_unverified (bounded).
+
+        Drafts whose reconciliation budget is exhausted are handed to the
+        watchdog, which surfaces a definitive one-shot "could not verify"
+        outcome (never a resend).
+        """
         for row in self._storage.drafts_in_statuses([DraftStatus.SENT_UNVERIFIED]):
             draft_id = int(row["id"])
             if draft_id in self._active_reconciles:
                 continue  # a send/verify flow already owns this draft
             attempts = int(row["verification_attempts"])
             if attempts >= self._settings.send_verification_max_attempts:
+                await self._notify_exhausted(row)
                 continue
             draft = self._draft_from_row(row)
             await self._reconcile_row(row, draft, startup=False)
         self.cleanup_orphan_tmp()
+
+    async def _notify_exhausted(self, row: dict[str, Any]) -> None:
+        """Definitive, one-shot 'could not verify' for an exhausted draft.
+
+        The draft has used up its reconciliation budget while still
+        inconclusive (Gmail could not be queried within it). The watchdog NEVER
+        resends: it transitions ``sent_unverified → verification_failed`` and
+        posts a single explanatory notice. The atomic status transition makes
+        the notice one-shot across sweeps and restarts (a second pass sees the
+        draft is no longer ``sent_unverified``).
+        """
+        draft_id = int(row["id"])
+        attempts = int(row["verification_attempts"] or 0)
+        async with self._lock_for(draft_id):
+            current = self._storage.get_draft(draft_id)
+            if current is None or current["status"] != DraftStatus.SENT_UNVERIFIED.value:
+                return  # already resolved by another flow
+            attempts = int(current["verification_attempts"] or 0)
+            if attempts < self._settings.send_verification_max_attempts:
+                return  # resolved below the threshold in the meantime
+            self._storage.set_draft_status(draft_id, DraftStatus.VERIFICATION_FAILED)
+        subject = str(row.get("subject") or "")
+        subject_hint = f" (asunto «{subject[:60]}»)" if subject else ""
+        await self._bot.send_notice(
+            "No pude confirmar si Gmail aceptó este envío"
+            f"{subject_hint} y ya agoté las comprobaciones automáticas. "
+            "No lo he reenviado para evitar duplicados. Revisa Gmail directamente: "
+            "si el correo no llegó a salir, escríbelo de nuevo."
+        )
+        logger.info(
+            "watchdog exhausted draft=%d status=verification_failed attempts=%d",
+            draft_id, attempts,
+        )
 
     async def _reconcile_row(
         self, row: dict[str, Any], draft: DraftReply, *, startup: bool
@@ -410,6 +634,10 @@ class ReplyCoordinator:
                     await self._bot.offer_resend(
                         draft_id, user_id=int(row["telegram_user_id"] or 0)
                     )
+                logger.info(
+                    "reconcile sweep draft=%d startup=%s outcome=%s",
+                    draft_id, startup, result.category,
+                )
         finally:
             self._active_reconciles.discard(draft_id)
 
@@ -465,6 +693,27 @@ class ReplyCoordinator:
                     parent.rmdir()
                     break
 
+    def _cleanup_draft_tmp(self, draft_id: int) -> None:
+        """Remove the LATEST persisted attachments of a draft AND any orphan
+        files in its temp dir (attach/edit flows add files after the
+        presentation-time snapshot)."""
+        row = self._storage.get_draft(draft_id)
+        if row is not None:
+            current = [a for a in self._load_attachments(row) if a is not None]
+            if current:
+                snapshot = replace(
+                    DraftReply(thread_id="", subject="", to=[], cc=[], body=""),
+                    attachments=tuple(current),
+                )
+                self._cleanup_attachments(snapshot)
+                return
+        base = self._draft_tmp_dir(draft_id)
+        with contextlib.suppress(OSError):
+            if base.is_dir():
+                for f in base.iterdir():
+                    f.unlink(missing_ok=True)
+                base.rmdir()
+
     def cleanup_orphan_tmp(self) -> None:
         """Remove temp files/dirs that can no longer be used.
 
@@ -508,6 +757,7 @@ class ReplyCoordinator:
             if status in (
                 DraftStatus.SENT_VERIFIED.value,
                 DraftStatus.SEND_FAILED.value,
+                DraftStatus.VERIFICATION_FAILED.value,
                 DraftStatus.CANCELLED.value,
                 DraftStatus.REJECTED.value,
             ):
@@ -557,6 +807,7 @@ class ReplyCoordinator:
             cc=[],
             body=str(row["body"]),
             attachments=(),
+            forward_of=str(row.get("forward_of") or ""),
         )
 
     def _load_attachments(self, row: dict[str, Any]) -> list[OutgoingAttachment | None]:
@@ -599,8 +850,25 @@ class ReplyCoordinator:
 
     async def present_draft(self, draft: DraftReply, *, user_id: int = 0) -> None:
         """V1.1 hook: present ANY draft (reply/compose/forward) through the
-        shared verified-delivery confirmation path."""
-        await self._present_draft(draft, user_id=user_id)
+        shared verified-delivery confirmation path.
+
+        Runs in a background task so the Telegram message handler returns
+        immediately. The preview's SEND/EDIT/CANCEL buttons are callback queries
+        that PTB processes sequentially; blocking here (in ``wait_for_confirmation``)
+        would deadlock them — the compose/forward flow used to hit exactly that.
+        """
+        async def _run() -> None:
+            try:
+                await self._present_draft(draft, user_id=user_id)
+            except Exception:
+                logger.exception("draft presentation failed for thread %s", draft.thread_id)
+                await self._bot.send_notice(
+                    "No pude preparar el borrador; inténtalo de nuevo."
+                )
+
+        task = asyncio.create_task(_run())
+        self._presentation_tasks.add(task)
+        task.add_done_callback(self._presentation_tasks.discard)
 
 
 class ReconciliationSweep:

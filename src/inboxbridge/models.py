@@ -34,6 +34,9 @@ class DraftStatus(StrEnum):
       expected thread with the expected recipients/attachments.
     - ``SEND_FAILED``: a definitive failure; safe to report and offer a
       controlled retry.
+    - ``VERIFICATION_FAILED``: reconciliation was exhausted while still
+      inconclusive (Gmail could not be queried within budget) — the outcome is
+      unknown; never resend automatically.
     """
 
     PENDING = "pending"
@@ -42,6 +45,7 @@ class DraftStatus(StrEnum):
     SENT_UNVERIFIED = "sent_unverified"
     SENT_VERIFIED = "sent_verified"
     SEND_FAILED = "send_failed"
+    VERIFICATION_FAILED = "verification_failed"
     CANCELLED = "cancelled"
     REJECTED = "rejected"
 
@@ -91,13 +95,15 @@ class ParsedEmail:
 
 @dataclass(frozen=True)
 class ThreadMessage:
-    """A message within a Gmail thread, used as reply context."""
+    """A message within a Gmail thread, used as reply/Q&A context."""
 
     message_id: str
     from_: EmailAddress
     date_iso: str
     body_text: str
     snippet: str = ""
+    #: Bounded attachment metadata + extracted text (never the binaries).
+    attachments: list[AttachmentMeta] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -153,6 +159,21 @@ class SendVerification:
             and self.subject_match
         )
 
+    @property
+    def category(self) -> str:
+        """Operational outcome category (for logs/observability, never control flow).
+
+        One of: ``verified``, ``inconclusive`` (Gmail unreachable), ``partial_match``
+        (found but not fully matching), ``not_found`` (Gmail queried, message absent).
+        """
+        if self.verified:
+            return "verified"
+        if not self.checked_ok:
+            return "inconclusive"
+        if self.found:
+            return "partial_match"
+        return "not_found"
+
 
 @dataclass(frozen=True)
 class DraftRequest:
@@ -164,6 +185,12 @@ class DraftRequest:
     #: Explicit facts the requesting member asked the bot to remember
     #: (untrusted context for the LLM; capped inside the draft prompt).
     memory: tuple[str, ...] = ()
+    #: TRUSTED reply recipient, resolved by the application from the exact
+    #: incoming Gmail message being replied to. The LLM never chooses it.
+    reply_to: EmailAddress | None = None
+    #: Exact incoming Gmail message id this reply targets (in_reply_to).
+    #: Frozen application state, never derived from LLM output.
+    in_reply_to: str = ""
 
 
 @dataclass(frozen=True)
@@ -173,6 +200,18 @@ class DraftReply:
     ``attachments`` are Telegram-supplied files attached AFTER generation
     (the LLM never decides what to attach); they travel in memory and in a
     temp directory, never in SQLite.
+
+    ``body_es`` is a display-only Spanish translation of ``body`` for the
+    Telegram preview. It is NEVER sent to Gmail and is never persisted.
+    ``translation_failed`` marks that a translation was attempted but failed,
+    so the preview can show an explicit "translation unavailable" state
+    instead of silently omitting the Spanish section.
+
+    ``forward_of`` marks a FORWARD: the exact Gmail message_id being
+    forwarded (frozen trusted state, like a reply's ``in_reply_to``). The
+    recipient/subject come from the user's explicit forward instruction; the
+    original message body is quoted at send time from trusted Gmail source
+    data — never reconstructed by the LLM.
     """
 
     thread_id: str
@@ -182,7 +221,10 @@ class DraftReply:
     body: str
     in_reply_to: str = ""
     references: str = ""
+    forward_of: str = ""
     attachments: tuple[OutgoingAttachment, ...] = ()
+    body_es: str = ""
+    translation_failed: bool = False
 
 
 @dataclass(frozen=True)

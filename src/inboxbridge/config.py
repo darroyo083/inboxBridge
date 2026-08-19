@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     send_emails: bool = Field(default=False, alias="SEND_EMAILS")
 
+    # Trusted sender signature for outgoing drafts (display name appended after
+    # the formal closing). Explicit application configuration — NEVER inferred
+    # from email/LLM/Telegram content. When empty, a draft that ends on a formal
+    # closing (orphan sign-off) is rejected as incomplete.
+    email_signature_name: str = Field(default="", alias="EMAIL_SIGNATURE_NAME")
+
     # Telegram
     telegram_bot_token: SecretStr = Field(default=SecretStr(""), alias="TELEGRAM_BOT_TOKEN")
     telegram_allowed_chat_id: int = Field(default=0, alias="TELEGRAM_ALLOWED_CHAT_ID")
@@ -27,14 +33,31 @@ class Settings(BaseSettings):
     llm_base_url: str = Field(default="", alias="LLM_BASE_URL")
     llm_api_key: SecretStr = Field(default=SecretStr(""), alias="LLM_API_KEY")
     llm_model: str = "deepseek-v4-flash"
-    llm_max_tokens_summary: int = 700
-    llm_max_tokens_draft: int = 1000
+    # Task-aware output budgets (CEILINGS, not consumption). Reasoning-capable
+    # models consume part of max_tokens internally, so each task gets enough
+    # headroom to reliably reach its visible output while staying bounded.
+    llm_max_tokens_summary: int = Field(default=1000, alias="LLM_MAX_TOKENS_SUMMARY")
+    llm_max_tokens_draft: int = Field(default=1600, alias="LLM_MAX_TOKENS_DRAFT")
+    llm_max_tokens_intent: int = Field(default=400, alias="LLM_MAX_TOKENS_INTENT")
+    llm_max_tokens_qa: int = Field(default=1600, alias="LLM_MAX_TOKENS_QA")
+    llm_max_tokens_thread_summary: int = Field(
+        default=2000, alias="LLM_MAX_TOKENS_THREAD_SUMMARY"
+    )
+    llm_max_tokens_thread_summary_plain: int = Field(
+        default=1500, alias="LLM_MAX_TOKENS_THREAD_SUMMARY_PLAIN"
+    )
+    llm_max_tokens_translation: int = Field(
+        default=1200, alias="LLM_MAX_TOKENS_TRANSLATION"
+    )
     llm_temperature: float = 0.4
     llm_max_retries: int = 3
 
     # AI routing (V1.1): text vs vision vs audio, configuration-driven.
     # Model IDs come from the environment; business logic never hardcodes them.
     ai_text_model: str = Field(default="", alias="AI_TEXT_MODEL")
+    #: Optional SECOND text model on the SAME provider/gateway, used ONLY as a
+    #: bounded technical-reliability fallback (never for quality preferences).
+    ai_text_fallback_model: str = Field(default="", alias="AI_TEXT_FALLBACK_MODEL")
     ai_vision_model: str = Field(default="", alias="AI_VISION_MODEL")
     ai_vision_fallback_model: str = Field(default="", alias="AI_VISION_FALLBACK_MODEL")
     ai_audio_enabled: bool = Field(default=False, alias="AI_AUDIO_ENABLED")
@@ -49,9 +72,24 @@ class Settings(BaseSettings):
     def effective_text_model(self) -> str:
         return self.ai_text_model or self.llm_model
 
+    @property
+    def effective_text_fallback_model(self) -> str:
+        """Optional second text model on the same provider; ``""`` = disabled.
+
+        Disabled when unset OR equal to the primary (a duplicate call would be
+        pointless). Never a hardcoded model: the owner configures it.
+        """
+        fallback = self.ai_text_fallback_model
+        if not fallback or fallback == self.effective_text_model:
+            return ""
+        return fallback
+
     # Gmail / Google
     google_client_secret_file: str = "credentials/client_secret.json"
-    google_token_file: str = "credentials/token.json"
+    # The OAuth refresh token is WRITTEN on every access-token refresh, so it
+    # lives in the persistent, writable data volume (never under the read-only
+    # ``credentials`` bind mount that holds the static secrets).
+    google_token_file: str = "data/token.json"
     # Service account key used to consume the Pub/Sub subscription (StreamingPull).
     # Empty → falls back to Application Default Credentials.
     google_application_credentials: str = Field(

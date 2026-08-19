@@ -2,9 +2,11 @@
 
 Flow: run interactively ONCE on a desktop machine — a browser opens, the user
 authorizes, and the resulting refresh token is stored in the file configured
-via ``GOOGLE_TOKEN_FILE`` (default ``credentials/token.json``). Copy that file
-to the VPS. Refresh tokens from installed-app flows do not expire, so the API
-client keeps refreshing silently afterwards.
+via ``GOOGLE_TOKEN_FILE`` (default ``data/token.json`` — a writable, persistent
+path; in Docker this lives in the ``inboxbridge-data`` volume, NOT in the
+read-only ``credentials`` bind mount). Refresh tokens from installed-app flows
+do not expire, but the API client silently refreshes the short-lived access
+token on every expiry and SAVES the updated credentials back to that file.
 
 Re-auth on a different account needs no code changes: delete the token file
 and run the auth flow again (see :func:`reauthenticate`).

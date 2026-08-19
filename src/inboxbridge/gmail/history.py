@@ -14,18 +14,24 @@ first boot" all meet:
   labels contain ``CATEGORY_PERSONAL`` or NO ``CATEGORY_*`` label at all
   (tabs disabled => everything is Primary). Label lookups are one cheap
   ``messages.get(format="metadata", fields="id,labelIds")`` per candidate.
+  Classification is tri-state (PRIMARY / NOT_PRIMARY / UNKNOWN): a failed
+  label lookup yields UNKNOWN and the baseline is NOT advanced past it, so a
+  real Primary email can never be silently skipped.
 
 The returned ``HistoryDelta.history_id`` is the newest historyId actually
-seen; the caller persists it via :meth:`HistoryProcessor.persist_history_id`
-ONLY after the returned ids were processed successfully (never before, or a
-crash would skip mail).
+seen; the caller persists it ONLY when the delta has no UNKNOWN candidates
+and all returned ids were processed successfully (never before, or a crash
+would skip mail).
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
+
+from googleapiclient.errors import HttpError  # type: ignore[import-untyped]
 
 from ..config import Settings
 from ..db import Storage
@@ -36,6 +42,7 @@ logger = logging.getLogger(__name__)
 PRIMARY_LABEL = "CATEGORY_PERSONAL"
 CATEGORY_PREFIX = "CATEGORY_"
 INBOX_LABEL = "INBOX"
+SENT_LABEL = "SENT"
 # Safety cap: history.list pages (~1000 records each) must never loop forever.
 MAX_HISTORY_PAGES = 100
 
@@ -44,10 +51,28 @@ class HistoryError(RuntimeError):
     """History processing failed (API error, runaway pagination, ...)."""
 
 
+class PrimaryStatus(StrEnum):
+    """Tri-state Primary-tab classification.
+
+    ``UNKNOWN`` is deliberately distinct from ``NOT_PRIMARY``: an unknown
+    candidate may still be a Primary message, so the history baseline must not
+    advance past it. A ``NOT_PRIMARY`` candidate is definitively irrelevant and
+    may be safely skipped forever.
+    """
+
+    PRIMARY = "primary"
+    NOT_PRIMARY = "not_primary"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class HistoryDelta:
     history_id: int
     message_ids: list[str]
+    #: Number of candidates whose Primary status could not be determined
+    #: (label lookup failed). The caller must NOT advance the baseline past
+    #: these — doing so could silently lose a real Primary email.
+    unknown_count: int = 0
 
 
 class HistoryProcessor:
@@ -93,10 +118,23 @@ class HistoryProcessor:
                 break
         else:
             raise HistoryError(f"history.list exceeded {MAX_HISTORY_PAGES} pages")
-        primary = [mid for mid in sorted(candidates) if self._is_primary_tab(mid)]
+        primary: list[str] = []
+        unknown = 0
+        for mid in sorted(candidates):
+            status = self._classify_primary(mid)
+            if status is PrimaryStatus.PRIMARY:
+                primary.append(mid)
+            elif status is PrimaryStatus.UNKNOWN:
+                unknown += 1
         if primary:
             logger.info("history delta: %d new Primary message(s) since %d", len(primary), start)
-        return HistoryDelta(history_id=max_seen, message_ids=primary)
+        if unknown:
+            logger.warning(
+                "history delta: %d candidate(s) with unknown Primary status; "
+                "baseline will not advance past them",
+                unknown,
+            )
+        return HistoryDelta(history_id=max_seen, message_ids=primary, unknown_count=unknown)
 
     def persist_history_id(self, history_id: int) -> None:
         """Advance the baseline. Call AFTER successful processing of the delta."""
@@ -112,7 +150,13 @@ class HistoryProcessor:
             logger.warning("stored last_history_id %r is not an int; treating as first boot", raw)
             return None
 
-    def _is_primary_tab(self, message_id: str) -> bool:
+    def _classify_primary(self, message_id: str) -> PrimaryStatus:
+        """Classify one candidate's Primary-tab membership (tri-state).
+
+        A label-lookup failure is ``UNKNOWN`` (the message may be Primary) —
+        NOT the same as ``NOT_PRIMARY``. A 404 (message deleted) is safe to
+        treat as ``NOT_PRIMARY``: there is nothing left to process.
+        """
         try:
             resp: dict[str, Any] = (
                 self._service.users()
@@ -125,13 +169,33 @@ class HistoryProcessor:
                 )
                 .execute()
             )
+        except HttpError as exc:
+            status = getattr(getattr(exc, "resp", None), "status", 0) or 0
+            if status == 404:
+                return PrimaryStatus.NOT_PRIMARY  # deleted — nothing to process
+            logger.exception("could not fetch labels for %s; unknown", message_id)
+            return PrimaryStatus.UNKNOWN
         except Exception:
-            logger.exception("could not fetch labels for %s; skipping", message_id)
-            return False
+            logger.exception("could not fetch labels for %s; unknown", message_id)
+            return PrimaryStatus.UNKNOWN
         labels = {str(label) for label in resp.get("labelIds") or []}
-        return PRIMARY_LABEL in labels or not any(
+        # Our own outgoing messages (reply / new email / forward) carry SENT and
+        # must NEVER be processed as incoming Primary — even if Gmail's INBOX
+        # history surfaced them (e.g. a reply inside a thread that lives in
+        # INBOX). Skipping them is safe: the baseline advances past them and
+        # real reception is unaffected.
+        if SENT_LABEL in labels:
+            return PrimaryStatus.NOT_PRIMARY
+        # Only inbox messages are incoming candidates. (history.list is already
+        # filtered by INBOX, but this is defense in depth: a message that lost
+        # INBOX — e.g. it was archived or sent — is not new incoming Primary.)
+        if INBOX_LABEL not in labels:
+            return PrimaryStatus.NOT_PRIMARY
+        if PRIMARY_LABEL in labels or not any(
             label.startswith(CATEGORY_PREFIX) for label in labels
-        )
+        ):
+            return PrimaryStatus.PRIMARY
+        return PrimaryStatus.NOT_PRIMARY
 
 
 def _to_int(value: Any) -> int | None:

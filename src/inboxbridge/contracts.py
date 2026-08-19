@@ -28,8 +28,18 @@ class GmailClient(Protocol):
         """Fetch and parse one message (body cleaned, attachments extracted)."""
         ...
 
-    async def fetch_thread_context(self, thread_id: str) -> ThreadContext:
-        """Fetch full thread (recent messages) for reply context."""
+    async def fetch_thread_context(
+        self, thread_id: str, *, with_attachments: bool = False
+    ) -> ThreadContext:
+        """Fetch full thread (recent messages) for reply/Q&A context.
+
+        ``with_attachments`` also extracts bounded attachment text.
+        """
+        ...
+
+    async def get_account_email(self) -> str:
+        """The authenticated Gmail account's own address (profile source of
+        truth). Guards against self-addressed replies."""
         ...
 
     async def send_reply(self, draft: DraftReply) -> str:
@@ -69,6 +79,15 @@ class LLMProvider(Protocol):
         self, request: DraftRequest, thread: ThreadContext
     ) -> DraftReply:
         """Draft a professional German reply using thread context."""
+        ...
+
+    async def translate_to_spanish(
+        self, body: str, *, model: str | None = None
+    ) -> str:
+        """Translate a German draft body to Spanish for the Telegram preview.
+
+        Display-only: the Spanish text is never sent to Gmail. ``model``
+        overrides the model for this call (``None`` = primary)."""
         ...
 
 

@@ -14,7 +14,13 @@ from inboxbridge.gmail.client import (
     SendingDisabledError,
     ensure_re_prefix,
 )
-from inboxbridge.models import DraftReply, EmailAddress, ParsedEmail, ThreadContext
+from inboxbridge.models import (
+    DraftReply,
+    EmailAddress,
+    OutgoingAttachment,
+    ParsedEmail,
+    ThreadContext,
+)
 from tests.mocks.gmail import FakeGmailService, build_raw_email
 
 Route = tuple[str, ...]
@@ -170,6 +176,50 @@ class TestFetchThreadContext:
         assert [m.message_id for m in ctx.messages] == ["m1", "m2"]
         assert ctx.messages[1].body_text == "Mensaje dos."
 
+    async def test_with_attachments_extracts_bounded_text(self) -> None:
+        raw = build_raw_email(
+            subject="Presupuesto",
+            body_text="Cuerpo.",
+            body_html=None,
+            attachments=[("rechnung.txt", "text", "plain", b"Rechnung: 125 CHF.")],
+        )
+        routes: dict[Route, object] = {
+            ("users", "threads", "get"): thread_response(
+                thread_message("m1", "100", subject="Presupuesto"), thread_id="t1"
+            ),
+            ("users", "messages", "get"): full_response(
+                raw, message_id="m1", thread_id="t1"
+            ),
+        }
+        client = GmailClient(make_settings(), service=FakeGmailService(routes))
+        ctx = await client.fetch_thread_context("t1", with_attachments=True)
+
+        assert len(ctx.messages) == 1
+        attachments = ctx.messages[0].attachments
+        assert len(attachments) == 1
+        assert attachments[0].filename == "rechnung.txt"
+        assert attachments[0].extracted_text == "Rechnung: 125 CHF."
+
+    async def test_without_attachments_skips_extraction(self) -> None:
+        raw = build_raw_email(
+            subject="Presupuesto",
+            body_text="Cuerpo.",
+            body_html=None,
+            attachments=[("rechnung.txt", "text", "plain", b"Rechnung: 125 CHF.")],
+        )
+        routes: dict[Route, object] = {
+            ("users", "threads", "get"): thread_response(
+                thread_message("m1", "100", subject="Presupuesto"), thread_id="t1"
+            ),
+            ("users", "messages", "get"): full_response(
+                raw, message_id="m1", thread_id="t1"
+            ),
+        }
+        client = GmailClient(make_settings(), service=FakeGmailService(routes))
+        ctx = await client.fetch_thread_context("t1", with_attachments=False)
+
+        assert ctx.messages[0].attachments == []
+
 
 class TestSendReply:
     async def test_reply_continues_thread(self) -> None:
@@ -229,6 +279,131 @@ class TestSendReply:
         mime = send_call_mime(client)
         assert mime["To"] == "Alice <alice@example.com>"
         assert mime.get("Cc") is None
+
+    async def test_new_email_keeps_subject_without_re_prefix(self) -> None:
+        """A threadless draft (compose/forward) must NOT get a 'Re:' prefix."""
+        routes: dict[Route, object] = {
+            ("users", "messages", "send"): {"id": "m3"},
+        }
+        client = GmailClient(make_settings(), service=FakeGmailService(routes))
+        draft = DraftReply(
+            thread_id="", subject="Presupuesto", to=[EmailAddress("R", "r@b.c")], cc=[], body="ok"
+        )
+        await client.send_reply(draft)
+        mime = send_call_mime(client)
+        assert mime["Subject"] == "Presupuesto"
+        assert mime.get("In-Reply-To") is None
+        send_call = next(c for c in client._service.calls if c[0] == ("users", "messages", "send"))
+        assert "threadId" not in send_call[1]["body"]
+
+    async def test_forward_keeps_fwd_prefix(self) -> None:
+        routes: dict[Route, object] = {
+            ("users", "messages", "send"): {"id": "m3"},
+        }
+        client = GmailClient(make_settings(), service=FakeGmailService(routes))
+        draft = DraftReply(
+            thread_id="",
+            subject="Fwd: Presupuesto",
+            to=[EmailAddress("R", "r@b.c")],
+            cc=[],
+            body="ok",
+        )
+        await client.send_reply(draft)
+        mime = send_call_mime(client)
+        assert mime["Subject"] == "Fwd: Presupuesto"
+
+    async def test_forward_quotes_trusted_original_and_attaches_once(self) -> None:
+        """A forward drafts the note and quotes the EXACT original from trusted
+        Gmail source data (never LLM reconstruction); the original PDF is
+        attached exactly once and no threadId is forced."""
+        import tempfile
+        from pathlib import Path
+
+        original = build_raw_email(
+            subject="Presupuesto",
+            sender="Anna Muster <anna@example.com>",
+            to="Daniel <daniel@example.com>",
+            date="Tue, 05 Aug 2025 10:30:00 +0200",
+            body_text="Hallo, bitte um Rückmeldung.",
+            attachments=[("presupuesto.pdf", "application", "pdf", b"%PDF-1.4 fake")],
+        )
+        routes: dict[Route, object] = {
+            ("users", "messages", "get"): full_response(original, message_id="m-fwd",
+                                                       thread_id="t1"),
+            ("users", "messages", "send"): {"id": "m3"},
+        }
+        client = GmailClient(make_settings(), service=FakeGmailService(routes))
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "presupuesto.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4 fake")
+            draft = DraftReply(
+                thread_id="",
+                subject="Fwd: Presupuesto",
+                to=[EmailAddress("R", "r@b.c")],
+                cc=[],
+                body="Weiterleitung von ...",
+                forward_of="m-fwd",
+                attachments=(
+                    OutgoingAttachment(
+                        filename="presupuesto.pdf",
+                        mime_type="application/pdf",
+                        size_bytes=15,
+                        path=str(pdf_path),
+                    ),
+                ),
+            )
+            await client.send_reply(draft)
+        mime = send_call_mime(client)
+        # Trusted quoted original headers + body, plus the short note.
+        text_parts = [
+            p.get_payload(decode=True).decode("utf-8", errors="replace")
+            for p in mime.walk()
+            if p.get_content_type() == "text/plain"
+            and p.get_payload(decode=True) is not None
+        ]
+        body = text_parts[0]
+        assert "Weiterleitung von ..." in body
+        assert "---------- Forwarded message ----------" in body
+        assert "From: Anna Muster <anna@example.com>" in body
+        assert "Subject: Presupuesto" in body
+        assert "Hallo, bitte um Rückmeldung." in body or "HTML body." in body
+        assert "presupuesto.pdf" in body  # attachment listed for awareness
+        # The attachment binary travels as a real attachment, exactly once.
+        attachments = mime.get_payload()
+        pdf_parts = [
+            p for p in attachments if isinstance(p, Message)
+            and p.get_content_type() == "application/pdf"
+            and p.get_filename() == "presupuesto.pdf"
+        ]
+        assert len(pdf_parts) == 1
+        # Forward is a new email: no threadId forced, no In-Reply-To.
+        send_call = next(
+            c for c in client._service.calls if c[0] == ("users", "messages", "send")
+        )
+        assert "threadId" not in send_call[1]["body"]
+        assert mime.get("In-Reply-To") is None
+
+    async def test_spanish_translation_never_sent(self) -> None:
+        """The display-only Spanish translation must never enter the sent MIME."""
+        routes: dict[Route, object] = {
+            ("users", "threads", "get"): thread_response(
+                thread_message("m2", "200", message_id_header="<m2@x>"), thread_id="t1"
+            ),
+            ("users", "messages", "send"): {"id": "m3"},
+        }
+        client = GmailClient(make_settings(), service=FakeGmailService(routes))
+        draft = DraftReply(
+            thread_id="t1",
+            subject="Tema",
+            to=[EmailAddress("A", "a@b.c")],
+            cc=[],
+            body="Sehr geehrte Frau Muster, vielen Dank für Ihre Nachricht.",
+            body_es="Estimada señora Muster, muchas gracias por su mensaje.",
+        )
+        await client.send_reply(draft)
+        mime = send_call_mime(client)
+        assert "vielen Dank" in mime.get_payload()
+        assert "muchas gracias" not in mime.get_payload()
 
     async def test_subject_gets_re_prefix(self) -> None:
         routes: dict[Route, object] = {

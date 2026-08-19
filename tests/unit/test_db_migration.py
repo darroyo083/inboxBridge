@@ -110,3 +110,26 @@ def test_draft_roundtrip_preserves_recipient_names(tmp_path: object) -> None:
     row = storage.get_draft(draft_id)
     assert "Ana Muster" in row["to_json"]  # full display identity preserved
     assert "ana@example.com" in row["to_json"]
+
+
+def test_draft_telegram_token_roundtrip(tmp_path: object) -> None:
+    """The preview callback token + message id survive on the draft row, so a
+    stale Telegram button resolves back to the draft after a restart."""
+    storage = Storage(str(tmp_path) + "/token.db")
+    storage.connect()
+    draft = DraftReply(
+        thread_id="t1",
+        subject="Re: X",
+        to=[EmailAddress("Ana", "ana@example.com")],
+        cc=[],
+        body="danke",
+    )
+    draft_id = storage.create_draft("t1", None, draft, telegram_user_id=7)
+    assert storage.get_draft_by_token("tok-abc") is None
+    storage.set_draft_telegram(draft_id, "tok-abc", 4242)
+    row = storage.get_draft_by_token("tok-abc")
+    assert row is not None
+    assert row["id"] == draft_id
+    assert row["telegram_message_id"] == 4242
+    assert row["telegram_user_id"] == 7
+    assert storage.get_draft(draft_id)["telegram_token"] == "tok-abc"

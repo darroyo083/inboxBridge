@@ -63,10 +63,13 @@ class InboundPipeline:
         results: list[PipelineResult] = []
         for message_id in delta.message_ids:
             results.append(await self.process_message(message_id))
-        if delta.message_ids:
-            ok = all(r.status != MessageStatus.FAILED for r in results)
-            if ok:
-                self._advance_baseline(max(delta.history_id, event.history_id))
+        ok = all(r.status != MessageStatus.FAILED for r in results)
+        # The baseline advances only when every candidate was resolved
+        # (no UNKNOWN Primary status) AND every Primary message processed
+        # cleanly. An unknown candidate must be re-examined on the next push —
+        # advancing past it could silently lose a real Primary email.
+        if ok and delta.unknown_count == 0:
+            self._advance_baseline(max(delta.history_id, event.history_id))
         return (
             results[-1]
             if results
@@ -113,6 +116,11 @@ class InboundPipeline:
             self._storage.mark_status(
                 message_id, MessageStatus.SENT_TELEGRAM, telegram_message_id
             )
+            logger.info(
+                "summary outcome=success attachments=%d attachment_context=%s",
+                len(email.attachments),
+                ("true" if email.attachment_texts else "false"),
+            )
             return PipelineResult(
                 message_id=message_id,
                 status=MessageStatus.SENT_TELEGRAM,
@@ -130,6 +138,9 @@ class InboundPipeline:
                 logger.exception("could not notify attachment error for %s", message_id)
             return PipelineResult(message_id=message_id, status=MessageStatus.FAILED)
         except Exception as exc:
+            logger.warning(
+                "summary outcome=failed error=%s", type(exc).__name__
+            )
             logger.exception("pipeline failed for message %s", message_id)
             self._mark_failed(message_id)
             return PipelineResult(

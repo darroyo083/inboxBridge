@@ -19,7 +19,9 @@ Flows implemented here:
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +31,15 @@ from .db import Storage
 from .gmail.client import GmailClient
 from .llm import prompts
 from .llm.ai_service import AIService
-from .llm.base import LLMError
-from .models import DraftReply, EmailAddress, OutgoingAttachment, ParsedEmail
+from .llm.base import (
+    LLMError,
+    StructuredOutputError,
+    alternate_text_models,
+    call_with_retry,
+)
+from .llm.qa import call_structured, parse_qa_answer, parse_thread_summary
+from .llm.signature import finalize_draft_body
+from .models import DraftReply, EmailAddress, OutgoingAttachment, ParsedEmail, ThreadContext
 from .reminders import ReminderParseError, ReminderService
 from .telegram.bot import TelegramBot
 
@@ -39,8 +48,25 @@ logger = logging.getLogger(__name__)
 #: Temp delivery of Gmail attachments: bounded count and bytes.
 MAX_ATTACHMENT_DELIVERY_BYTES = 10 * 1024 * 1024
 MAX_ATTACHMENT_DELIVERY_COUNT = 5
-#: Supported types for attachment delivery to Telegram.
-_DELIVERABLE_TYPES = ("application/pdf", "application/msword", "text/plain", "text/csv", "image/")
+#: Supported types for attachment delivery to Telegram (docs claim DOCX works;
+#: modern .docx uses the OpenXML mime, older .doc uses application/msword).
+_DELIVERABLE_TYPES = (
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "text/plain",
+    "text/csv",
+    "image/",
+)
+
+#: Sanitized MIME for logs (headers are untrusted): keep only the coarse
+#: ``type/subtype`` form, never raw header text (log-injection safe).
+_COARSE_MIME_RE = re.compile(r"^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$")
+
+
+def _coarse_mime(mime: str) -> str:
+    match = _COARSE_MIME_RE.match(mime)
+    return match.group(0) if match else "unknown"
 
 
 class AssistantError(RuntimeError):
@@ -138,17 +164,72 @@ class EmailAssistant:
             await self._bot.send_notice("Ese borrador ya no está activo.")
             return
         try:
-            thread = await self._gmail.fetch_thread_context(pending.draft.thread_id)
+            if pending.draft.thread_id:
+                thread = await self._gmail.fetch_thread_context(pending.draft.thread_id)
+            else:
+                # Compose/forward drafts have no thread; the edit prompt just
+                # omits thread context rather than failing on an empty id.
+                thread = ThreadContext(
+                    thread_id="", subject=pending.draft.subject, messages=[], history_id=0
+                )
             await self._bot.send_typing()
             messages = prompts.edit_draft_messages(pending.draft.body, instruction, thread)
-            new_body = await self._ai.text(
-                messages,
-                max_tokens=self._settings.llm_max_tokens_draft,
+            models = alternate_text_models(
+                self._settings.effective_text_model,
+                self._settings.effective_text_fallback_model,
                 task="draft_edit",
+            )
+            # Bounded retry (one extra attempt) covers transient LLMEmptyResponse
+            # on the edit generation itself. The retry runs the SAME operation
+            # against the SAME current German draft; recipient/subject/thread/
+            # attachments/owner are untouched, and a new preview is only
+            # published after one edit generation succeeds.
+            new_body = await call_with_retry(
+                lambda: self._ai.text(
+                    messages,
+                    max_tokens=self._settings.llm_max_tokens_draft,
+                    task="draft_edit",
+                    require_complete=True,
+                    model=models(),
+                ),
+                max_attempts=2,
+                base_backoff=self._settings.retry_backoff_base,
             )
         except LLMError:
             await self._bot.send_notice("No pude editar el borrador ahora; inténtalo otra vez.")
             return
+        # Normalize the trusted signature on the edited body (dedup-safe) and
+        # reject an orphan sign-off; the translation below then covers the
+        # exact final German body.
+        try:
+            new_body = finalize_draft_body(new_body, self._settings.email_signature_name)
+        except LLMError:
+            await self._bot.send_notice("No pude editar el borrador ahora; inténtalo otra vez.")
+            return
+        # Regenerate the display-only Spanish translation from the NEW German
+        # body, so the preview never shows a stale translation. Bounded retry
+        # (one extra attempt) covers transient LLMEmptyResponse; the German
+        # body is NEVER regenerated here.
+        try:
+            models = alternate_text_models(
+                self._settings.effective_text_model,
+                self._settings.effective_text_fallback_model,
+                task="translate",
+            )
+            new_body_es = (
+                await call_with_retry(
+                    lambda: self._ai.translate_to_spanish(
+                        new_body, model=models()
+                    ),
+                    max_attempts=2,
+                    base_backoff=self._settings.retry_backoff_base,
+                )
+            ).strip()
+            translation_failed = False
+        except Exception:
+            logger.warning("draft translation failed after retry")
+            new_body_es = ""
+            translation_failed = True
         updated = DraftReply(
             thread_id=pending.draft.thread_id,
             subject=pending.draft.subject,
@@ -158,6 +239,8 @@ class EmailAssistant:
             in_reply_to=pending.draft.in_reply_to,
             references=pending.draft.references,
             attachments=pending.draft.attachments,
+            body_es=new_body_es,
+            translation_failed=translation_failed,
         )
         await self._bot.apply_draft_edit(pending.draft_id, updated)
         # Persisted draft row keeps the latest body (retry coherence).
@@ -177,17 +260,47 @@ class EmailAssistant:
             await self._bot.send_notice("Sobre qué correo? Responde a un resumen de InboxBridge.")
             return
         try:
-            thread = await self._gmail.fetch_thread_context(thread_id)
+            thread = await self._gmail.fetch_thread_context(
+                thread_id, with_attachments=True
+            )
             await self._bot.send_typing()
-            answer = await self._ai.text(
-                prompts.ask_about_email_messages(question or "¿Qué me está pidiendo?", thread),
-                max_tokens=600,
+            models = alternate_text_models(
+                self._settings.effective_text_model,
+                self._settings.effective_text_fallback_model,
                 task="qa",
             )
-        except LLMError:
+            parsed = await call_structured(
+                lambda: self._ai.text(
+                    prompts.ask_about_email_messages(
+                        question or "¿Qué me está pidiendo?", thread
+                    ),
+                    max_tokens=self._settings.llm_max_tokens_qa,
+                    task="qa",
+                    require_complete=True,
+                    model=models(),
+                ),
+                parse_qa_answer,
+                max_attempts=2,
+                base_backoff=self._settings.retry_backoff_base,
+            )
+        except StructuredOutputError:
+            # Generation succeeded but the structured contract never parsed;
+            # the raw model output is an implementation detail, never shown.
+            logger.warning("qa outcome=invalid_structure")
             await self._bot.send_notice("No pude responder ahora; inténtalo otra vez.")
             return
-        await self._bot.send_notice(_cap(answer, 1800))
+        except LLMError as exc:
+            logger.warning("qa outcome=failed error=%s", type(exc).__name__)
+            await self._bot.send_notice("No pude responder ahora; inténtalo otra vez.")
+            return
+        attachment_count = sum(len(m.attachments) for m in thread.messages)
+        logger.info(
+            "qa outcome=success attachments=%d attachment_context=%s",
+            attachment_count,
+            ("true" if attachment_count else "false"),
+        )
+        # Structured contract → deterministic safe section formatting.
+        await self._bot.send_qa_answer(parsed.answer, parsed.sections)
 
     async def _act_summarize_thread(self, payload: dict[str, Any]) -> None:
         thread_id = str(payload.get("thread_id") or "")
@@ -195,21 +308,106 @@ class EmailAssistant:
             await self._bot.send_notice("¿Qué hilo? Responde a un resumen de InboxBridge.")
             return
         try:
-            thread = await self._gmail.fetch_thread_context(thread_id)
-            await self._bot.send_typing()
-            summary = await self._ai.text(
-                prompts.summarize_thread_messages(thread), max_tokens=600, task="thread_summary"
+            thread = await self._gmail.fetch_thread_context(
+                thread_id, with_attachments=True
             )
-        except LLMError:
-            await self._bot.send_notice("No pude resumir el hilo ahora; inténtalo otra vez.")
+            await self._bot.send_typing()
+        except Exception as exc:
+            logger.warning("thread_summary structured outcome=failed error=%s", type(exc).__name__)
+            await self._bot.send_notice("No pude generar el resumen ahora; inténtalo otra vez.")
             return
-        await self._bot.send_notice(_cap(summary, 1800))
+        attachment_count = sum(len(m.attachments) for m in thread.messages)
+        attachment_context = "true" if attachment_count else "false"
+        # HARD total budget for ONE user request: 3 provider generations.
+        # Model alternation: attempt 1 primary, attempt 2 fallback model (or
+        # primary again when unset), attempt 3 plain summary on the next
+        # model in the alternation. Never 2+2+2+2.
+        models = alternate_text_models(
+            self._settings.effective_text_model,
+            self._settings.effective_text_fallback_model,
+            task="thread_summary",
+        )
+        try:
+            parsed = await call_structured(
+                lambda: self._ai.text(
+                    prompts.summarize_thread_messages(thread),
+                    max_tokens=self._settings.llm_max_tokens_thread_summary,
+                    task="thread_summary",
+                    require_complete=True,
+                    model=models(),
+                ),
+                parse_thread_summary,
+                max_attempts=2,
+                base_backoff=self._settings.retry_backoff_base,
+                task="thread_summary",
+            )
+            logger.info(
+                "thread_summary structured outcome=success attachments=%d "
+                "attachment_context=%s",
+                attachment_count,
+                attachment_context,
+            )
+            # Structured contract → deterministic safe section formatting.
+            await self._bot.send_summary_answer(parsed.headline, parsed.sections)
+            return
+        except StructuredOutputError:
+            # Generation succeeded but the structured contract never parsed;
+            # the raw model output is an implementation detail, never shown.
+            logger.warning(
+                "thread_summary structured outcome=invalid_structure attachments=%d "
+                "attachment_context=%s",
+                attachment_count,
+                attachment_context,
+            )
+        except LLMError as exc:
+            logger.warning(
+                "thread_summary structured outcome=failed error=%s", type(exc).__name__
+            )
+
+        # Layer B (attempt 3 of the hard budget): ONE plain-summary generation
+        # (no JSON contract) so a useful summary still reaches the user when
+        # the structured path is exhausted.
+        try:
+            plain = await call_with_retry(
+                lambda: self._ai.text(
+                    prompts.plain_summarize_thread_messages(thread),
+                    max_tokens=self._settings.llm_max_tokens_thread_summary_plain,
+                    task="thread_summary_plain",
+                    require_complete=True,
+                    model=models(),
+                ),
+                max_attempts=1,
+                base_backoff=self._settings.retry_backoff_base,
+            )
+        except LLMError as exc:
+            logger.warning(
+                "thread_summary fallback=plain outcome=failed error=%s",
+                type(exc).__name__,
+            )
+            await self._bot.send_notice(
+                "No pude generar el resumen ahora; inténtalo otra vez."
+            )
+            return
+        logger.info(
+            "thread_summary fallback=plain outcome=success attachments=%d "
+            "attachment_context=%s",
+            attachment_count,
+            attachment_context,
+        )
+        # Safe rich rendering (escaped, emoji-led headings) → plain-text
+        # fallback if the formatted send fails. Raw model text is never shown
+        # as JSON, and malformed structured output never reached this point.
+        await self._bot.send_rich_notice(_cap(plain, 1800))
 
     # ── Gmail attachment delivery to Telegram ───────────────────────────────
 
     async def _act_get_attachment(self, payload: dict[str, Any]) -> None:
         tg_message_id = int(payload.get("tg_message_id") or 0)
-        index = int(payload.get("index") or -1)  # -1 → list panel
+        # Distinguish "no index" (→ list panel) from attachment #0, which is a
+        # real, deliverable index. ``payload.get("index") or -1`` would wrongly
+        # treat 0 as "no index" and re-show the panel forever.
+        raw_index = payload.get("index")
+        index = -1 if raw_index is None else int(raw_index)
         message_id = self._storage.get_meta(f"tgm:{tg_message_id}") or ""
         if not message_id:
             await self._bot.send_notice("No puedo asociar eso a ningún correo.")
@@ -256,6 +454,10 @@ class EmailAssistant:
             return
         data = await self._gmail.fetch_attachment_bytes(email.message_id, index)
         if data is None:
+            logger.warning(
+                "attachment_delivery outcome=failed error=%s",
+                "AttachmentUnreadable",
+            )
             await self._bot.send_notice("No pude leer ese adjunto.")
             return
         path = self._bot.write_temp_file(attachment.filename, data)
@@ -263,6 +465,11 @@ class EmailAssistant:
             await self._bot.send_document_file(path, attachment.filename)
         finally:
             _remove_file(path)
+        logger.info(
+            "attachment_delivery outcome=success mime=%s bytes=%d",
+            _coarse_mime(mime),
+            attachment.size_bytes,
+        )
 
     # ── mark read / archive ─────────────────────────────────────────────────
 
@@ -499,24 +706,52 @@ class EmailAssistant:
             return  # ambiguity/unknown already handled (asked)
         await self._bot.send_typing()
         try:
-            body = await self._ai.text(
-                prompts.compose_messages(
-                    contact["display_name"],
-                    instruction or "Saluda y presenta el asunto.",
-                ),
-                max_tokens=self._settings.llm_max_tokens_draft,
+            messages = prompts.compose_messages(
+                contact["display_name"],
+                instruction or "Saluda y presenta el asunto.",
+            )
+            models = alternate_text_models(
+                self._settings.effective_text_model,
+                self._settings.effective_text_fallback_model,
                 task="compose",
+            )
+            # Bounded retry (one extra attempt) covers transient LLMEmptyResponse.
+            # The retry uses the SAME recipient + instruction, and the draft is
+            # only built/presented after one AI call succeeds (never two drafts).
+            content = await call_with_retry(
+                lambda: self._ai.text(
+                    messages,
+                    max_tokens=self._settings.llm_max_tokens_draft,
+                    task="compose",
+                    require_complete=True,
+                    model=models(),
+                ),
+                max_attempts=2,
+                base_backoff=self._settings.retry_backoff_base,
             )
         except LLMError:
             await self._bot.send_notice("No pude redactar el correo ahora; inténtalo otra vez.")
             return
-        subject = _default_subject(instruction)
+        subject, body = _parse_compose(content)
+        if not body:
+            await self._bot.send_notice("No pude redactar el correo ahora; inténtalo otra vez.")
+            return
+        if not subject:
+            subject = _FALLBACK_SUBJECT  # safe deterministic fallback, never the command
+        # Defensive: never leak the recipient's address into the subject.
+        subject = _strip_recipient_from_subject(subject, contact["email"])
+        try:
+            body = finalize_draft_body(body, self._settings.email_signature_name)
+        except LLMError:
+            await self._bot.send_notice("No pude redactar el correo ahora; inténtalo otra vez.")
+            return
         draft = DraftReply(
             thread_id="",
             subject=subject,
             to=[EmailAddress(contact["display_name"], contact["email"])],
             cc=[],
             body=body,
+            attachments=tuple(payload.get("attachments") or ()),
         )
         await self._present_new_draft(draft, user_id=user_id)
 
@@ -527,32 +762,61 @@ class EmailAssistant:
         contact = await self._resolve_recipient(recipient_phrase, user_id)
         if contact is None:
             return
-        gmail_message_id = self._storage.get_meta(f"tgm:{tg_message_id}") or ""
+        # Freeze the EXACT source Gmail message: the coordinator/bot already
+        # resolved it from the Telegram summary mapping (tgm: meta) when the
+        # message was dispatched; fall back to re-deriving only as a safety
+        # net for UI flows that did not carry it.
+        gmail_message_id = str(payload.get("message_id") or "")
+        if not gmail_message_id and tg_message_id:
+            gmail_message_id = self._storage.get_meta(f"tgm:{tg_message_id}") or ""
         if not gmail_message_id:
             await self._bot.send_notice("No puedo asociar eso a ningún correo.")
             return
         try:
             original = await self._gmail.fetch_message(gmail_message_id)
             await self._bot.send_typing()
-            body = await self._ai.text(
-                prompts.forward_body_messages(original),
-                max_tokens=self._settings.llm_max_tokens_draft,
+            messages = prompts.forward_note_messages(original)
+            models = alternate_text_models(
+                self._settings.effective_text_model,
+                self._settings.effective_text_fallback_model,
                 task="forward",
+            )
+            # Bounded retry (one extra attempt) covers transient LLMEmptyResponse.
+            # The retry reuses the SAME fetched original; attachments are only
+            # collected AFTER the note succeeds, so no duplicate temp files.
+            note = await call_with_retry(
+                lambda: self._ai.text(
+                    messages,
+                    max_tokens=self._settings.llm_max_tokens_draft,
+                    task="forward",
+                    require_complete=True,
+                    model=models(),
+                ),
+                max_attempts=2,
+                base_backoff=self._settings.retry_backoff_base,
             )
         except LLMError:
             await self._bot.send_notice("No pude preparar el reenvío ahora; inténtalo otra vez.")
             return
         subject = f"Fwd: {original.subject}"
         # Include the original's attachments (bounded; the preview shows them
-        # and the send pipeline verifies them against Gmail).
+        # and the send pipeline verifies them against Gmail). The original is
+        # NEVER reconstructed by the LLM — only the short note travels in the
+        # body; the trusted original is quoted at send time from Gmail.
         attachments = await self._collect_original_attachments(original)
+        try:
+            note = finalize_draft_body(note, self._settings.email_signature_name)
+        except LLMError:
+            await self._bot.send_notice("No pude preparar el reenvío ahora; inténtalo otra vez.")
+            return
         draft = DraftReply(
             thread_id="",
             subject=subject,
             to=[EmailAddress(contact["display_name"], contact["email"])],
             cc=[],
-            body=body,
+            body=note,
             attachments=attachments,
+            forward_of=gmail_message_id,
         )
         await self._present_new_draft(draft, user_id=user_id)
 
@@ -604,6 +868,13 @@ class EmailAssistant:
         display_match = _re.search(r"<([^<>@\s]+@[^<>\s]+)>", phrase)
         if display_match:
             phrase = display_match.group(1)
+        # The phrase may carry trailing words after the address (e.g. a photo
+        # caption "a alguien@gmail.com con esta foto"): the FIRST bare email
+        # in the phrase is the deterministic recipient (still shown in the
+        # preview before anything can be sent).
+        email_match = _re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", phrase)
+        if email_match:
+            phrase = email_match.group(0)
         # Bare valid email → direct destination (still shown in preview).
         from .contacts import validate_email
 
@@ -737,13 +1008,43 @@ def _parse_alias_instruction(text: str, *, add: bool) -> tuple[str, str] | None:
     return alias, contact
 
 
-def _default_subject(instruction: str) -> str:
-    """Heuristic subject from the instruction; the user can change it later."""
-    for word in instruction.split():
-        if "@" in word:
-            continue
-    subject = " ".join(instruction.split()[:6])
-    return subject[:80] or "Sin asunto"
+_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+#: Safe deterministic fallback subject when the LLM does not produce one.
+_FALLBACK_SUBJECT = "Kein Betreff"
+
+
+def _parse_compose(content: str) -> tuple[str, str]:
+    """Parse the compose LLM JSON ``{"subject_de": ..., "body_de": ...}``.
+
+    Tolerant like the summary parser: when the output is not valid JSON, the
+    whole text becomes the body and the subject is empty (the caller applies
+    the safe fallback). The raw bot command NEVER becomes the subject.
+    Returns ``(subject, body)``.
+    """
+    match = _JSON_BLOCK_RE.search(content)
+    if match is not None:
+        try:
+            payload = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            body = payload.get("body_de")
+            subject = payload.get("subject_de")
+            if isinstance(body, str) and body.strip():
+                subject = subject if isinstance(subject, str) else ""
+                return subject.strip(), body.strip()
+    return "", content.strip()
+
+
+def _strip_recipient_from_subject(subject: str, recipient_email: str) -> str:
+    """Never leak the recipient's email address into the generated subject."""
+    if not subject or not recipient_email:
+        return subject
+    cleaned = re.sub(
+        re.escape(recipient_email), "", subject, flags=re.IGNORECASE
+    ).strip(" .,;:!?¿¡")
+    return cleaned[:80] or _FALLBACK_SUBJECT
 
 
 def _remove_file(path: str) -> None:

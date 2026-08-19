@@ -46,12 +46,19 @@ BOT_USERNAME = "inboxbridge_bot"
 
 
 class FakeFile:
-    """Minimal Telegram File stand-in with the blocking ``download`` API."""
+    """Minimal Telegram File stand-in with the PTB >=20 async download API.
+
+    ``download`` (removed in PTB 20) deliberately does NOT exist, so tests
+    prove the production path never relies on the obsolete API.
+    """
 
     def __init__(self, data: bytes) -> None:
         self._data = data
+        self.fail_download = False
 
-    def download(self, custom_path: Any = None) -> Any:
+    async def download_to_drive(self, custom_path: Any = None) -> Any:
+        if self.fail_download:
+            raise RuntimeError("simulated download failure")
         path = Path(custom_path)
         path.write_bytes(self._data)
         return path
@@ -67,6 +74,8 @@ class FakeSender:
         self.files: dict[str, FakeFile] = {}
         self.downloaded: list[Any] = []
         self.files_delivered: list[tuple[str, bytes]] = []
+        self.parse_modes: list[ParseMode | None] = []
+        self.fail_html: bool = False  # True: formatted (HTML) sends raise
         self._next_id = 1
 
     async def send_message(
@@ -79,6 +88,9 @@ class FakeSender:
         link_preview_options: LinkPreviewOptions | None = None,
         reply_parameters: ReplyParameters | None = None,
     ) -> Message:
+        if self.fail_html and parse_mode == ParseMode.HTML:
+            raise RuntimeError("simulated formatted send failure")
+        self.parse_modes.append(parse_mode)
         message = Message(
             message_id=self._next_id,
             date=datetime.now(UTC),
@@ -1141,6 +1153,7 @@ def _photo_message(
     chat_id: int = CHAT_ID,
     user_id: int = 7,
     reply_to: Message | None = None,
+    caption: str | None = None,
 ) -> Message:
     photo = PhotoSize(
         file_id="photo-1",
@@ -1155,6 +1168,7 @@ def _photo_message(
         chat=Chat(id=chat_id, type=ChatType.GROUP),
         from_user=_user(user_id),
         photo=[photo],
+        caption=caption,
         reply_to_message=reply_to,
     )
 
@@ -1224,7 +1238,8 @@ async def test_oversized_attachment_rejected_with_notice(make_env: Any, tmp_path
     await bot.process_update(_update(message))
 
     requests = await _drain(bot)
-    assert requests[0].attachments == ()  # rejected
+    # Rejected → the attachment-bearing action ABORTS (no misleading draft).
+    assert requests == []
     assert "grande" in (sender.messages[-1].text or "")  # notice posted
 
 
@@ -1257,8 +1272,8 @@ async def test_too_many_attachments_rejected(make_env: Any, tmp_path: Path) -> N
     await bot.process_update(_update(message))
 
     requests = await _drain(bot)
-    assert len(requests) == 1
-    assert requests[0].attachments == ()  # batch rejected
+    # Rejected → the attachment-bearing action ABORTS (no misleading draft).
+    assert requests == []
     assert any("Demasiados adjuntos" in (m.text or "") for m in sender.messages)
 
 

@@ -194,10 +194,6 @@ class App:
         reply_worker.start()
         self._reply_worker = reply_worker
 
-        reconcile_sweep = ReconciliationSweep(reply_coordinator)
-        reconcile_sweep.start()
-        self._reconcile_sweep = reconcile_sweep
-
         # V1.1 wiring: assistant (contacts/reminders/QA/actions) + intent
         # routing + reminder scheduler. The assistant reuses the coordinator's
         # verified-delivery pipeline for new drafts (compose/forward/edits).
@@ -209,6 +205,13 @@ class App:
         bot.register_action_callback(assistant.handle)
         bot.register_assistant(assistant)
         bot.set_intent_classifier(IntentClassifier(services.ai))
+        # Restart-safe draft actions: stale draft buttons keep working after a
+        # restart (cancel/edit/send with explicit confirmation).
+        bot.register_draft_actions(
+            reply_coordinator.restore_pending,
+            reply_coordinator.send_confirmed_draft_id,
+            reply_coordinator.cancel_confirmed_draft_id,
+        )
 
         reminder_scheduler = ReminderScheduler(
             services.storage, services.bot, interval_seconds=30.0
@@ -218,9 +221,16 @@ class App:
 
         await services.bot.start()
 
-        # Reconcile drafts left in-flight by a previous process. Never resends:
-        # verifies against Gmail and resolves sent_unverified/sending states.
+        # Reconcile drafts left in-flight by a previous process FIRST. Never
+        # resends: verifies against Gmail and resolves sent_unverified/sending
+        # states. The periodic sweep (which may terminal-ify exhausted drafts
+        # via the watchdog) starts only AFTER this, so a draft that actually
+        # reached Gmail is verified rather than reported as unverifiable.
         await reply_coordinator.reconcile_on_startup()
+
+        reconcile_sweep = ReconciliationSweep(reply_coordinator)
+        reconcile_sweep.start()
+        self._reconcile_sweep = reconcile_sweep
 
         logger.info("InboxBridge started (SEND_EMAILS=%s)", services.settings.send_emails)
         try:
