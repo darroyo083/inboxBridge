@@ -147,6 +147,62 @@ function ScrollToTop() {
   return null;
 }
 
+function ScrollRevealObserver() {
+  const { pathname } = useRoute();
+
+  useEffect(() => {
+    const page = document.querySelector<HTMLElement>(".page");
+    if (!page) return undefined;
+
+    const targets = Array.from(page.querySelectorAll<HTMLElement>([
+      ".home-previews",
+      ".preview-grid > .preview-link",
+      ".process-section",
+      ".process-list > .process-row",
+      ".language-panel",
+      ".language-steps > div",
+      ".capabilities-section",
+      ".capabilities-grid > .capability-card",
+      ".capability-note",
+      ".safety-intro",
+      ".principles-section",
+      ".principles-list > .principle-row",
+      ".send-boundary",
+      ".boundary-flow",
+      ".system-section",
+      ".system-diagram",
+      ".architecture-notes",
+      ".architecture-notes > div",
+    ].join(", ")));
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    targets.forEach((target, index) => {
+      target.classList.add("scroll-reveal");
+      target.style.setProperty("--reveal-delay", `${(index % 3) * 70}ms`);
+    });
+    page.dataset.motionReady = "true";
+
+    if (reducedMotion || !("IntersectionObserver" in window)) {
+      targets.forEach((target) => { target.dataset.revealed = "true"; });
+      return undefined;
+    }
+
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return;
+        const target = entry.target as HTMLElement;
+        target.dataset.revealed = "true";
+        observer.unobserve(target);
+      });
+    }, { threshold: 0.12, rootMargin: "0px 0px -8% 0px" });
+
+    targets.forEach((target) => observer.observe(target));
+    return () => observer.disconnect();
+  }, [pathname]);
+
+  return null;
+}
+
 function Page({ children, className = "" }: PageProps) {
   return <main className={`page ${className}`}>{children}</main>;
 }
@@ -287,29 +343,6 @@ function HalftoneField() {
   return <canvas ref={canvasRef} className="halftone-field" aria-hidden="true" />;
 }
 
-function Reveal({ children, className = "" }: PageProps) {
-  const elementRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const element = elementRef.current;
-    if (!element) return;
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches || !("IntersectionObserver" in window)) {
-      element.classList.add("is-visible");
-      return;
-    }
-    element.classList.add("reveal-pending");
-    const observer = new IntersectionObserver(([entry]) => {
-      if (!entry.isIntersecting) return;
-      element.classList.add("is-visible");
-      observer.disconnect();
-    }, { threshold: 0.12 });
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
-
-  return <div ref={elementRef} className={`reveal ${className}`}>{children}</div>;
-}
-
 function FlowPreview() {
   return (
     <div className="hero-visual" aria-label="InboxBridge flow preview">
@@ -373,7 +406,7 @@ function HomePage() {
           <h2>One interface.<br />Four deliberate layers.</h2>
           <p>See how InboxBridge turns a crowded inbox into a conversation you can trust.</p>
         </div>
-        <Reveal className="preview-grid">
+        <div className="preview-grid">
           {homePreviews.map((preview) => (
             <RouteLink className="preview-link" to={preview.to} key={preview.to}>
               <span className="preview-number">{preview.number}</span>
@@ -381,7 +414,7 @@ function HomePage() {
               <ExternalArrow />
             </RouteLink>
           ))}
-        </Reveal>
+        </div>
       </section>
     </Page>
   );
@@ -411,7 +444,7 @@ function HowItWorksPage() {
     <Page className="inner-page">
       <PageHeader title={<>From new mail to<br /><em>verified delivery.</em></>} intro="A clear sequence of small decisions. InboxBridge keeps the person in the loop where it matters." />
       <section className="process-section page-shell">
-        <Reveal className="process-list">{operations.map((operation) => <ProcessRow key={operation.number} operation={operation} />)}</Reveal>
+        <div className="process-list">{operations.map((operation) => <ProcessRow key={operation.number} operation={operation} />)}</div>
       </section>
       <section className="language-panel page-shell">
         <div><h2>One conversation,<br /><em>multiple languages.</em></h2><p>Incoming mail is summarized in Spanish. Your instructions become a polished German draft. The Spanish review stays visible until you confirm.</p></div>
@@ -448,9 +481,9 @@ function CapabilitiesPage() {
     <Page className="inner-page">
       <PageHeader title={<>The useful parts,<br /><em>without the noise.</em></>} intro="InboxBridge is focused on the moments where email becomes work: understanding context, writing clearly, and sending deliberately." />
       <section className="capabilities-section page-shell">
-        <Reveal className="capabilities-grid">
+        <div className="capabilities-grid">
           {capabilityGroups.map((group, index) => <CapabilityCard featured={index === 0} group={group} key={group.index} />)}
-        </Reveal>
+        </div>
       </section>
       <section className="capability-note page-shell"><p>Ask about a PDF. Summarize the thread. Make the draft shorter. Forward it to a saved contact. The interface stays conversational while the system stays structured.</p></section>
     </Page>
@@ -467,13 +500,13 @@ function SafetyPage() {
   return (
     <Page className="inner-page safety-page">
       <PageHeader title={<>AI proposes.<br /><em>Systems decide.</em></>} intro="The model can suggest language. It cannot decide who receives it, whether it is complete, or whether it has been sent." />
-      <Reveal className="safety-intro page-shell"><div className="safety-statement"><span className="safety-quote">“</span><p>InboxBridge treats a draft as a proposal, not an action.</p></div><div className="safety-state"><span>SAFE SEND STATE</span><strong>Awaiting explicit confirmation</strong><small>AI output is visible. Gmail is untouched.</small></div></Reveal>
+      <div className="safety-intro page-shell"><div className="safety-statement"><span className="safety-quote">“</span><p>InboxBridge treats a draft as a proposal, not an action.</p></div><div className="safety-state"><span>SAFE SEND STATE</span><strong>Awaiting explicit confirmation</strong><small>AI output is visible. Gmail is untouched.</small></div></div>
       <section className="principles-section page-shell">
-        <Reveal className="principles-list">{safetyPrinciples.map((principle) => <article className="principle-row" key={principle.number}><span className="principle-number">{principle.number}</span><h2>{principle.title}</h2><p>{principle.copy}</p></article>)}</Reveal>
+        <div className="principles-list">{safetyPrinciples.map((principle) => <article className="principle-row" key={principle.number}><span className="principle-number">{principle.number}</span><h2>{principle.title}</h2><p>{principle.copy}</p></article>)}</div>
       </section>
       <section className="send-boundary page-shell">
         <div className="section-heading"><h2>Every handoff has a visible state.</h2></div>
-        <Reveal className="boundary-flow"><div><span>01</span><strong>AI draft</strong><small>proposal</small></div><i aria-hidden="true" /><div className="boundary-active"><span>02</span><strong>Confirm</strong><small>human decision</small></div><i aria-hidden="true" /><div><span>03</span><strong>Gmail send</strong><small>verified result</small></div></Reveal>
+        <div className="boundary-flow"><div><span>01</span><strong>AI draft</strong><small>proposal</small></div><i aria-hidden="true" /><div className="boundary-active"><span>02</span><strong>Confirm</strong><small>human decision</small></div><i aria-hidden="true" /><div><span>03</span><strong>Gmail send</strong><small>verified result</small></div></div>
       </section>
     </Page>
   );
@@ -484,15 +517,15 @@ function ArchitecturePage() {
     <Page className="inner-page architecture-page">
       <PageHeader title={<>A small core,<br /><em>clear boundaries.</em></>} intro="Telegram is the interface. Gmail remains the source of truth. InboxBridge coordinates the decisions between them." />
       <section className="system-section page-shell">
-        <Reveal className="system-diagram">
+        <div className="system-diagram">
           <div className="system-node system-interface"><span className="mono-label">INTERFACE</span><strong>Telegram</strong><small>Bot API</small></div>
           <div className="system-link" aria-hidden="true"><span>INPUT</span></div>
           <div className="system-core"><span className="mono-label">CORE ENGINE</span><strong>InboxBridge</strong><p>Intent routing, structured LLM output, trusted state, and verified delivery.</p><div className="core-parts"><span>Intent</span><span>LLM</span><span>Docs</span><span>State</span><span>Delivery</span></div></div>
           <div className="system-link" aria-hidden="true"><span>OUTPUT</span></div>
           <div className="system-node system-external"><span className="mono-label">SOURCE OF TRUTH</span><strong>Gmail</strong><small>OAuth 2.0 / API</small></div>
-        </Reveal>
+        </div>
       </section>
-      <Reveal className="architecture-notes page-shell"><div><h2>Built to stay small.</h2><p>Docker and Linux VPS deployment keep the runtime portable. SQLite stores identifiers and statuses, not email bodies or attachment content.</p></div><div><h2>Designed to reconcile.</h2><p>Retries and restarts return to trusted state. An uncertain send is checked against Gmail before anything can be sent again.</p></div></Reveal>
+      <div className="architecture-notes page-shell"><div><h2>Built to stay small.</h2><p>Docker and Linux VPS deployment keep the runtime portable. SQLite stores identifiers and statuses, not email bodies or attachment content.</p></div><div><h2>Designed to reconcile.</h2><p>Retries and restarts return to trusted state. An uncertain send is checked against Gmail before anything can be sent again.</p></div></div>
     </Page>
   );
 }
@@ -532,6 +565,7 @@ function App() {
     <AppRouter>
       <PageMeta />
       <ScrollToTop />
+      <ScrollRevealObserver />
       <Header />
       <PageTransition />
       <Footer />
