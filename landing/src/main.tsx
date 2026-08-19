@@ -151,10 +151,9 @@ function Page({ children, className = "" }: PageProps) {
   return <main className={`page ${className}`}>{children}</main>;
 }
 
-function PageHeader({ kicker, title, intro }: { kicker: string; title: ReactNode; intro: string }) {
+function PageHeader({ title, intro }: { title: ReactNode; intro: string }) {
   return (
     <header className="page-header page-shell">
-      <span className="eyebrow">{kicker}</span>
       <h1>{title}</h1>
       <p>{intro}</p>
     </header>
@@ -188,8 +187,8 @@ function HalftoneField() {
       const bounds = host.getBoundingClientRect();
       width = bounds.width;
       height = bounds.height;
-      cellSize = width < 520 ? 23 : 16;
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      cellSize = width < 520 ? 25 : 18;
+      const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
       canvas.width = Math.max(1, Math.floor(width * dpr));
       canvas.height = Math.max(1, Math.floor(height * dpr));
       canvas.style.width = `${width}px`;
@@ -205,22 +204,29 @@ function HalftoneField() {
       pointer.y += (pointer.targetY - pointer.y) * Math.min(1, elapsed * 0.008);
       context.clearRect(0, 0, width, height);
 
-      const time = reduceMotion ? 0 : timestamp * 0.0002;
+      const time = reduceMotion ? 0 : timestamp * 0.00016;
       const columns = Math.ceil(width / cellSize);
       const rows = Math.ceil(height / cellSize);
       for (let row = 0; row < rows; row += 1) {
         for (let column = 0; column < columns; column += 1) {
           const x = column * cellSize + cellSize * 0.5;
           const y = row * cellSize + cellSize * 0.5;
-          const wave = (Math.sin(x * 0.014 + time) + Math.cos(y * 0.018 - time * 0.8) + 2) * 0.25;
-          const flowDistance = ((x - width * 0.54) / (width * 0.52)) ** 2 + ((y - height * 0.48) / (height * 0.75)) ** 2;
+          const nx = x / width;
+          const ny = y / height;
+          const wave = (Math.sin(x * 0.012 + time * 1.4) + Math.cos(y * 0.016 - time) + Math.sin((x + y) * 0.006 - time * 0.7) + 3) / 6;
+          const flowDistance = ((x - width * 0.54) / (width * 0.7)) ** 2 + ((y - height * 0.48) / (height * 0.9)) ** 2;
           const flowField = Math.max(0, 1 - flowDistance);
-          const pointerDistance = Math.hypot(x / width - pointer.x, y / height - pointer.y);
-          const pointerField = pointer.active ? Math.max(0, 1 - pointerDistance * 4.8) : 0;
-          const edgeFade = Math.min(1, Math.min(x, width - x, y, height - y) / (cellSize * 2.5));
-          const energy = Math.min(1, (0.1 + wave * 0.25 + flowField * 0.42 + pointerField * 0.6) * edgeFade);
-          const size = 0.8 + energy * (reduceMotion ? 1.6 : 2.7);
-          context.fillStyle = `rgba(159, 190, 230, ${0.018 + energy * 0.12})`;
+          const pointerDistance = Math.hypot(nx - pointer.x, ny - pointer.y);
+          const pointerField = pointer.active ? Math.max(0, 1 - pointerDistance * 5.2) ** 2 : 0;
+          const ripple = pointer.active ? (Math.sin(pointerDistance * 42 - time * 7) + 1) * 0.5 * pointerField : 0;
+          const edgeFade = Math.min(1, Math.min(nx, 1 - nx, ny, 1 - ny) * 5);
+          const energy = Math.min(1, (0.08 + wave * 0.24 + flowField * 0.5 + pointerField * 0.65 + ripple * 0.35) * edgeFade);
+          if (energy < 0.04) continue;
+          const size = 0.7 + energy * (reduceMotion ? 1.8 : 3.8) + pointerField * 2;
+          const blue = pointerField > 0.18 && Math.sin(column * 1.7 + row * 0.6) > 0.05;
+          context.fillStyle = blue
+            ? `rgba(81, 163, 255, ${0.08 + pointerField * 0.34})`
+            : `rgba(159, 190, 230, ${0.025 + energy * 0.14})`;
           context.fillRect(x - size * 0.5, y - size * 0.5, size, size);
         }
       }
@@ -352,10 +358,31 @@ function StatusBar() {
   return (
     <div className="status-bar page-shell">
       <span className="status-dot" aria-hidden="true" />
-      <strong>ACTIVE DEVELOPMENT</strong>
+      <strong>LIVE / SELF-HOSTED</strong>
       <span className="status-divider">/</span>
-      <span>Core flows operational, attachment hardening in progress.</span>
+      <span>Gmail context, Telegram review, verified delivery.</span>
     </div>
+  );
+}
+
+function ProductDemo() {
+  return (
+    <section className="product-demo page-shell">
+      <div className="demo-heading">
+        <span className="demo-kicker">A REAL WORKFLOW</span>
+        <h2>See it in <em>action.</em></h2>
+        <p>One message, one clear decision path, from a German inbox to a verified reply.</p>
+      </div>
+      <Reveal className="demo-flow">
+        <article className="demo-card demo-email"><span className="demo-label">EMAIL / INCOMING</span><strong>Dokumente für den Termin</strong><small>Leonie Fischer · 09:42</small><p>Guten Morgen Daniel, anbei finden Sie das geschützte PDF für unseren Termin.</p><span className="attachment">PDF · 2.4 MB <b>ATTACHED</b></span></article>
+        <i className="demo-arrow" aria-hidden="true" />
+        <article className="demo-card demo-telegram"><span className="demo-label">TELEGRAM / SUMMARY</span><strong>Resumen listo</strong><p>Daniel, Leonie te envía un PDF protegido con la información para la reunión.</p><div className="demo-buttons"><span>Preguntar</span><span>Responder</span><span>Adjuntos</span></div></article>
+        <i className="demo-arrow" aria-hidden="true" />
+        <article className="demo-card demo-draft"><span className="demo-label">DRAFT / REVIEW</span><strong>Respuesta preparada</strong><p><b>DE</b> Vielen Dank, ich prüfe das Dokument vor unserem Termin.</p><p className="translation"><b>ES</b> Gracias, revisaré el documento antes de nuestra reunión.</p><div className="demo-buttons"><span className="selected">Enviar</span><span>Editar</span><span>Cancelar</span></div></article>
+        <i className="demo-arrow" aria-hidden="true" />
+        <article className="demo-card demo-sent"><span className="demo-label">DELIVERY / VERIFIED</span><strong>✓ Sent and verified</strong><p>Gmail confirmed the right thread, recipient, and attachment.</p><small>09:44 · SAFE SEND COMPLETE</small></article>
+      </Reveal>
+    </section>
   );
 }
 
@@ -371,7 +398,7 @@ function HomePage() {
     <Page className="home-page">
       <section className="hero page-shell">
         <div className="hero-copy">
-          <div className="status-badge"><span className="status-dot" />Work in progress</div>
+          <div className="status-badge"><span className="status-dot" />LIVE / SELF-HOSTED</div>
           <h1>Your inbox,<br /><em>conversational.</em></h1>
           <p>A multilingual Gmail assistant in Telegram, grounded in threads and attachments, with explicit confirmation before any message leaves.</p>
           <div className="hero-actions">
@@ -382,9 +409,9 @@ function HomePage() {
         <FlowPreview />
       </section>
       <StatusBar />
+      <ProductDemo />
       <section className="home-previews page-shell">
         <div className="section-heading">
-          <span className="eyebrow">THE SYSTEM</span>
           <h2>One interface.<br />Four deliberate layers.</h2>
           <p>See how InboxBridge turns a crowded inbox into a conversation you can trust.</p>
         </div>
@@ -424,12 +451,12 @@ function ProcessRow({ operation }: { operation: typeof operations[number] }) {
 function HowItWorksPage() {
   return (
     <Page className="inner-page">
-      <PageHeader kicker="HOW IT WORKS" title={<>From new mail to<br /><em>verified delivery.</em></>} intro="A clear sequence of small decisions. InboxBridge keeps the person in the loop where it matters." />
+      <PageHeader title={<>From new mail to<br /><em>verified delivery.</em></>} intro="A clear sequence of small decisions. InboxBridge keeps the person in the loop where it matters." />
       <section className="process-section page-shell">
         <Reveal className="process-list">{operations.map((operation) => <ProcessRow key={operation.number} operation={operation} />)}</Reveal>
       </section>
       <section className="language-panel page-shell">
-        <div><span className="eyebrow">LANGUAGE TRACE</span><h2>One conversation,<br /><em>multiple languages.</em></h2><p>Incoming mail is summarized in Spanish. Your instructions become a polished German draft. The Spanish review stays visible until you confirm.</p></div>
+        <div><h2>One conversation,<br /><em>multiple languages.</em></h2><p>Incoming mail is summarized in Spanish. Your instructions become a polished German draft. The Spanish review stays visible until you confirm.</p></div>
         <div className="language-steps">
           <div><span>INCOMING</span><strong>German thread</strong><small>“Könnten Sie uns das Dokument senden?”</small></div>
           <div><span>YOUR REVIEW</span><strong>Spanish summary</strong><small>“El cliente solicita el documento.”</small></div>
@@ -461,13 +488,13 @@ function CapabilityCard({ group, featured = false }: { group: typeof capabilityG
 function CapabilitiesPage() {
   return (
     <Page className="inner-page">
-      <PageHeader kicker="CAPABILITIES" title={<>The useful parts,<br /><em>without the noise.</em></>} intro="InboxBridge is focused on the moments where email becomes work: understanding context, writing clearly, and sending deliberately." />
+      <PageHeader title={<>The useful parts,<br /><em>without the noise.</em></>} intro="InboxBridge is focused on the moments where email becomes work: understanding context, writing clearly, and sending deliberately." />
       <section className="capabilities-section page-shell">
         <Reveal className="capabilities-grid">
           {capabilityGroups.map((group, index) => <CapabilityCard featured={index === 0} group={group} key={group.index} />)}
         </Reveal>
       </section>
-      <section className="capability-note page-shell"><span className="eyebrow">IN PRACTICE</span><p>Ask about a PDF. Summarize the thread. Make the draft shorter. Forward it to a saved contact. The interface stays conversational while the system stays structured.</p></section>
+      <section className="capability-note page-shell"><p>Ask about a PDF. Summarize the thread. Make the draft shorter. Forward it to a saved contact. The interface stays conversational while the system stays structured.</p></section>
     </Page>
   );
 }
@@ -481,13 +508,13 @@ const safetyPrinciples = [
 function SafetyPage() {
   return (
     <Page className="inner-page safety-page">
-      <PageHeader kicker="SAFETY" title={<>AI proposes.<br /><em>Systems decide.</em></>} intro="The model can suggest language. It cannot decide who receives it, whether it is complete, or whether it has been sent." />
+      <PageHeader title={<>AI proposes.<br /><em>Systems decide.</em></>} intro="The model can suggest language. It cannot decide who receives it, whether it is complete, or whether it has been sent." />
       <Reveal className="safety-intro page-shell"><div className="safety-statement"><span className="safety-quote">“</span><p>InboxBridge treats a draft as a proposal, not an action.</p></div><div className="safety-state"><span>SAFE SEND STATE</span><strong>Awaiting explicit confirmation</strong><small>AI output is visible. Gmail is untouched.</small></div></Reveal>
       <section className="principles-section page-shell">
         <Reveal className="principles-list">{safetyPrinciples.map((principle) => <article className="principle-row" key={principle.number}><span className="principle-number">{principle.number}</span><h2>{principle.title}</h2><p>{principle.copy}</p></article>)}</Reveal>
       </section>
       <section className="send-boundary page-shell">
-        <div className="section-heading"><span className="eyebrow">THE SEND BOUNDARY</span><h2>Every handoff has a visible state.</h2></div>
+        <div className="section-heading"><h2>Every handoff has a visible state.</h2></div>
         <Reveal className="boundary-flow"><div><span>01</span><strong>AI draft</strong><small>proposal</small></div><i aria-hidden="true" /><div className="boundary-active"><span>02</span><strong>Confirm</strong><small>human decision</small></div><i aria-hidden="true" /><div><span>03</span><strong>Gmail send</strong><small>verified result</small></div></Reveal>
       </section>
     </Page>
@@ -497,7 +524,7 @@ function SafetyPage() {
 function ArchitecturePage() {
   return (
     <Page className="inner-page architecture-page">
-      <PageHeader kicker="ARCHITECTURE" title={<>A small core,<br /><em>clear boundaries.</em></>} intro="Telegram is the interface. Gmail remains the source of truth. InboxBridge coordinates the decisions between them." />
+      <PageHeader title={<>A small core,<br /><em>clear boundaries.</em></>} intro="Telegram is the interface. Gmail remains the source of truth. InboxBridge coordinates the decisions between them." />
       <section className="system-section page-shell">
         <Reveal className="system-diagram">
           <div className="system-node system-interface"><span className="eyebrow">INTERFACE</span><strong>Telegram</strong><small>Bot API</small></div>
@@ -507,7 +534,7 @@ function ArchitecturePage() {
           <div className="system-node system-external"><span className="eyebrow">SOURCE OF TRUTH</span><strong>Gmail</strong><small>OAuth 2.0 / API</small></div>
         </Reveal>
       </section>
-      <Reveal className="architecture-notes page-shell"><div><span className="eyebrow">DEPLOYMENT</span><h2>Built to stay small.</h2><p>Docker and Linux VPS deployment keep the runtime portable. SQLite stores identifiers and statuses, not email bodies or attachment content.</p></div><div><span className="eyebrow">RECOVERY</span><h2>Designed to reconcile.</h2><p>Retries and restarts return to trusted state. An uncertain send is checked against Gmail before anything can be sent again.</p></div></Reveal>
+      <Reveal className="architecture-notes page-shell"><div><h2>Built to stay small.</h2><p>Docker and Linux VPS deployment keep the runtime portable. SQLite stores identifiers and statuses, not email bodies or attachment content.</p></div><div><h2>Designed to reconcile.</h2><p>Retries and restarts return to trusted state. An uncertain send is checked against Gmail before anything can be sent again.</p></div><div className="stack-row"><span>PYTHON</span><span>GMAIL API</span><span>TELEGRAM BOT API</span><span>SQLITE</span><span>DOCKER COMPOSE</span><span>GOOGLE PUB/SUB</span><span>OAUTH 2.0</span></div></Reveal>
     </Page>
   );
 }
@@ -517,8 +544,8 @@ function Footer() {
     <footer className="site-footer">
       <div className="footer-shell page-shell">
         <div className="footer-brand"><LogoMark /><p>Conversational Gmail via Telegram.</p></div>
-        <div className="footer-nav"><span className="eyebrow">EXPLORE</span>{navItems.slice(1).map((item) => <RouteLink key={item.to} to={item.to}>{item.label}</RouteLink>)}</div>
-        <div className="footer-meta"><span className="eyebrow">WORK IN PROGRESS</span><a href={GITHUB_URL} target="_blank" rel="noreferrer">GitHub <ExternalArrow /></a><small>© 2026 Daniel Arroyo</small></div>
+        <div className="footer-nav">{navItems.slice(1).map((item) => <RouteLink key={item.to} to={item.to}>{item.label}</RouteLink>)}</div>
+        <div className="footer-meta"><a href={GITHUB_URL} target="_blank" rel="noreferrer">GitHub <ExternalArrow /></a><small>© 2026 Daniel Arroyo</small></div>
       </div>
     </footer>
   );

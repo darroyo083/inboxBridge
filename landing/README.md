@@ -1,8 +1,11 @@
 # InboxBridge Landing
 
-Public static landing experience for InboxBridge, implemented from the Stitch
-screen `2e95e801d7ba476aa9e520ad7493ce28` in project
-`15616762419389439509`.
+Public static landing experience for the deployed InboxBridge product:
+[inboxbridge.dev](https://inboxbridge.dev).
+
+InboxBridge connects Gmail Primary mail to Telegram with multilingual Spanish
+summaries, German reply/compose/forward drafts, attachment-aware context,
+explicit confirmation, verified delivery, reminders, and restart-safe recovery.
 
 The app uses real browser routes:
 
@@ -34,6 +37,10 @@ Inter and JetBrains Mono are bundled under `public/fonts/` to match the Stitch
 design without a runtime Google Fonts dependency. The page uses CSS diagrams and
 the downloaded Stitch preview only as a visual reference; no backend assets or
 credentials are required.
+
+The visual architecture reflects the actual stack: Python, Gmail API, Telegram
+Bot API, Google Pub/Sub, SQLite, OAuth 2.0, Docker Compose, and configured LLM
+APIs. No credentials, personal addresses, chat IDs, or VPS details belong here.
 
 The GitHub links point to the repository remote:
 `https://github.com/darroyo083/inboxbridge`.
