@@ -233,6 +233,10 @@ class _PendingDraft:
     preview_version: int = 1
     decided: bool | None = None
     future: asyncio.Future[bool] | None = None
+    #: True when this pending was RECONSTRUCTED from a persisted row after a
+    #: restart (the coordinator coroutine that awaited the future is gone, so
+    #: send/cancel must drive the coordinator's verified path directly).
+    restored: bool = False
 
     def resolve(self, confirmed: bool) -> None:
         self.decided = confirmed
@@ -509,6 +513,9 @@ class TelegramBot(TelegramNotifier):
         self._status_provider = status_provider
         self._original_fetcher = original_fetcher
         self._resend_callback: Callable[[int], Awaitable[None]] | None = None
+        self._draft_restorer: Callable[[str], Any] | None = None
+        self._draft_sender: Callable[[int], Awaitable[None]] | None = None
+        self._draft_canceller: Callable[[int], Awaitable[None]] | None = None
         self._action_callback: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None
         self._intent_classifier: Any | None = None
         self._assistant: Any | None = None
@@ -534,6 +541,23 @@ class TelegramBot(TelegramNotifier):
     def register_resend_callback(self, callback: Callable[[int], Awaitable[None]]) -> None:
         """Wire the "Reintentar envío" button to the reply coordinator."""
         self._resend_callback = callback
+
+    def register_draft_actions(
+        self,
+        restorer: Callable[[str], Any],
+        sender: Callable[[int], Awaitable[None]],
+        canceller: Callable[[int], Awaitable[None]],
+    ) -> None:
+        """Wire restart-safe draft actions to the reply coordinator.
+
+        ``restorer`` rebuilds a ``_PendingDraft`` from its persisted row when a
+        stale Telegram button resolves after a restart; ``sender``/``canceller``
+        drive the verified send / cancel for drafts whose original presentation
+        coroutine is gone. Send always requires the explicit button tap.
+        """
+        self._draft_restorer = restorer
+        self._draft_sender = sender
+        self._draft_canceller = canceller
 
     def register_action_callback(
         self, callback: Callable[[str, dict[str, Any]], Awaitable[None]]
@@ -1166,6 +1190,26 @@ class TelegramBot(TelegramNotifier):
                 return pending
         return None
 
+    def _resolve_draft_pending(self, token: str) -> _PendingDraft | None:
+        """Resolve a draft callback token to a pending draft.
+
+        Live pendings live in memory; after a restart they are reconstructed
+        from the PERSISTED row (the coordinator's ``restore_pending``), so a
+        stale Telegram button keeps working safely. A restored pending carries
+        ``restored=True`` so send/cancel route through the coordinator's
+        verified path instead of a (dead) in-memory future.
+        """
+        pending = self._pending_drafts.get(token)
+        if pending is not None:
+            return pending
+        if self._draft_restorer is not None:
+            restored = self._draft_restorer(token)
+            if restored is not None:
+                restored_pending = cast(_PendingDraft, restored)
+                self._pending_drafts[token] = restored_pending
+                return restored_pending
+        return None
+
     async def _send_draft_via_text(self, user_id: int) -> None:
         pending = self._active_pending_for(user_id)
         if pending is None:
@@ -1178,7 +1222,10 @@ class TelegramBot(TelegramNotifier):
             )
             return
         self._pending_drafts.pop(pending.token, None)
-        pending.resolve(True)
+        if pending.restored and self._draft_sender is not None:
+            await self._draft_sender(pending.draft_id)
+        else:
+            pending.resolve(True)
 
     async def _cancel_draft_via_text(self, user_id: int) -> None:
         pending = self._active_pending_for(user_id)
@@ -1186,7 +1233,10 @@ class TelegramBot(TelegramNotifier):
             await self._send("No hay ningún borrador pendiente para cancelar.")
             return
         self._pending_drafts.pop(pending.token, None)
-        pending.resolve(False)
+        if pending.restored and self._draft_canceller is not None:
+            await self._draft_canceller(pending.draft_id)
+        else:
+            pending.resolve(False)
 
     async def _edit_draft_via_text(
         self, user_id: int, text: str, action: IntentAction
@@ -1981,7 +2031,7 @@ class TelegramBot(TelegramNotifier):
             return
 
         # First tap on SEND / CANCEL / EDIT: confirmation UI, no action yet.
-        pending = self._pending_drafts.get(token)
+        pending = self._resolve_draft_pending(token)
         if pending is None:
             await sender.answer_callback_query(
                 query.id, "Este borrador ya no está disponible."
@@ -2073,7 +2123,7 @@ class TelegramBot(TelegramNotifier):
         )
 
     async def _draft_second_step(self, query: CallbackQuery, action: str, token: str) -> None:
-        pending = self._pending_drafts.get(token)
+        pending = self._resolve_draft_pending(token)
         if pending is None:
             await self._ensure_sender().answer_callback_query(
                 query.id, "Este borrador ya no está disponible."
@@ -2092,12 +2142,23 @@ class TelegramBot(TelegramNotifier):
                 )
                 return
             self._pending_drafts.pop(token, None)
-            pending.resolve(True)
+            if pending.restored:
+                # The original presentation coroutine is gone (restart): drive
+                # the coordinator's verified send directly (never auto-send —
+                # this is the explicit owner confirmation tap).
+                if self._draft_sender is not None:
+                    await self._draft_sender(pending.draft_id)
+            else:
+                pending.resolve(True)
             await sender.answer_callback_query(query.id, "Enviando…")
             return
         if action == "cancelyes":
             self._pending_drafts.pop(token, None)
-            pending.resolve(False)
+            if pending.restored:
+                if self._draft_canceller is not None:
+                    await self._draft_canceller(pending.draft_id)
+            else:
+                pending.resolve(False)
             await sender.answer_callback_query(query.id, "Cancelado.")
             return
         if action == "edit":
@@ -2108,7 +2169,7 @@ class TelegramBot(TelegramNotifier):
             )
 
     async def _draft_back(self, query: CallbackQuery, token: str, notice: str) -> None:
-        pending = self._pending_drafts.get(token)
+        pending = self._resolve_draft_pending(token)
         if pending is None:
             await self._ensure_sender().answer_callback_query(
                 query.id, "Este borrador ya no está disponible."
@@ -2519,6 +2580,11 @@ class TelegramBot(TelegramNotifier):
 
         The preview is versioned: any edit re-renders it and bumps the preview
         version — a stale preview can never authorize a send.
+
+        The callback token AND the preview message id are PERSISTED on the
+        draft row, so an unconfirmed draft stays safely actionable across a
+        restart: a stale button resolves back to the draft, Cancel/Edit work,
+        and Send still needs an explicit owner confirmation.
         """
         pending = _PendingDraft(
             token=secrets.token_urlsafe(8),
@@ -2530,6 +2596,8 @@ class TelegramBot(TelegramNotifier):
         message_id = await self._post_draft_preview(pending)
         pending.message_id = message_id
         self._pending_drafts[pending.token] = pending
+        if draft_id:
+            self._storage.set_draft_telegram(draft_id, pending.token, message_id)
         return message_id
 
     async def _post_draft_preview(self, pending: _PendingDraft) -> int:
@@ -2604,6 +2672,10 @@ class TelegramBot(TelegramNotifier):
         new_message_id = await self._post_draft_preview(pending)
         pending.message_id = new_message_id
         pending.preview_version = pending.draft_version
+        # Persist the NEW preview identity so the edited draft also survives a
+        # subsequent restart.
+        if pending.draft_id:
+            self._storage.set_draft_telegram(pending.draft_id, pending.token, new_message_id)
         # Invalidate the old preview + buttons (replay of old callbacks is a no-op).
         self._pending_drafts.pop(old_token, None)
         self._pending_drafts[pending.token] = pending

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -12,6 +13,7 @@ import pytest
 from inboxbridge.db import DraftStatus
 from inboxbridge.models import EmailSummary
 from tests.integration.test_v11_flows import Stack, email_with_attachments, make_email
+from tests.unit.test_telegram_auth import CHAT_ID, _callback_update
 
 
 @pytest.fixture
@@ -125,6 +127,11 @@ async def test_flow_v_restart_preserves_contacts_reminders_and_state(
     bot.register_action_callback(assistant.handle)
     bot.register_assistant(assistant)
     bot.set_intent_classifier(IntentClassifier(ai))
+    bot.register_draft_actions(
+        coordinator.restore_pending,
+        coordinator.send_confirmed_draft_id,
+        coordinator.cancel_confirmed_draft_id,
+    )
 
     # Restart-safe: contacts, aliases and reminders survive.
     assert contacts.resolve("roman").contact["email"] == "femo@femo.ch"
@@ -152,7 +159,6 @@ async def test_flow_v_restart_reconciles_inflight_draft_never_resends(
 
 
 # ── W. CONCURRENCY / DUPLICATE DELIVERY ──────────────────────────────────────
-
 
 async def test_flow_w_duplicate_telegram_updates_do_not_duplicate_sends(
     stack: Stack,
@@ -203,3 +209,237 @@ async def test_flow_w_reminder_duplicate_tick_fires_once(stack: Stack) -> None:
     assert stack.reminders.claim(reminder_id)
     assert not stack.reminders.claim(reminder_id)
     assert stack.reminders.list_pending(7) == []
+
+
+# ── RESTART-SAFE UNCONFIRMED DRAFT ACTIONS ───────────────────────────────────
+
+
+def _restart_services(stack: Stack):
+    """Build a FRESH process over the SAME SQLite file (simulated restart).
+
+    The in-memory ``_pending_drafts`` map is empty; the draft row (PENDING),
+    its callback token and the preview message id survive in the DB, so stale
+    Telegram buttons must resolve back to the draft.
+    """
+    from inboxbridge.assistant import EmailAssistant
+    from inboxbridge.contacts import ContactService
+    from inboxbridge.intents import IntentClassifier
+    from inboxbridge.reminders import ReminderService
+    from inboxbridge.responder import ReplyCoordinator
+    from inboxbridge.telegram.bot import TelegramBot
+    from tests.integration.test_v11_flows import FakeAi, FakeCoordinatorLLM
+    from tests.unit.test_telegram_auth import BOT_ID, BOT_USERNAME, FakeSender
+
+    storage = stack.storage
+    gmail = stack.gmail
+    ai = FakeAi()
+    contacts = ContactService(storage)
+    reminders = ReminderService(storage, clock=lambda: stack.reminders._clock())
+    sender = FakeSender()
+    bot = TelegramBot(
+        stack.settings,
+        storage,
+        sender=sender,
+        bot_user_id=BOT_ID,
+        bot_username=BOT_USERNAME,
+        original_fetcher=gmail.fetch_message,
+    )
+    assistant = EmailAssistant(
+        stack.settings, storage, gmail, ai, bot, contacts, reminders
+    )
+    coordinator = ReplyCoordinator(
+        stack.settings, gmail, FakeCoordinatorLLM(), bot, storage
+    )
+    assistant.set_draft_presenter(coordinator.present_draft)
+    bot.register_action_callback(assistant.handle)
+    bot.register_assistant(assistant)
+    bot.set_intent_classifier(IntentClassifier(ai))
+    bot.register_draft_actions(
+        coordinator.restore_pending,
+        coordinator.send_confirmed_draft_id,
+        coordinator.cancel_confirmed_draft_id,
+    )
+    return SimpleNamespace(
+        storage=storage, gmail=gmail, bot=bot, assistant=assistant,
+        coordinator=coordinator, sender=sender, ai=ai,
+    )
+
+
+async def _create_unconfirmed_draft(stack: Stack, contact: str) -> tuple[int, str]:
+    """Create an unconfirmed compose draft via the LIVE bot; returns the draft
+    id and the preview callback token."""
+    await stack.send_bg(f"envía un correo a {contact} diciendo que muchas gracias")
+    preview_messages = [
+        m for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert preview_messages
+    markup = preview_messages[-1].reply_markup
+    assert markup is not None
+    token = markup.inline_keyboard[0][0].callback_data.split(":", 1)[1]
+    return 1, token
+
+
+async def test_flow_x_unconfirmed_draft_restart_never_sends(stack: Stack) -> None:
+    """Regression #1: an unconfirmed draft after restart never sends
+    automatically (no auto-send on startup)."""
+    stack.contacts.create_contact("Daniel", "daniel@restart.ch")
+    await _create_unconfirmed_draft(stack, "Daniel")
+    assert stack.gmail.sent == []
+
+    fresh = _restart_services(stack)
+    # A real process calls reconcile_on_startup at boot: it must NOT send.
+    await fresh.coordinator.reconcile_on_startup()
+    await asyncio.sleep(0.1)
+    assert stack.gmail.sent == []  # nothing sent
+    row = stack.storage.get_draft(1)
+    assert row is not None and row["status"] == DraftStatus.PENDING.value
+
+
+async def test_flow_x_no_blind_resend_after_restart(stack: Stack) -> None:
+    """Regression #2: no blind resend after restart — the unconfirmed draft is
+    left PENDING, never claimed/sent by recovery."""
+    stack.contacts.create_contact("Daniel", "daniel@restart.ch")
+    await _create_unconfirmed_draft(stack, "Daniel")
+    assert stack.gmail.sent == []
+
+    fresh = _restart_services(stack)
+    await fresh.coordinator.reconcile_on_startup()
+    await asyncio.sleep(0.1)
+    assert stack.gmail.sent == []
+    assert stack.gmail.sent_store == []
+    assert stack.storage.get_draft(1)["status"] == DraftStatus.PENDING.value
+
+
+async def test_flow_x_stale_callback_cannot_send(stack: Stack) -> None:
+    """Regression #3: a stale (restart-surviving) SEND button alone cannot
+    send — the draft stays PENDING until the owner explicitly confirms."""
+    stack.contacts.create_contact("Daniel", "daniel@restart.ch")
+    draft_id, token = await _create_unconfirmed_draft(stack, "Daniel")
+    assert stack.gmail.sent == []
+
+    fresh = _restart_services(stack)
+    # First tap on SEND only shows the confirm dialog — no send yet.
+    await fresh.bot.process_update(_callback_update(CHAT_ID, f"confirm:{token}"))
+    await asyncio.sleep(0.05)
+    assert stack.gmail.sent == []
+    assert stack.storage.get_draft(draft_id)["status"] == DraftStatus.PENDING.value
+
+
+async def test_flow_x_cancel_after_restart_coherent(stack: Stack) -> None:
+    """Regression #4: Cancel after restart cancels the persisted draft and
+    cleans its temp files (never sends)."""
+    stack.contacts.create_contact("Daniel", "daniel@restart.ch")
+    draft_id, token = await _create_unconfirmed_draft(stack, "Daniel")
+
+    fresh = _restart_services(stack)
+    await fresh.bot.process_update(_callback_update(CHAT_ID, f"cancel:{token}"))
+    await asyncio.sleep(0.05)
+    await fresh.bot.process_update(_callback_update(CHAT_ID, f"cancelyes:{token}"))
+    await asyncio.sleep(0.05)
+    assert stack.gmail.sent == []
+    assert stack.storage.get_draft(draft_id)["status"] == DraftStatus.CANCELLED.value
+    assert any(
+        (m.text or "").startswith("Borrador cancelado") for m in fresh.sender.messages
+    )
+
+
+async def test_flow_x_edit_after_restart_coherent(stack: Stack) -> None:
+    """Regression #5: Edit after restart edits the draft and re-renders; the
+    result must still be explicitly confirmed before send."""
+    stack.contacts.create_contact("Daniel", "daniel@restart.ch")
+    draft_id, token = await _create_unconfirmed_draft(stack, "Daniel")
+
+    fresh = _restart_services(stack)
+    await fresh.bot.process_update(_callback_update(CHAT_ID, f"edit:{token}"))
+    await asyncio.sleep(0.05)
+    # The user gives an edit instruction; the assistant regenerates the body.
+    assert token in fresh.bot._pending_drafts  # restored pending is registered
+    from tests.unit.test_telegram_auth import _message, _update
+
+    edit_message = _message(900, CHAT_ID, "hazlo más corto", 7)
+    await fresh.bot.process_update(_update(edit_message))
+    await asyncio.sleep(0.05)
+    row = stack.storage.get_draft(draft_id)
+    assert row is not None
+    assert "kurz" in row["body"] or "corto" in row["body"].lower()
+    # Still PENDING → send still requires explicit confirmation.
+    assert row["status"] == DraftStatus.PENDING.value
+    assert stack.gmail.sent == []
+    # The re-rendered preview persisted a NEW token: a second restart must
+    # keep the edited draft actionable.
+    assert stack.storage.get_draft(draft_id)["telegram_token"]
+    fresh2 = _restart_services(stack)
+    assert stack.storage.get_draft(draft_id)["telegram_token"]
+    new_token = stack.storage.get_draft(draft_id)["telegram_token"]
+    previews2 = [
+        m for m in fresh.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert previews2
+    markup2 = previews2[-1].reply_markup
+    assert markup2 is not None
+    edit_token = markup2.inline_keyboard[0][0].callback_data.split(":", 1)[1]
+    assert edit_token != token
+    # After the second restart, SEND via the NEW token works with confirmation.
+    await fresh2.bot.process_update(_callback_update(CHAT_ID, f"confirm:{new_token}"))
+    await fresh2.bot.process_update(_callback_update(CHAT_ID, f"sendyes:{new_token}"))
+    await asyncio.sleep(0.1)
+    assert len(stack.gmail.sent) == 1
+    assert stack.storage.get_draft(draft_id)["status"] == DraftStatus.SENT_VERIFIED.value
+
+
+async def test_flow_x_send_after_restart_explicit_confirmation(stack: Stack) -> None:
+    """Regression #6: Send after restart requires the explicit two-tap owner
+    confirmation (SEND → confirm dialog → sendyes). It must go through the
+    verified-send path and never auto-send."""
+    stack.contacts.create_contact("Daniel", "daniel@restart.ch")
+    draft_id, token = await _create_unconfirmed_draft(stack, "Daniel")
+
+    fresh = _restart_services(stack)
+    # Only the first tap: confirm dialog, no send.
+    await fresh.bot.process_update(_callback_update(CHAT_ID, f"confirm:{token}"))
+    await asyncio.sleep(0.05)
+    assert stack.gmail.sent == []
+    # Explicit "Sí, enviar" → verified send.
+    await fresh.bot.process_update(_callback_update(CHAT_ID, f"sendyes:{token}"))
+    await asyncio.sleep(0.1)
+    assert len(stack.gmail.sent) == 1
+    assert stack.gmail.sent[0].to[0].email == "daniel@restart.ch"
+    assert stack.storage.get_draft(draft_id)["status"] == DraftStatus.SENT_VERIFIED.value
+
+
+async def test_flow_x_duplicate_protection_after_restart(stack: Stack) -> None:
+    """Regression #7: duplicate protection remains intact — a second explicit
+    sendyes on an already-sent draft sends nothing."""
+    stack.contacts.create_contact("Daniel", "daniel@restart.ch")
+    draft_id, token = await _create_unconfirmed_draft(stack, "Daniel")
+
+    fresh = _restart_services(stack)
+    await fresh.bot.process_update(_callback_update(CHAT_ID, f"confirm:{token}"))
+    await fresh.bot.process_update(_callback_update(CHAT_ID, f"sendyes:{token}"))
+    await asyncio.sleep(0.1)
+    assert len(stack.gmail.sent) == 1
+    # Replay the same sendyes → no duplicate.
+    await fresh.bot.process_update(_callback_update(CHAT_ID, f"sendyes:{token}"))
+    await asyncio.sleep(0.05)
+    assert len(stack.gmail.sent) == 1
+    assert stack.storage.get_draft(draft_id)["status"] == DraftStatus.SENT_VERIFIED.value
+
+
+async def test_flow_x_non_restart_draft_flow_unchanged(stack: Stack) -> None:
+    """Regression #8: the normal (non-restart) draft flow is unchanged — the
+    in-memory pending drives send/cancel as before."""
+    stack.contacts.create_contact("Daniel", "daniel@normal.ch")
+    await stack.send_bg("envía un correo a Daniel diciendo que muchas gracias")
+    preview_messages = [
+        m for m in stack.sender.messages if (m.text or "").startswith("Borrador (")
+    ]
+    assert preview_messages
+    markup = preview_messages[-1].reply_markup
+    assert markup is not None
+    token = markup.inline_keyboard[0][0].callback_data.split(":", 1)[1]
+    await stack.tap(CHAT_ID, f"confirm:{token}")
+    await stack.tap(CHAT_ID, f"sendyes:{token}")
+    await stack.wait_for_send()
+    await stack.join_background()
+    assert len(stack.gmail.sent) == 1
+    assert stack.draft_row(1)["status"] == DraftStatus.SENT_VERIFIED.value

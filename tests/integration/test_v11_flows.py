@@ -417,6 +417,11 @@ class Stack:
         self.bot.register_action_callback(self.assistant.handle)
         self.bot.register_assistant(self.assistant)
         self.bot.set_intent_classifier(IntentClassifier(self.ai))
+        self.bot.register_draft_actions(
+            self.coordinator.restore_pending,
+            self.coordinator.send_confirmed_draft_id,
+            self.coordinator.cancel_confirmed_draft_id,
+        )
 
     async def send(self, text: str, *, user_id: int = 7, message_id: int = 100,
                    reply_to: Message | None = None) -> None:

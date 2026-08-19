@@ -131,6 +131,8 @@ class Storage:
         self._ensure_column("drafts", "verification_attempts", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("drafts", "attachments_json", "TEXT NOT NULL DEFAULT '[]'")
         self._ensure_column("drafts", "forward_of", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("drafts", "telegram_token", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("drafts", "telegram_message_id", "INTEGER NOT NULL DEFAULT 0")
 
     def _ensure_column(self, table: str, column: str, ddl: str) -> None:
         """Idempotent ALTER TABLE ADD COLUMN for pre-existing databases.
@@ -325,6 +327,28 @@ class Storage:
             (status.value, now, draft_id),
         )
         self._conn.commit()
+
+    def set_draft_telegram(self, draft_id: int, token: str, message_id: int) -> None:
+        """Persist the Telegram preview identity so a draft callback survives
+        restart: the callback token can be resolved back to the draft row."""
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now(UTC).isoformat()
+        self._conn.execute(
+            "UPDATE drafts SET telegram_token = ?, telegram_message_id = ?, updated_at = ? "
+            "WHERE id = ?",
+            (token, message_id, now, draft_id),
+        )
+        self._conn.commit()
+
+    def get_draft_by_token(self, token: str) -> dict[str, Any] | None:
+        """Resolve a Telegram callback token to its persisted draft row."""
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT * FROM drafts WHERE telegram_token = ?", (token,)
+        ).fetchone()
+        return dict(row) if row else None
 
     def set_draft_body(self, draft_id: int, body: str) -> None:
         """Update the persisted draft body after an edit (retry coherence)."""

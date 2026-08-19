@@ -205,6 +205,13 @@ class App:
         bot.register_action_callback(assistant.handle)
         bot.register_assistant(assistant)
         bot.set_intent_classifier(IntentClassifier(services.ai))
+        # Restart-safe draft actions: stale draft buttons keep working after a
+        # restart (cancel/edit/send with explicit confirmation).
+        bot.register_draft_actions(
+            reply_coordinator.restore_pending,
+            reply_coordinator.send_confirmed_draft_id,
+            reply_coordinator.cancel_confirmed_draft_id,
+        )
 
         reminder_scheduler = ReminderScheduler(
             services.storage, services.bot, interval_seconds=30.0

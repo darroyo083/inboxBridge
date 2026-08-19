@@ -53,7 +53,7 @@ from .models import (
     ParsedEmail,
     SendVerification,
 )
-from .telegram.bot import ReplyRequest, TelegramBot
+from .telegram.bot import ReplyRequest, TelegramBot, _PendingDraft
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +217,63 @@ class ReplyCoordinator:
             return
         self._storage.set_draft_status(draft_id, DraftStatus.CONFIRMED)
         await self._send_confirmed(draft_id, draft)
+
+    # ── restart-safe draft actions (unconfirmed drafts survive a restart) ──
+
+    def restore_pending(self, token: str) -> _PendingDraft | None:
+        """Reconstruct an in-memory pending draft from its persisted row.
+
+        After a restart the ``_pending_drafts`` map is empty but the draft row
+        (status PENDING) and its callback token are persisted, so a stale
+        Telegram button can resolve back to the draft: Cancel/Edit keep working
+        and Send still requires an explicit owner confirmation.
+        """
+        row = self._storage.get_draft_by_token(token)
+        if row is None or row["status"] != DraftStatus.PENDING.value:
+            return None
+        draft = self._draft_from_row(row)
+        attachments = [a for a in self._load_attachments(row) if a is not None]
+        if attachments:
+            draft = replace(draft, attachments=tuple(attachments))
+        return _PendingDraft(
+            token=token,
+            draft=draft,
+            message_id=int(row.get("telegram_message_id") or 0),
+            draft_id=int(row["id"]),
+            user_id=int(row.get("telegram_user_id") or 0),
+            restored=True,
+        )
+
+    async def send_confirmed_draft_id(self, draft_id: int) -> None:
+        """Drive a send for an unconfirmed draft whose original presentation
+        coroutine is gone (restart).
+
+        The owner has EXPLICITLY confirmed via the button; the draft is
+        atomically claimed and goes through the SAME verified-delivery path as
+        a normal send (claim → send → verify → duplicate protection). Never
+        auto-sends.
+        """
+        async with self._lock_for(draft_id):
+            row = self._storage.get_draft(draft_id)
+            if row is None or row["status"] != DraftStatus.PENDING.value:
+                return  # already resolved elsewhere (duplicate protection)
+            self._storage.set_draft_status(draft_id, DraftStatus.CONFIRMED)
+            draft = self._draft_from_row(row)
+            attachments = [a for a in self._load_attachments(row) if a is not None]
+            if attachments:
+                draft = replace(draft, attachments=tuple(attachments))
+        await self._send_confirmed(draft_id, draft)
+
+    async def cancel_confirmed_draft_id(self, draft_id: int) -> None:
+        """Cancel an unconfirmed draft after restart (the original coroutine
+        that would have handled cancel is gone). Marks CANCELLED + temp cleanup."""
+        async with self._lock_for(draft_id):
+            row = self._storage.get_draft(draft_id)
+            if row is None or row["status"] != DraftStatus.PENDING.value:
+                return
+            self._storage.set_draft_status(draft_id, DraftStatus.CANCELLED)
+            self._cleanup_draft_tmp(draft_id)
+        await self._bot.send_notice("Borrador cancelado.")
 
     async def _translate_for_preview(self, draft: DraftReply) -> DraftReply:
         """Attach a best-effort Spanish translation of the German body.
