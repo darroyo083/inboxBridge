@@ -530,7 +530,7 @@ function Footer() {
   return (
     <footer className="site-footer">
       <div className="footer-shell page-shell">
-        <div className="footer-brand"><LogoMark /><p>Conversational Gmail via Telegram.</p></div>
+        <div className="footer-brand"><LogoMark /><p>Self-hosted AI Gmail assistant via Telegram.</p></div>
         <div className="footer-nav">{navItems.slice(1).map((item) => <RouteLink key={item.to} to={item.to}>{item.label}</RouteLink>)}</div>
         <div className="footer-meta"><a href={GITHUB_URL} target="_blank" rel="noreferrer">GitHub <ExternalArrow /></a><small>© 2026 Daniel Arroyo</small></div>
       </div>
