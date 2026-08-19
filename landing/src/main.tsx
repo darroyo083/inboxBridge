@@ -347,10 +347,6 @@ function FlowPreview() {
   return (
     <div className="hero-visual" aria-label="InboxBridge flow preview">
       <HalftoneField />
-      <div className="visual-topline">
-        <span>SYS.FLOW / LIVE</span>
-        <span>01—03</span>
-      </div>
       <div className="visual-route">
         <div className="route-side route-source">
           <span className="mono-label">SOURCE</span>
@@ -393,7 +389,7 @@ function HomePage() {
       <section className="hero page-shell">
         <div className="hero-copy">
           <h1>Your inbox,<br /><em>conversational.</em></h1>
-          <p>A self-hosted AI Gmail assistant for Telegram, with attachment-aware context, multilingual drafting and explicit confirmation before sending.</p>
+          <p>A self-hosted AI assistant that connects Gmail with Telegram, with thread and attachment context, multilingual drafting, and explicit confirmation before anything is sent.</p>
           <div className="hero-actions">
             <a className="button button-primary" href={GITHUB_URL} target="_blank" rel="noreferrer">View on GitHub <ExternalArrow /></a>
             <ButtonLink to="/how-it-works" variant="secondary">Explore the flow</ButtonLink>
@@ -479,7 +475,7 @@ function CapabilityCard({ group, featured = false }: { group: typeof capabilityG
 function CapabilitiesPage() {
   return (
     <Page className="inner-page">
-      <PageHeader title={<>The useful parts,<br /><em>without the noise.</em></>} intro="InboxBridge is focused on the moments where email becomes work: understanding context, writing clearly, and sending deliberately." />
+      <PageHeader title={<>What InboxBridge<br /><em>can do.</em></>} intro="InboxBridge is focused on the moments where email becomes work: understanding context, writing clearly, and sending deliberately." />
       <section className="capabilities-section page-shell">
         <div className="capabilities-grid">
           {capabilityGroups.map((group, index) => <CapabilityCard featured={index === 0} group={group} key={group.index} />)}
