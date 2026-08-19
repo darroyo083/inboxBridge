@@ -151,10 +151,9 @@ function Page({ children, className = "" }: PageProps) {
   return <main className={`page ${className}`}>{children}</main>;
 }
 
-function PageHeader({ kicker, title, intro }: { kicker: string; title: ReactNode; intro: string }) {
+function PageHeader({ title, intro }: { title: ReactNode; intro: string }) {
   return (
     <header className="page-header page-shell">
-      <span className="eyebrow">{kicker}</span>
       <h1>{title}</h1>
       <p>{intro}</p>
     </header>
@@ -348,17 +347,6 @@ function FlowPreview() {
   );
 }
 
-function StatusBar() {
-  return (
-    <div className="status-bar page-shell">
-      <span className="status-dot" aria-hidden="true" />
-      <strong>ACTIVE DEVELOPMENT</strong>
-      <span className="status-divider">/</span>
-      <span>Core flows operational, attachment hardening in progress.</span>
-    </div>
-  );
-}
-
 const homePreviews = [
   { number: "01", title: "How it works", copy: "Six deliberate handoffs from new mail to verified delivery.", to: "/how-it-works" },
   { number: "02", title: "Capabilities", copy: "Thread context, documents, drafting, and multilingual review.", to: "/capabilities" },
@@ -371,9 +359,8 @@ function HomePage() {
     <Page className="home-page">
       <section className="hero page-shell">
         <div className="hero-copy">
-          <div className="status-badge"><span className="status-dot" />Work in progress</div>
           <h1>Your inbox,<br /><em>conversational.</em></h1>
-          <p>A multilingual Gmail assistant in Telegram, grounded in threads and attachments, with explicit confirmation before any message leaves.</p>
+          <p>A self-hosted AI Gmail assistant for Telegram, with attachment-aware context, multilingual drafting and explicit confirmation before sending.</p>
           <div className="hero-actions">
             <a className="button button-primary" href={GITHUB_URL} target="_blank" rel="noreferrer">View on GitHub <ExternalArrow /></a>
             <ButtonLink to="/how-it-works" variant="secondary">Explore the flow</ButtonLink>
@@ -381,10 +368,8 @@ function HomePage() {
         </div>
         <FlowPreview />
       </section>
-      <StatusBar />
       <section className="home-previews page-shell">
         <div className="section-heading">
-          <span className="eyebrow">THE SYSTEM</span>
           <h2>One interface.<br />Four deliberate layers.</h2>
           <p>See how InboxBridge turns a crowded inbox into a conversation you can trust.</p>
         </div>
@@ -424,12 +409,12 @@ function ProcessRow({ operation }: { operation: typeof operations[number] }) {
 function HowItWorksPage() {
   return (
     <Page className="inner-page">
-      <PageHeader kicker="HOW IT WORKS" title={<>From new mail to<br /><em>verified delivery.</em></>} intro="A clear sequence of small decisions. InboxBridge keeps the person in the loop where it matters." />
+      <PageHeader title={<>From new mail to<br /><em>verified delivery.</em></>} intro="A clear sequence of small decisions. InboxBridge keeps the person in the loop where it matters." />
       <section className="process-section page-shell">
         <Reveal className="process-list">{operations.map((operation) => <ProcessRow key={operation.number} operation={operation} />)}</Reveal>
       </section>
       <section className="language-panel page-shell">
-        <div><span className="eyebrow">LANGUAGE TRACE</span><h2>One conversation,<br /><em>multiple languages.</em></h2><p>Incoming mail is summarized in Spanish. Your instructions become a polished German draft. The Spanish review stays visible until you confirm.</p></div>
+        <div><h2>One conversation,<br /><em>multiple languages.</em></h2><p>Incoming mail is summarized in Spanish. Your instructions become a polished German draft. The Spanish review stays visible until you confirm.</p></div>
         <div className="language-steps">
           <div><span>INCOMING</span><strong>German thread</strong><small>“Könnten Sie uns das Dokument senden?”</small></div>
           <div><span>YOUR REVIEW</span><strong>Spanish summary</strong><small>“El cliente solicita el documento.”</small></div>
@@ -461,13 +446,13 @@ function CapabilityCard({ group, featured = false }: { group: typeof capabilityG
 function CapabilitiesPage() {
   return (
     <Page className="inner-page">
-      <PageHeader kicker="CAPABILITIES" title={<>The useful parts,<br /><em>without the noise.</em></>} intro="InboxBridge is focused on the moments where email becomes work: understanding context, writing clearly, and sending deliberately." />
+      <PageHeader title={<>The useful parts,<br /><em>without the noise.</em></>} intro="InboxBridge is focused on the moments where email becomes work: understanding context, writing clearly, and sending deliberately." />
       <section className="capabilities-section page-shell">
         <Reveal className="capabilities-grid">
           {capabilityGroups.map((group, index) => <CapabilityCard featured={index === 0} group={group} key={group.index} />)}
         </Reveal>
       </section>
-      <section className="capability-note page-shell"><span className="eyebrow">IN PRACTICE</span><p>Ask about a PDF. Summarize the thread. Make the draft shorter. Forward it to a saved contact. The interface stays conversational while the system stays structured.</p></section>
+      <section className="capability-note page-shell"><p>Ask about a PDF. Summarize the thread. Make the draft shorter. Forward it to a saved contact. The interface stays conversational while the system stays structured.</p></section>
     </Page>
   );
 }
@@ -481,13 +466,13 @@ const safetyPrinciples = [
 function SafetyPage() {
   return (
     <Page className="inner-page safety-page">
-      <PageHeader kicker="SAFETY" title={<>AI proposes.<br /><em>Systems decide.</em></>} intro="The model can suggest language. It cannot decide who receives it, whether it is complete, or whether it has been sent." />
+      <PageHeader title={<>AI proposes.<br /><em>Systems decide.</em></>} intro="The model can suggest language. It cannot decide who receives it, whether it is complete, or whether it has been sent." />
       <Reveal className="safety-intro page-shell"><div className="safety-statement"><span className="safety-quote">“</span><p>InboxBridge treats a draft as a proposal, not an action.</p></div><div className="safety-state"><span>SAFE SEND STATE</span><strong>Awaiting explicit confirmation</strong><small>AI output is visible. Gmail is untouched.</small></div></Reveal>
       <section className="principles-section page-shell">
         <Reveal className="principles-list">{safetyPrinciples.map((principle) => <article className="principle-row" key={principle.number}><span className="principle-number">{principle.number}</span><h2>{principle.title}</h2><p>{principle.copy}</p></article>)}</Reveal>
       </section>
       <section className="send-boundary page-shell">
-        <div className="section-heading"><span className="eyebrow">THE SEND BOUNDARY</span><h2>Every handoff has a visible state.</h2></div>
+        <div className="section-heading"><h2>Every handoff has a visible state.</h2></div>
         <Reveal className="boundary-flow"><div><span>01</span><strong>AI draft</strong><small>proposal</small></div><i aria-hidden="true" /><div className="boundary-active"><span>02</span><strong>Confirm</strong><small>human decision</small></div><i aria-hidden="true" /><div><span>03</span><strong>Gmail send</strong><small>verified result</small></div></Reveal>
       </section>
     </Page>
@@ -497,17 +482,17 @@ function SafetyPage() {
 function ArchitecturePage() {
   return (
     <Page className="inner-page architecture-page">
-      <PageHeader kicker="ARCHITECTURE" title={<>A small core,<br /><em>clear boundaries.</em></>} intro="Telegram is the interface. Gmail remains the source of truth. InboxBridge coordinates the decisions between them." />
+      <PageHeader title={<>A small core,<br /><em>clear boundaries.</em></>} intro="Telegram is the interface. Gmail remains the source of truth. InboxBridge coordinates the decisions between them." />
       <section className="system-section page-shell">
         <Reveal className="system-diagram">
-          <div className="system-node system-interface"><span className="eyebrow">INTERFACE</span><strong>Telegram</strong><small>Bot API</small></div>
+          <div className="system-node system-interface"><span className="mono-label">INTERFACE</span><strong>Telegram</strong><small>Bot API</small></div>
           <div className="system-link" aria-hidden="true"><span>INPUT</span></div>
-          <div className="system-core"><span className="eyebrow">CORE ENGINE</span><strong>InboxBridge</strong><p>Intent routing, structured LLM output, trusted state, and verified delivery.</p><div className="core-parts"><span>Intent</span><span>LLM</span><span>Docs</span><span>State</span><span>Delivery</span></div></div>
+          <div className="system-core"><span className="mono-label">CORE ENGINE</span><strong>InboxBridge</strong><p>Intent routing, structured LLM output, trusted state, and verified delivery.</p><div className="core-parts"><span>Intent</span><span>LLM</span><span>Docs</span><span>State</span><span>Delivery</span></div></div>
           <div className="system-link" aria-hidden="true"><span>OUTPUT</span></div>
-          <div className="system-node system-external"><span className="eyebrow">SOURCE OF TRUTH</span><strong>Gmail</strong><small>OAuth 2.0 / API</small></div>
+          <div className="system-node system-external"><span className="mono-label">SOURCE OF TRUTH</span><strong>Gmail</strong><small>OAuth 2.0 / API</small></div>
         </Reveal>
       </section>
-      <Reveal className="architecture-notes page-shell"><div><span className="eyebrow">DEPLOYMENT</span><h2>Built to stay small.</h2><p>Docker and Linux VPS deployment keep the runtime portable. SQLite stores identifiers and statuses, not email bodies or attachment content.</p></div><div><span className="eyebrow">RECOVERY</span><h2>Designed to reconcile.</h2><p>Retries and restarts return to trusted state. An uncertain send is checked against Gmail before anything can be sent again.</p></div></Reveal>
+      <Reveal className="architecture-notes page-shell"><div><h2>Built to stay small.</h2><p>Docker and Linux VPS deployment keep the runtime portable. SQLite stores identifiers and statuses, not email bodies or attachment content.</p></div><div><h2>Designed to reconcile.</h2><p>Retries and restarts return to trusted state. An uncertain send is checked against Gmail before anything can be sent again.</p></div></Reveal>
     </Page>
   );
 }
@@ -517,8 +502,8 @@ function Footer() {
     <footer className="site-footer">
       <div className="footer-shell page-shell">
         <div className="footer-brand"><LogoMark /><p>Conversational Gmail via Telegram.</p></div>
-        <div className="footer-nav"><span className="eyebrow">EXPLORE</span>{navItems.slice(1).map((item) => <RouteLink key={item.to} to={item.to}>{item.label}</RouteLink>)}</div>
-        <div className="footer-meta"><span className="eyebrow">WORK IN PROGRESS</span><a href={GITHUB_URL} target="_blank" rel="noreferrer">GitHub <ExternalArrow /></a><small>© 2026 Daniel Arroyo</small></div>
+        <div className="footer-nav">{navItems.slice(1).map((item) => <RouteLink key={item.to} to={item.to}>{item.label}</RouteLink>)}</div>
+        <div className="footer-meta"><a href={GITHUB_URL} target="_blank" rel="noreferrer">GitHub <ExternalArrow /></a><small>© 2026 Daniel Arroyo</small></div>
       </div>
     </footer>
   );
